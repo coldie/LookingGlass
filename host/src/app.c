@@ -23,6 +23,9 @@
 #include "dynamic/capture.h"
 #include "common/version.h"
 #include "common/debug.h"
+#ifdef _WIN32
+#include "common/windebug.h"
+#endif
 #include "common/option.h"
 #include "common/locking.h"
 #include "common/KVMFR.h"
@@ -35,6 +38,7 @@
 #include "common/cpuinfo.h"
 #include "common/util.h"
 #include "common/array.h"
+#include "common/profile.h"
 
 #include <lgmp/host.h>
 
@@ -44,6 +48,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <avrt.h>
+#endif
 
 #define CONFIG_FILE "looking-glass-host.ini"
 #define POINTER_SHAPE_BUFFERS 3
@@ -61,6 +69,25 @@ static const struct LGMPQueueConfig POINTER_QUEUE_CONFIG =
   .numMessages = LGMP_Q_POINTER_LEN,
   .subTimeout  = 1000
 };
+
+#ifdef _WIN32
+static void boostFrameThreadPriority(void)
+{
+  DWORD taskIndex = 0;
+  HANDLE task = AvSetMmThreadCharacteristicsA("Capture", &taskIndex);
+  if (task)
+  {
+    if (!AvSetMmThreadPriority(task, AVRT_PRIORITY_HIGH))
+      DEBUG_WINERROR("Failed to set frame thread MMCSS priority", GetLastError());
+  }
+  else
+    DEBUG_WINERROR("AvSetMmThreadCharacteristicsA failed for frame thread",
+      GetLastError());
+
+  if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST))
+    DEBUG_WINERROR("Failed to set frame thread priority", GetLastError());
+}
+#endif
 
 #define MAX_POINTER_SIZE (sizeof(KVMFRCursor) + (512 * 512 * 4))
 
@@ -230,7 +257,11 @@ static bool sendFrame(CaptureResult result, bool * restart)
 
   // only wait if the result from the capture was OK
   if (result == CAPTURE_RESULT_OK)
+  {
+    LG_PROFILE_ZONE_BEGIN(zoneWaitFrame, "host waitFrame");
     result = app.iface->waitFrame(app.captureIndex, &frame, app.maxFrameSize);
+    LG_PROFILE_ZONE_END(zoneWaitFrame);
+  }
 
   switch(result)
   {
@@ -309,6 +340,10 @@ static bool sendFrame(CaptureResult result, bool * restart)
       fi->type = FRAME_TYPE_RGB_24;
       break;
 
+    case CAPTURE_FMT_NV12:
+      fi->type = FRAME_TYPE_NV12;
+      break;
+
     default:
       DEBUG_ERROR("Unsupported frame format %d, skipping frame", frame.format);
       return true;
@@ -356,17 +391,34 @@ static bool sendFrame(CaptureResult result, bool * restart)
   framebuffer_prepare(app.frameBuffer[app.captureIndex]);
 
   /* we post and then get the frame, this is intentional! */
+  const bool timing = app.iface->recordTiming && app.iface->isTimingEnabled &&
+    app.iface->isTimingEnabled();
+  if (frame.hasBackendFrameTime && app.iface->recordTiming)
+    app.iface->recordTiming(CAPTURE_TIMING_FRAME_TO_LGMP_POST,
+      microtime() - frame.backendFrameTimeUs);
+
+  const uint64_t postStart = timing ? microtime() : 0;
+  LG_PROFILE_ZONE_BEGIN(zonePostFrame, "host lgmp post frame");
   if ((status = lgmpHostQueuePost(app.frameQueue, 0,
     app.frameMemory[app.captureIndex])) != LGMP_OK)
   {
+    LG_PROFILE_ZONE_END(zonePostFrame);
     DEBUG_ERROR("%s", lgmpStatusString(status));
     return true;
   }
+  LG_PROFILE_ZONE_END(zonePostFrame);
+  if (timing)
+    app.iface->recordTiming(CAPTURE_TIMING_LGMP_POST,
+      microtime() - postStart);
 
+  LG_PROFILE_ZONE_BEGIN(zoneGetFrame, "host getFrame");
   app.iface->getFrame(
     app.captureIndex,
     app.frameBuffer[app.captureIndex],
     app.maxFrameSize);
+  LG_PROFILE_ZONE_END(zoneGetFrame);
+  LG_PROFILE_FRAME_DEFAULT();
+  LG_PROFILE_FRAME("consumer ready frame");
 
   app.readIndex = app.captureIndex;
   if (++app.captureIndex == LGMP_Q_FRAME_LEN)
@@ -377,6 +429,10 @@ static bool sendFrame(CaptureResult result, bool * restart)
 static int frameThread(void * opaque)
 {
   DEBUG_INFO("Frame thread started");
+  LG_PROFILE_THREAD("LG frame thread");
+#ifdef _WIN32
+  boostFrameThreadPriority();
+#endif
 
   while(app.state == APP_STATE_RUNNING)
   {
@@ -813,6 +869,8 @@ fail_init:
 // this is called from the platform specific startup routine
 int app_main(int argc, char * argv[])
 {
+  LG_PROFILE_THREAD("LG host main");
+
   if (!installCrashHandler(os_getExecutable()))
     DEBUG_WARN("Failed to install the crash handler");
 
@@ -1076,6 +1134,12 @@ int app_main(int argc, char * argv[])
           bool restart = false;
           if (!sendFrame(result, &restart) && restart)
             setAppState(APP_STATE_TRANSITION_TO_IDLE);
+          if (result == CAPTURE_RESULT_OK &&
+              app.iface->recordTiming &&
+              app.iface->isTimingEnabled &&
+              app.iface->isTimingEnabled())
+            app.iface->recordTiming(CAPTURE_TIMING_LOOP_TOTAL,
+              microtime() - captureStartTime);
         }
         break;
       }
@@ -1088,7 +1152,7 @@ int app_main(int argc, char * argv[])
 
   exitcode = app.exitcode;
 
-fail:
+  fail:
   stopThreads();
   captureStop();
   app.iface->free();

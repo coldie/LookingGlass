@@ -35,6 +35,9 @@ add_feature_info(ENABLE_ASAN ENABLE_ASAN "AddressSanitizer support.")
 option(ENABLE_UBSAN "Build with UndefinedBehaviorSanitizer" OFF)
 add_feature_info(ENABLE_UBSAN ENABLE_UBSAN "UndefinedBehaviorSanitizer support.")
 
+option(ENABLE_TRACY "Build with Tracy profiler instrumentation" OFF)
+add_feature_info(ENABLE_TRACY ENABLE_TRACY "Tracy profiler instrumentation.")
+
 add_compile_options(
   "-Wall"
   "-Werror"
@@ -60,6 +63,21 @@ endif()
 if(ENABLE_UBSAN)
   add_compile_options("-fsanitize=undefined")
   set(EXE_FLAGS "${EXE_FLAGS} -fsanitize=undefined")
+endif()
+
+if(ENABLE_TRACY)
+  enable_language(CXX)
+  set(TRACY_STATIC ON CACHE BOOL "" FORCE)
+  set(TRACY_ON_DEMAND ON CACHE BOOL "" FORCE)
+  add_subdirectory("${PROJECT_TOP}/repos/tracy" "${CMAKE_BINARY_DIR}/tracy")
+  target_compile_definitions(TracyClient PUBLIC TRACY_ENABLE TRACY_ON_DEMAND)
+  target_compile_options(TracyClient PRIVATE
+    -Wno-error
+    -Wno-unknown-pragmas
+    -Wno-sign-compare
+  )
+  add_definitions(-DENABLE_TRACY -DTRACY_ENABLE -DTRACY_ON_DEMAND)
+  include_directories(SYSTEM "${PROJECT_TOP}/repos/tracy/public")
 endif()
 
 add_custom_command(
@@ -112,6 +130,19 @@ target_link_libraries(looking-glass-host
   lgmp
 )
 
+if(ENABLE_TRACY)
+  target_link_libraries(looking-glass-host TracyClient)
+  if(WIN32)
+    target_link_libraries(looking-glass-host
+      -static
+      -static-libstdc++
+      -static-libgcc
+    )
+  endif()
+  target_compile_definitions(looking-glass-host PRIVATE ENABLE_TRACY)
+  set_target_properties(looking-glass-host PROPERTIES LINKER_LANGUAGE CXX)
+endif()
+
 if(WIN32)
   set_target_properties(looking-glass-host PROPERTIES LINK_FLAGS "-Wl,--gc-sections -Wl,--nxcompat")
 else()
@@ -121,5 +152,17 @@ endif()
 install(TARGETS looking-glass-host
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   COMPONENT binary)
+
+option(BUILD_TEST_D3D11ON12_IVSHMEM
+  "Build the standalone D3D11On12 + IVSHMEM validation tool" OFF)
+option(BUILD_TEST_WGC_D3D11ON12_FRAMEPOOL
+  "Build the standalone WGC + D3D11On12 frame-pool callback repro" OFF)
+if((BUILD_TEST_D3D11ON12_IVSHMEM OR BUILD_TEST_WGC_D3D11ON12_FRAMEPOOL) AND WIN32)
+  add_subdirectory(test-d3d11on12-ivshmem)
+endif()
+add_feature_info(BUILD_TEST_D3D11ON12_IVSHMEM BUILD_TEST_D3D11ON12_IVSHMEM
+  "Standalone D3D11On12 + IVSHMEM validation tool")
+add_feature_info(BUILD_TEST_WGC_D3D11ON12_FRAMEPOOL BUILD_TEST_WGC_D3D11ON12_FRAMEPOOL
+  "Standalone WGC + D3D11On12 frame-pool callback repro")
 
 feature_summary(WHAT ENABLED_FEATURES DISABLED_FEATURES)

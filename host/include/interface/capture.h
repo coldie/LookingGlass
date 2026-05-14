@@ -50,6 +50,7 @@ typedef enum CaptureFormat
   CAPTURE_FMT_RGBA16F,
   CAPTURE_FMT_BGR_32 ,
   CAPTURE_FMT_RGB_24 ,
+  CAPTURE_FMT_NV12   ,
 
   // pointer formats
   CAPTURE_FMT_COLOR ,
@@ -85,6 +86,8 @@ typedef struct CaptureFrame
   bool            hdr;          // true if the frame format is HDR
   bool            hdrPQ;        // true if the frame format is PQ transformed
   CaptureRotation rotation;     // output rotation of the frame
+  bool            hasBackendFrameTime;
+  uint64_t        backendFrameTimeUs;
 
   uint32_t        damageRectsCount;
   FrameDamageRect damageRects[KVMFR_MAX_DAMAGE_RECTS];
@@ -107,6 +110,14 @@ CapturePointer;
 
 typedef bool (*CaptureGetPointerBuffer )(void ** data, uint32_t * size);
 typedef void (*CapturePostPointerBuffer)(const CapturePointer * pointer);
+
+typedef enum CaptureTimingStage
+{
+  CAPTURE_TIMING_LGMP_POST,
+  CAPTURE_TIMING_FRAME_TO_LGMP_POST,
+  CAPTURE_TIMING_LOOP_TOTAL
+}
+CaptureTimingStage;
 
 typedef struct CaptureInterface
 {
@@ -140,5 +151,11 @@ typedef struct CaptureInterface
     unsigned frameBufferIndex,
     FrameBuffer  * frame,
     const size_t maxFrameSize);
+
+  void (*recordTiming)(
+    CaptureTimingStage stage,
+    uint64_t           durationUs);
+
+  bool (*isTimingEnabled)(void);
 }
 CaptureInterface;

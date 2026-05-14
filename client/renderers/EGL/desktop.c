@@ -47,6 +47,7 @@ struct DesktopShader
   GLint uTransform;
   GLint uDesktopSize;
   GLint uSamplerType;
+  GLint uFrameType;
   GLint uScaleAlgo;
   GLint uNVGain;
   GLint uCBMode;
@@ -121,6 +122,7 @@ static bool egl_initDesktopShader(
 
   shader->uDesktopSize  = egl_shaderGetUniform(shader->shader, "desktopSize" );
   shader->uTransform    = egl_shaderGetUniform(shader->shader, "transform"   );
+  shader->uFrameType    = egl_shaderGetUniform(shader->shader, "frameType"   );
   shader->uScaleAlgo    = egl_shaderGetUniform(shader->shader, "scaleAlgo"   );
   shader->uNVGain       = egl_shaderGetUniform(shader->shader, "nvGain"      );
   shader->uCBMode       = egl_shaderGetUniform(shader->shader, "cbMode"      );
@@ -348,6 +350,18 @@ bool egl_desktopSetup(EGL_Desktop * desktop, const LG_RendererFormat format)
       pixFmt = EGL_PF_RGB_24;
       break;
 
+    case FRAME_TYPE_NV12:
+      pixFmt = EGL_PF_NV12;
+      break;
+
+    case FRAME_TYPE_YUY2:
+      pixFmt = EGL_PF_YUY2;
+      break;
+
+    case FRAME_TYPE_UYVY:
+      pixFmt = EGL_PF_UYVY;
+      break;
+
     default:
       DEBUG_ERROR("Unsupported frame format");
       return false;
@@ -377,6 +391,11 @@ bool egl_desktopSetup(EGL_Desktop * desktop, const LG_RendererFormat format)
 bool egl_desktopUpdate(EGL_Desktop * desktop, const FrameBuffer * frame, int dmaFd,
     const FrameDamageRect * damageRects, int damageRectsCount)
 {
+  const bool yuvFrame =
+    desktop->format.type == FRAME_TYPE_NV12 ||
+    desktop->format.type == FRAME_TYPE_YUY2 ||
+    desktop->format.type == FRAME_TYPE_UYVY;
+
   if (likely(desktop->useDMA && dmaFd >= 0))
   {
     if (likely(egl_textureUpdateFromDMA(desktop->texture, frame, dmaFd)))
@@ -413,6 +432,12 @@ bool egl_desktopUpdate(EGL_Desktop * desktop, const FrameBuffer * frame, int dma
 
     if (!egl_desktopSetup(desktop, desktop->format))
       return false;
+  }
+
+  if (yuvFrame)
+  {
+    damageRects = NULL;
+    damageRectsCount = 0;
   }
 
   if (likely(egl_textureUpdateFromFrame(desktop->texture, frame,
@@ -465,19 +490,29 @@ bool egl_desktopRender(EGL_Desktop * desktop, unsigned int outputWidth,
   }
 
   int scaleAlgo = EGL_SCALE_NEAREST;
+  const bool yuvFrame =
+    desktop->format.type == FRAME_TYPE_NV12 ||
+    desktop->format.type == FRAME_TYPE_YUY2 ||
+    desktop->format.type == FRAME_TYPE_UYVY;
 
   egl_desktopRectsMatrix((float *)desktop->matrix->data,
       width, height, x, y, scaleX, scaleY, rotate);
   egl_desktopRectsUpdate(desktop->mesh, rects, width, height);
 
-  if (atomic_exchange(&desktop->processFrame, false) ||
+  if (!yuvFrame &&
+      (atomic_exchange(&desktop->processFrame, false) ||
       egl_postProcessConfigModified(desktop->pp))
-    egl_postProcessRun(desktop->pp, tex, desktop->mesh,
-        width, height, outputWidth, outputHeight, dma);
+  )
+  {
+      egl_postProcessRun(desktop->pp, tex, desktop->mesh,
+          width, height, outputWidth, outputHeight, dma);
+  }
+  else if (yuvFrame)
+    atomic_store(&desktop->processFrame, false);
 
   unsigned int finalSizeX, finalSizeY;
-  EGL_Texture * texture = egl_postProcessGetOutput(desktop->pp,
-      &finalSizeX, &finalSizeY);
+  EGL_Texture * texture = yuvFrame ? NULL :
+    egl_postProcessGetOutput(desktop->pp, &finalSizeX, &finalSizeY);
 
   if (unlikely(!texture))
   {
@@ -533,6 +568,11 @@ bool egl_desktopRender(EGL_Desktop * desktop, unsigned int outputWidth,
       .type        = EGL_UNIFORM_TYPE_2F,
       .location    = shader->uDesktopSize,
       .f           = { width, height },
+    },
+    {
+      .type        = EGL_UNIFORM_TYPE_1I,
+      .location    = shader->uFrameType,
+      .i           = { desktop->format.type },
     },
     {
       .type        = EGL_UNIFORM_TYPE_M3x2FV,

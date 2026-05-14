@@ -328,14 +328,15 @@ static void rectCopyUnaligned_avx(
   src += ystart * srcPitch + dx;
   dst += ystart * dstPitch + dx;
 
-  const int align = (32 - ((uintptr_t)dst & 31)) & 31;
-  const int nvec  = (width - align) / sizeof(__m256i);
-  const int rem   = (width - align) % sizeof(__m256i);
-
   for (int i = ystart; i < yend; ++i)
   {
+    const int align = min((int)((32 - ((uintptr_t)dst & 31)) & 31), width);
+    const int vecBytes = width - align;
+    const int nvec = vecBytes / sizeof(__m256i);
+    const int rem  = vecBytes % sizeof(__m256i);
+
     // copy the unaligned bytes
-    for(int col = align - 1; col >= 0; --col)
+    for(int col = 0; col < align; ++col)
       dst[col] = src[col];
 
     const __m256i *restrict s = (__m256i*)(src + align);

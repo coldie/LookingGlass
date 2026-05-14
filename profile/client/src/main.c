@@ -35,6 +35,7 @@
 #include <pwd.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 #include <lgmp/client.h>
 
@@ -55,6 +56,13 @@ static struct Option options[] =
     .shortopt       = 'C',
     .type           = OPTION_TYPE_STRING,
     .value.x_string = NULL
+  },
+  {
+    .module         = "app",
+    .name           = "interval",
+    .description    = "Interval in seconds between profile timing summaries",
+    .type           = OPTION_TYPE_INT,
+    .value.x_int    = 1
   },
   {0}
 };
@@ -112,14 +120,21 @@ static int run(void)
   KVMFR *udata;
 
   LGMP_STATUS status;
-  if ((status = lgmpClientInit(state.shmDev.mem, state.shmDev.size, &lgmp,
-          &udataSize, (uint8_t **)&udata)) != LGMP_OK)
+  if ((status = lgmpClientInit(state.shmDev.mem, state.shmDev.size, &lgmp))
+      != LGMP_OK)
   {
     DEBUG_ERROR("lgmpClientInit: %s", lgmpStatusString(status));
     return -1;
   }
 
-  if (udataSize != sizeof(KVMFR) ||
+  if ((status = lgmpClientSessionInit(lgmp, &udataSize, (uint8_t **)&udata,
+          NULL)) != LGMP_OK)
+  {
+    DEBUG_ERROR("lgmpClientSessionInit: %s", lgmpStatusString(status));
+    return -1;
+  }
+
+  if (udataSize < sizeof(*udata) ||
       memcmp(udata->magic, KVMFR_MAGIC, sizeof(udata->magic)) != 0 ||
       udata->version != KVMFR_VERSION)
   {
@@ -140,14 +155,15 @@ static int run(void)
   {
     uint64_t min, max, ttl;
     unsigned int count;
+    double sumSqMs;
   };
 
-  unsigned int frameCount    = 0;
+  unsigned int frameCount = 0;
   uint64_t     lastFrameTime = 0;
-  struct perf  p1  = {};
-  struct perf  p5  = {};
-  struct perf  p10 = {};
-  struct perf  p30 = {};
+  struct perf  p = {};
+  int          interval = option_get_int("app", "interval");
+  if (interval < 1)
+    interval = 1;
 
   // start accepting frames
   while(state.running)
@@ -170,37 +186,36 @@ static int run(void)
     if (frameCount++ == 0)
     {
       lastFrameTime = frameTime;
-      p1.min = p5.min = p10.min = p30.min = diff;
       continue;
     }
 
-    ++p1 .count;
-    ++p5 .count;
-    ++p10.count;
-    ++p30.count;
-
 #define UPDATE(p, interval) \
-    if (p.ttl + diff >= (1e9 * interval)) \
+    do \
     { \
-      fprintf(stdout, "%02d, min:%9lu ns (%5.2f ms) max:%9lu ns (%5.2f ms) avg:%9lu ns (%5.2f ms)\n", \
-          interval, \
-          p.min          , ((float)p.min / 1e6f), \
-          p.max          , ((float)p.max / 1e6f), \
-          p.ttl / p.count, (((float)p.ttl / p.count) / 1e6f)\
-      ); \
-      p.min = p.max = p.ttl = diff; p.count = 1; \
-    } \
-    else \
-    { \
-      p.min = min(p.min, diff); \
-      p.max = max(p.max, diff); \
+      const double diffMs = (double)diff / 1e6; \
+      p.min = p.count ? min(p.min, diff) : diff; \
+      p.max = p.count ? max(p.max, diff) : diff; \
       p.ttl += diff; \
-    }
+      p.sumSqMs += diffMs * diffMs; \
+      ++p.count; \
+      if (p.ttl >= (1000000000ULL * (uint64_t)interval)) \
+      { \
+        const double avgMs = (double)p.ttl / (double)p.count / 1e6; \
+        const double minMs = (double)p.min / 1e6; \
+        const double maxMs = (double)p.max / 1e6; \
+        const double variance = max(0.0, p.sumSqMs / p.count - avgMs * avgMs); \
+        const double stddevMs = sqrt(variance); \
+        fprintf(stdout, \
+            "Profile timings interval:%d samples:%u frame-ms avg:%.3f min:%.3f max:%.3f stddev:%.3f jitter:%.3f fps:%.3f\n", \
+            interval, p.count, avgMs, minMs, maxMs, stddevMs, maxMs - minMs, \
+            avgMs > 0.0 ? 1000.0 / avgMs : 0.0); \
+        p.min = p.max = p.ttl = 0; \
+        p.count = 0; \
+        p.sumSqMs = 0.0; \
+      } \
+    } while (0)
 
-    UPDATE(p1 , 1 );
-    UPDATE(p5 , 5 );
-    UPDATE(p10, 10);
-    UPDATE(p30, 30);
+    UPDATE(p, interval);
 
     lastFrameTime = frameTime;
   }
@@ -210,7 +225,9 @@ static int run(void)
 
 int main(int argc, char * argv[])
 {
-  DEBUG_INFO("Looking Glass (" BUILD_VERSION ") - Client Profiler");
+  setbuf(stdout, NULL);
+  debug_init();
+  DEBUG_INFO("Looking Glass (" PROFILE_BUILD_VERSION ") - Client Profiler");
 
   if (!installCrashHandler("/proc/self/exe"))
     DEBUG_WARN("Failed to install the crash handler");

@@ -142,9 +142,9 @@ static struct Option egl_options[] =
   {
     .module       = "egl",
     .name         = "multisample",
-    .description  = "Enable Multisampling",
+    .description  = "Enable Multisampling (costs GPU; rarely useful for desktop streaming)",
     .type         = OPTION_TYPE_BOOL,
-    .value.x_bool = true
+    .value.x_bool = false
   },
   {
     .module       = "egl",

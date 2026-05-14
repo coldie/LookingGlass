@@ -35,6 +35,7 @@ typedef struct TexFB
 {
   TextureBuffer base;
   struct TexDamage damage[EGL_TEX_BUFFER_MAX];
+  struct TexDamage uploadDamage[EGL_TEX_BUFFER_MAX];
 }
 TexFB;
 
@@ -53,7 +54,10 @@ static bool egl_texFBInit(EGL_Texture ** texture, EGL_TexType type,
   }
 
   for (int i = 0; i < EGL_TEX_BUFFER_MAX; ++i)
+  {
     this->damage[i].count = -1;
+    this->uploadDamage[i].count = 0;
+  }
 
   return true;
 }
@@ -73,7 +77,10 @@ bool egl_texFBSetup(EGL_Texture * texture, const EGL_TexSetup * setup)
   TexFB         * this   = UPCAST(TexFB        , parent );
 
   for (int i = 0; i < EGL_TEX_BUFFER_MAX; ++i)
+  {
     this->damage[i].count = -1;
+    this->uploadDamage[i].count = 0;
+  }
 
   return egl_texBufferStreamSetup(texture, setup);
 }
@@ -91,6 +98,8 @@ static bool egl_texFBUpdate(EGL_Texture * texture, const EGL_TexUpdate * update)
   bool damageAll = !update->rects || update->rectCount == 0 || damage->count < 0 ||
     damage->count + update->rectCount > KVMFR_MAX_DAMAGE_RECTS;
 
+  struct TexDamage * upload = this->uploadDamage + parent->bufIndex;
+
   if (damageAll)
   {
      framebuffer_read(
@@ -102,6 +111,8 @@ static bool egl_texFBUpdate(EGL_Texture * texture, const EGL_TexUpdate * update)
       texture->format.bpp,
       texture->format.pitch
     );
+
+    upload->count = -1;
   }
   else
   {
@@ -132,6 +143,15 @@ static bool egl_texFBUpdate(EGL_Texture * texture, const EGL_TexUpdate * update)
         update->frame,
         texture->format.pitch
       );
+
+      if (damage->count > KVMFR_MAX_DAMAGE_RECTS)
+        upload->count = -1;
+      else
+      {
+        memcpy(upload->rects, scaledDamageRects,
+          damage->count * sizeof(FrameDamageRect));
+        upload->count = damage->count;
+      }
     }
     else
     {
@@ -145,6 +165,15 @@ static bool egl_texFBUpdate(EGL_Texture * texture, const EGL_TexUpdate * update)
         update->frame,
         texture->format.pitch
       );
+
+      if (damage->count > KVMFR_MAX_DAMAGE_RECTS)
+        upload->count = -1;
+      else
+      {
+        memcpy(upload->rects, damage->rects,
+          damage->count * sizeof(FrameDamageRect));
+        upload->count = damage->count;
+      }
     }
   }
 
@@ -171,13 +200,87 @@ static bool egl_texFBUpdate(EGL_Texture * texture, const EGL_TexUpdate * update)
   return true;
 }
 
+static EGL_TexStatus egl_texFBProcess(EGL_Texture * texture)
+{
+  TextureBuffer * parent = UPCAST(TextureBuffer, texture);
+  TexFB         * this   = UPCAST(TexFB        , parent );
+
+  LG_LOCK(parent->copyLock);
+
+  /* If a prior upload is still in flight, do not issue a new one. Doing so
+   * would orphan the old fence and prevent the swap from advancing, which
+   * leaves rIndex stale and the consumer reading a stuck/older texture. */
+  if (parent->sync != 0 || !parent->buf[parent->bufIndex].updated)
+  {
+    LG_UNLOCK(parent->copyLock);
+    return EGL_TEX_STATUS_OK;
+  }
+
+  int             uploadIndex = parent->bufIndex;
+  GLuint          tex         = parent->tex[parent->bufIndex];
+  EGL_TexBuffer * buffer      = &parent->buf[parent->bufIndex];
+
+  parent->rIndex = parent->bufIndex;
+  if (++parent->bufIndex == parent->texCount)
+    parent->bufIndex = 0;
+
+  struct TexDamage upload = this->uploadDamage[uploadIndex];
+  this->uploadDamage[uploadIndex].count = 0;
+  buffer->updated = false;
+
+  LG_UNLOCK(parent->copyLock);
+
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buffer->pbo);
+  glBindTexture(GL_TEXTURE_2D, tex);
+
+  glPixelStorei(GL_UNPACK_ROW_LENGTH, texture->format.stride);
+
+  if (upload.count <= 0)
+  {
+    glTexSubImage2D(GL_TEXTURE_2D,
+        0, 0, 0,
+        texture->format.width,
+        texture->format.height,
+        texture->format.format,
+        texture->format.dataType,
+        (const void *)0);
+  }
+  else
+  {
+    for (int i = 0; i < upload.count; ++i)
+    {
+      FrameDamageRect rect = upload.rects[i];
+      glPixelStorei(GL_UNPACK_SKIP_PIXELS, rect.x);
+      glPixelStorei(GL_UNPACK_SKIP_ROWS  , rect.y);
+      glTexSubImage2D(GL_TEXTURE_2D,
+          0,
+          rect.x,
+          rect.y,
+          rect.width,
+          rect.height,
+          texture->format.format,
+          texture->format.dataType,
+          (const void *)0);
+    }
+    glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS  , 0);
+  }
+
+  glBindTexture(GL_TEXTURE_2D, 0);
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+  parent->sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
+  return EGL_TEX_STATUS_OK;
+}
+
 EGL_TextureOps EGL_TextureFrameBuffer =
 {
   .init    = egl_texFBInit,
   .free    = egl_texFBFree,
   .setup   = egl_texFBSetup,
   .update  = egl_texFBUpdate,
-  .process = egl_texBufferStreamProcess,
+  .process = egl_texFBProcess,
   .get     = egl_texBufferStreamGet,
   .bind    = egl_texBufferBind
 };

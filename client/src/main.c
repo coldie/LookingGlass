@@ -116,10 +116,11 @@ static bool fpsTimerFn(void * unused)
   const uint64_t renderCount = atomic_exchange_explicit(&g_state.renderCount, 0,
       memory_order_acquire);
 
+  uint64_t frameCount = 0;
   float fps, ups;
   if (renderCount > 0)
   {
-    const uint64_t frameCount = atomic_exchange_explicit(&g_state.frameCount, 0,
+    frameCount = atomic_exchange_explicit(&g_state.frameCount, 0,
         memory_order_acquire);
 
     const uint64_t time      = nanotime();
@@ -139,6 +140,11 @@ static bool fpsTimerFn(void * unused)
 
   atomic_store_explicit(&g_state.fps, fps, memory_order_relaxed);
   atomic_store_explicit(&g_state.ups, ups, memory_order_relaxed);
+
+  if (g_params.logFPS)
+    DEBUG_INFO("Client timings fps:%.2f ups:%.2f renders:%llu frames:%llu",
+        fps, ups, (unsigned long long)renderCount,
+        (unsigned long long)frameCount);
 
   return true;
 }
@@ -430,9 +436,29 @@ int main_cursorThread(void * unused)
       break;
     }
 
+    if (msg.size < sizeof(KVMFRCursor))
+    {
+      DEBUG_WARN("Ignoring invalid cursor message: size %u < %u",
+        msg.size, (unsigned)sizeof(KVMFRCursor));
+      lgmpClientMessageDone(g_state.pointerQueue);
+      continue;
+    }
+
     KVMFRCursor * tmp = (KVMFRCursor *)msg.mem;
-    const int neededSize = sizeof(*tmp) +
-      (msg.udata & CURSOR_FLAG_SHAPE ? tmp->height * tmp->pitch : 0);
+    size_t neededSize = sizeof(*tmp);
+    if (msg.udata & CURSOR_FLAG_SHAPE)
+    {
+      const uint64_t shapeSize = (uint64_t)tmp->height * tmp->pitch;
+      if (tmp->width > 512 || tmp->height > 512 ||
+          tmp->pitch > 512 * 4 || shapeSize > msg.size - sizeof(*tmp))
+      {
+        DEBUG_WARN("Ignoring invalid cursor shape: %ux%u pitch:%u msg:%u",
+          tmp->width, tmp->height, tmp->pitch, msg.size);
+        lgmpClientMessageDone(g_state.pointerQueue);
+        continue;
+      }
+      neededSize += (size_t)shapeSize;
+    }
 
     if (cursor && neededSize > cursorSize)
     {
@@ -446,11 +472,11 @@ int main_cursorThread(void * unused)
       cursor = malloc(neededSize);
       if (!cursor)
       {
-        DEBUG_ERROR("failed to allocate %d bytes for cursor", neededSize);
+        DEBUG_ERROR("failed to allocate %zu bytes for cursor", neededSize);
         g_state.state = APP_STATE_SHUTDOWN;
         break;
       }
-      cursorSize = neededSize;
+      cursorSize = (int)neededSize;
     }
 
     memcpy(cursor, msg.mem, neededSize);
@@ -691,6 +717,15 @@ int main_frameThread(void * unused)
         case FRAME_TYPE_BGR_32:
         case FRAME_TYPE_RGB_24:
           lgrFormat.bpp  = 24;
+          break;
+
+        case FRAME_TYPE_YUY2:
+        case FRAME_TYPE_UYVY:
+          lgrFormat.bpp  = 16;
+          break;
+
+        case FRAME_TYPE_NV12:
+          lgrFormat.bpp = 12;
           break;
 
         default:

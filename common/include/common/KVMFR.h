@@ -28,7 +28,7 @@
 #include "types.h"
 
 #define KVMFR_MAGIC   "KVMFR---"
-#define KVMFR_VERSION 20
+#define KVMFR_VERSION 21
 
 #define KVMFR_MAX_DAMAGE_RECTS 64
 
@@ -139,7 +139,14 @@ enum
   FRAME_FLAG_REQUEST_ACTIVATION = 0x2 ,
   FRAME_FLAG_TRUNCATED          = 0x4 , // ivshmem was too small for the frame
   FRAME_FLAG_HDR                = 0x8 , // RGBA10 may not be HDR
-  FRAME_FLAG_HDR_PQ             = 0x10  // HDR PQ has been applied to the frame
+  FRAME_FLAG_HDR_PQ             = 0x10, // HDR PQ has been applied to the frame
+  // Body is being written by the host (post-then-write / streaming). When
+  // set, the frame metadata is valid but the pixel data has not finished
+  // landing in IVSHMEM yet. The host clears this bit with release-store
+  // semantics once the GPU/CPU write retires. Clients should acquire-load
+  // this flag and spin (with a bounded timeout) before consuming the body.
+  // Hosts that complete the write before posting MUST leave this clear.
+  FRAME_FLAG_BODY_PENDING       = 0x20
 };
 
 typedef uint32_t KVMFRFrameFlags;

@@ -174,6 +174,7 @@ struct AppParams
   unsigned int         w, h;
   bool                 setGuestRes;
   int                  fpsMin;
+  bool                 logFPS;
   LG_RendererRotate    winRotate;
   bool                 useSpice;
   bool                 useSpiceInput;

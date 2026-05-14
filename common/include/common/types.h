@@ -57,6 +57,10 @@ typedef enum FrameType
   FRAME_TYPE_RGBA16F   , // RGBA interleaved: R,G,B,A 16,16,16,16 bpp float
   FRAME_TYPE_BGR_32    , // BGR 24-bpp in 32bpp
   FRAME_TYPE_RGB_24    , // RGB 24-bpp
+  FRAME_TYPE_NV12      , // YUV 4:2:0 planar: Y plane, interleaved UV plane
+  FRAME_TYPE_YUY2      , // YUV 4:2:2 packed: Y0,U,Y1,V
+  FRAME_TYPE_UYVY      , // YUV 4:2:2 packed: U,Y0,V,Y1
+  FRAME_TYPE_P010      , // YUV 4:2:0 10-bit planar in 16-bit samples
   FRAME_TYPE_MAX       , // sentinel value
 }
 FrameType;

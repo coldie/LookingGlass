@@ -23,6 +23,7 @@
 #include "common/windebug.h"
 
 #include <windows.h>
+#include <stdlib.h>
 
 struct LGThread
 {
@@ -42,6 +43,32 @@ static DWORD WINAPI threadWrapper(LPVOID lpParameter)
   return 0;
 }
 
+typedef HRESULT (WINAPI * SetThreadDescriptionFn)(HANDLE hThread,
+    PCWSTR lpThreadDescription);
+
+static void setThreadName(HANDLE thread, const char * name)
+{
+  if (!thread || !name || !*name)
+    return;
+
+  HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+  if (!kernel32)
+    return;
+
+  SetThreadDescriptionFn setThreadDescription =
+    (SetThreadDescriptionFn)GetProcAddress(kernel32, "SetThreadDescription");
+  if (!setThreadDescription)
+    return;
+
+  wchar_t wideName[64];
+  const int written = MultiByteToWideChar(CP_UTF8, 0, name, -1,
+    wideName, ARRAYSIZE(wideName));
+  if (written <= 0)
+    return;
+
+  setThreadDescription(thread, wideName);
+}
+
 bool lgCreateThread(const char * name, LGThreadFunction function, void * opaque, LGThread ** handle)
 {
   *handle             = malloc(sizeof(**handle));
@@ -58,6 +85,7 @@ bool lgCreateThread(const char * name, LGThreadFunction function, void * opaque,
     return false;
   }
 
+  setThreadName((*handle)->handle, name);
   return true;
 }
 
@@ -91,4 +119,3 @@ bool lgJoinThread(LGThread * handle, int * resultCode)
   DEBUG_WINERROR("Unknown failure waiting for thread", GetLastError());
   return false;
 }
-

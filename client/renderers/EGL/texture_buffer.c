@@ -271,7 +271,7 @@ EGL_TexStatus egl_texBufferStreamGet(EGL_Texture * texture, GLuint * tex,
   if (this->sync)
   {
     switch(glClientWaitSync(
-          this->sync, GL_SYNC_FLUSH_COMMANDS_BIT, 40000000)) //40ms
+          this->sync, GL_SYNC_FLUSH_COMMANDS_BIT, 0)) //non-blocking
     {
       case GL_ALREADY_SIGNALED:
       case GL_CONDITION_SATISFIED:
@@ -280,6 +280,15 @@ EGL_TexStatus egl_texBufferStreamGet(EGL_Texture * texture, GLuint * tex,
         break;
 
       case GL_TIMEOUT_EXPIRED:
+        // Upload still in flight; leave the sync for the next call to poll.
+        // Fall back to the previously-completed texture in the ping-pong
+        // so the render thread never stalls. Only safe when we have more
+        // than one texture and at least one frame has been completed.
+        if (this->texCount > 1 && this->rIndex != -1)
+        {
+          *tex = this->tex[(this->rIndex + 1) % 2];
+          return EGL_TEX_STATUS_OK;
+        }
         return EGL_TEX_STATUS_NOTREADY;
 
       case GL_WAIT_FAILED:

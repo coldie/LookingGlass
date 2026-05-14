@@ -28,6 +28,16 @@
 #include "egldebug.h"
 #include "egl_dynprocs.h"
 
+#ifndef DRM_FORMAT_NV12
+#define DRM_FORMAT_NV12 fourcc_code('N', 'V', '1', '2')
+#endif
+#ifndef DRM_FORMAT_YUYV
+#define DRM_FORMAT_YUYV fourcc_code('Y', 'U', 'Y', 'V')
+#endif
+#ifndef DRM_FORMAT_UYVY
+#define DRM_FORMAT_UYVY fourcc_code('U', 'Y', 'V', 'Y')
+#endif
+
 bool egl_texUtilGetFormat(const EGL_TexSetup * setup, EGL_TexFormat * fmt)
 {
   fmt->pixFmt = setup->pixFmt;
@@ -86,6 +96,30 @@ bool egl_texUtilGetFormat(const EGL_TexSetup * setup, EGL_TexFormat * fmt)
       fmt->intFormat  = GL_BGRA_EXT;
       fmt->dataType   = GL_UNSIGNED_BYTE;
       fmt->fourcc     = DRM_FORMAT_RGB888;
+      break;
+
+    case EGL_PF_NV12:
+      // Single-buffer NV12 transport: Y plane followed by interleaved UV,
+      // packed as four consecutive bytes per RGBA8 texel. The desktop
+      // shader interprets the layout.
+      fmt->bpp        = 4;
+      fmt->format     = GL_RGBA;
+      fmt->intFormat  = GL_RGBA;
+      fmt->dataType   = GL_UNSIGNED_BYTE;
+      fmt->fourcc     = DRM_FORMAT_NV12;
+      break;
+
+    case EGL_PF_YUY2:
+    case EGL_PF_UYVY:
+      // Packed 4:2:2 stores two output pixels in one RGBA8 texel:
+      // YUY2: R=Y0, G=U, B=Y1, A=V
+      // UYVY: R=U, G=Y0, B=V, A=Y1
+      fmt->bpp        = 4;
+      fmt->format     = GL_RGBA;
+      fmt->intFormat  = GL_RGBA;
+      fmt->dataType   = GL_UNSIGNED_BYTE;
+      fmt->fourcc     = setup->pixFmt == EGL_PF_YUY2 ?
+        DRM_FORMAT_YUYV : DRM_FORMAT_UYVY;
       break;
 
     default:

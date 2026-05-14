@@ -292,7 +292,7 @@ static EGL_TexStatus egl_texDMABUFGet(EGL_Texture * texture, GLuint * tex,
 
   if (sync)
   {
-    switch (glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 20000000)) //20ms
+    switch (glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 0)) //non-blocking
     {
       case GL_ALREADY_SIGNALED:
       case GL_CONDITION_SATISFIED:
@@ -300,6 +300,7 @@ static EGL_TexStatus egl_texDMABUFGet(EGL_Texture * texture, GLuint * tex,
         break;
 
       case GL_TIMEOUT_EXPIRED:
+      {
         // Put it back for next try
         INTERLOCKED_SECTION(parent->copyLock,
         {
@@ -308,7 +309,19 @@ static EGL_TexStatus egl_texDMABUFGet(EGL_Texture * texture, GLuint * tex,
           else
             glDeleteSync(sync);
         });
+
+        // Fall back to the other ping-pong image if it has been bound to
+        // a real GL texture; this avoids stalling the render thread.
+        struct FdImage * other = &this->images[!this->lastIndex];
+        if (other->texIndex >= 0)
+        {
+          *tex = parent->tex[other->texIndex];
+          if (fmt)
+            *fmt = this->pixFmt;
+          return EGL_TEX_STATUS_OK;
+        }
         return EGL_TEX_STATUS_NOTREADY;
+      }
 
       case GL_WAIT_FAILED:
       case GL_INVALID_VALUE:
