@@ -12,6 +12,7 @@ precision highp int;
 #define FRAME_TYPE_NV12 7
 #define FRAME_TYPE_YUY2 8
 #define FRAME_TYPE_UYVY 9
+#define FRAME_TYPE_P010 10
 
 #include "color_blind.h"
 #include "hdr.h"
@@ -30,7 +31,11 @@ uniform int   cbMode;
 uniform bool  isHDR;
 uniform bool  mapHDRtoSDR;
 uniform float mapHDRGain;
+uniform float hdrMaxCLL;
 uniform bool  mapHDRPQ;
+uniform bool  hdrOutputPQ;
+uniform int   hdrMappingMode;
+uniform int   hdrViewMode;
 
 vec3 yuvToRgb(float y, float u, float v)
 {
@@ -40,6 +45,16 @@ vec3 yuvToRgb(float y, float u, float v)
     y + 1.5748 * v,
     y - 0.1873 * u - 0.4681 * v,
     y + 1.8556 * u);
+}
+
+vec3 yuvToRgbBT2020(float y, float u, float v)
+{
+  u -= 0.5;
+  v -= 0.5;
+  return vec3(
+    y + 1.4746 * v,
+    y - 0.1646 * u - 0.5714 * v,
+    y + 1.8814 * u);
 }
 
 vec4 sampleNV12(vec2 pos)
@@ -66,6 +81,40 @@ vec4 sampleNV12(vec2 pos)
   return vec4(clamp(yuvToRgb(y, u, v), 0.0, 1.0), 1.0);
 }
 
+vec4 sampleP010(vec2 pos)
+{
+  ivec2 pixel = ivec2(clamp(pos * desktopSize,
+    vec2(0.0), max(desktopSize - vec2(1.0), vec2(0.0))));
+  int yHeight = int(desktopSize.y);
+  int uvX = (pixel.x / 2) * 2;
+  int uvY = yHeight + pixel.y / 2;
+
+  vec4 yv = texelFetch(sampler1, ivec2(pixel.x / 4, pixel.y), 0);
+  vec4 uvv0 = texelFetch(sampler1, ivec2(uvX / 4, uvY), 0);
+  vec4 uvv1 = texelFetch(sampler1, ivec2((uvX + 1) / 4, uvY), 0);
+
+  float y = pixel.x % 4 == 0 ? yv.r :
+            pixel.x % 4 == 1 ? yv.g :
+            pixel.x % 4 == 2 ? yv.b : yv.a;
+  float u = uvX % 4 == 0 ? uvv0.r :
+            uvX % 4 == 1 ? uvv0.g :
+            uvX % 4 == 2 ? uvv0.b : uvv0.a;
+  float v = (uvX + 1) % 4 == 0 ? uvv1.r :
+            (uvX + 1) % 4 == 1 ? uvv1.g :
+            (uvX + 1) % 4 == 2 ? uvv1.b : uvv1.a;
+  return vec4(clamp(yuvToRgbBT2020(y, u, v), 0.0, 1.0), 1.0);
+}
+
+float sampleP010Y(vec2 pos)
+{
+  ivec2 pixel = ivec2(clamp(pos * desktopSize,
+    vec2(0.0), max(desktopSize - vec2(1.0), vec2(0.0))));
+  vec4 yv = texelFetch(sampler1, ivec2(pixel.x / 4, pixel.y), 0);
+  return pixel.x % 4 == 0 ? yv.r :
+         pixel.x % 4 == 1 ? yv.g :
+         pixel.x % 4 == 2 ? yv.b : yv.a;
+}
+
 vec4 sampleYUY2(vec2 pos)
 {
   ivec2 pixel = ivec2(clamp(pos * desktopSize,
@@ -86,8 +135,12 @@ vec4 sampleUYVY(vec2 pos)
 
 void main()
 {
+  vec3 hdrSource = vec3(0.0);
+
   if (frameType == FRAME_TYPE_NV12)
     color = sampleNV12(uv);
+  else if (frameType == FRAME_TYPE_P010)
+    color = sampleP010(uv);
   else if (frameType == FRAME_TYPE_YUY2)
     color = sampleYUY2(uv);
   else if (frameType == FRAME_TYPE_UYVY)
@@ -108,8 +161,35 @@ void main()
     }
   }
 
-  if (isHDR && mapHDRtoSDR)
-    color.rgb = mapToSDR(color.rgb, mapHDRGain, mapHDRPQ);
+  hdrSource = color.rgb;
+
+  if (isHDR && hdrViewMode == HDR_VIEW_FALSE_COLOR)
+  {
+    float lum = frameType == FRAME_TYPE_P010 ?
+      hdrPQLuminance(sampleP010Y(uv)) :
+      hdrLuminance(hdrSource, mapHDRGain, mapHDRPQ);
+    color.rgb = falseColorHDR(lum);
+    color.a = 1.0;
+    return;
+  }
+
+  if (isHDR && mapHDRtoSDR && !hdrOutputPQ)
+  {
+    color.rgb = mapToSDR(color.rgb, mapHDRGain, mapHDRPQ, hdrMappingMode);
+  }
+  else if (isHDR && hdrOutputPQ && mapHDRPQ && hdrMappingMode != HDR_MAPPING_OFF)
+  {
+    color.rgb = mapPQToTarget(color.rgb, mapHDRGain, hdrMaxCLL, hdrMappingMode);
+  }
+  else if (isHDR && hdrOutputPQ && !mapHDRPQ)
+  {
+    color.rgb = linear709ToBt2020PQ(color.rgb, mapHDRGain, hdrMaxCLL,
+      hdrMappingMode);
+  }
+  else if (!isHDR && hdrOutputPQ)
+  {
+    color.rgb = sdr709ToBt2020PQ(color.rgb);
+  }
 
   if (cbMode > 0)
     color = cbTransform(color, cbMode);

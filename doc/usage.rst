@@ -412,6 +412,10 @@ All command line options
   +-------------------+-------+-------+---------------------------------------------------------------------------+
   | egl:maxCLL        |       | 10000 | Maximum content light level in nits for HDR to SDR mapping                |
   +-------------------+-------+-------+---------------------------------------------------------------------------+
+  | egl:hdrMetadataPeak|       | 2560  | Maximum mastering/content luminance in nits for HDR presentation metadata |
+  +-------------------+-------+-------+---------------------------------------------------------------------------+
+  | egl:hdrMetadataFALL|       | 500   | Maximum frame-average luminance in nits for HDR presentation metadata     |
+  +-------------------+-------+-------+---------------------------------------------------------------------------+
   | egl:preset        |       | NULL  | The initial filter preset to load                                         |
   +-------------------+-------+-------+---------------------------------------------------------------------------+
 

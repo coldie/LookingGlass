@@ -35,6 +35,8 @@
 #include "wgc_profile_d3d11.h"
 
 #include <stdint.h>
+#include <float.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,6 +46,7 @@
 #define WGC_D3D12_COPY_QUEUE_MAX 8
 #define WGC_D3D12_TILE_SPAN_MAX 1024
 #define WGC_STATS_SAMPLE_MAX 512
+#define WGC_HDR_STATS_GRID 16
 
 typedef enum WGCTiledCopyMode
 {
@@ -480,6 +483,12 @@ struct WGCInstance
   ID3D12Fence       ** wgcD3D12Fence;
   UINT64               wgcFenceValue;
   ID3D11ComputeShader ** nv12Shader;
+  bool                 nv12ShaderStateValid;
+  bool                 nv12ShaderPqPreserve;
+  bool                 nv12ShaderHdrToneMap;
+  DXGI_COLOR_SPACE_TYPE nv12ShaderColorSpace;
+  DXGI_FORMAT          nv12ShaderIvshmemFormat;
+  ID3D11Texture2D      ** hdrStatsTexture;
 
   // True iff the two-device bridge path is active (separate WGC + D3D11On12
   // devices, with the cross-device fence and bridge textures). When false,
@@ -505,6 +514,7 @@ struct WGCInstance
   unsigned            ivshmemWidth;
   unsigned            ivshmemHeight;
   DXGI_FORMAT         ivshmemFormat;
+  DXGI_FORMAT         captureFormatHint;
   uint64_t            ivshmemSlotSize;
   bool                ivshmemEnvReady;
 
@@ -559,9 +569,11 @@ struct WGCInstance
   volatile LONG   d3d12FenceWaitSampleOverflow;
   LONG64          d3d12FenceWaitSamples[WGC_STATS_SAMPLE_MAX];
   uint64_t debugStatsLastLog;
+  uint64_t hdrStatsLastLog;
 
   SizeInt32 size;
   RECT outputRect;
+  IDXGIOutput * output;
   DXGI_COLOR_SPACE_TYPE colorSpace;
   bool roInitialized;
   unsigned emptyPolls;
@@ -634,6 +646,8 @@ static bool wgc_selectAsyncSlot(WGCInstance * this, unsigned * frameBufferIndex)
 
 static bool wgc_createCaptureItem(WGCInstance * this, HMONITOR monitor);
 static bool wgc_createFramePool(WGCInstance * this);
+static DXGI_COLOR_SPACE_TYPE wgc_getOutputColorSpace(WGCInstance * this);
+static DXGI_FORMAT wgc_expectedSourceFormat(WGCInstance * this);
 static bool wgc_asyncFrameReady(WGCInstance * this);
 static void wgc_accumulateDamage(WGCInstance * this, const WGCFrameInfo * src);
 static void wgc_clearAccumulatedDamage(WGCFrameInfo * frame);
@@ -641,6 +655,7 @@ static void wgc_copyFrameTexture(WGCInstance * this, WGCFrameInfo * dst,
   ID3D11Texture2D * src, bool publishCopy);
 static bool wgc_copyFrameTextureD3D12(WGCInstance * this, WGCFrameInfo * dst);
 static void wgc_waitFrameD3D12Copy(WGCInstance * this, WGCFrameInfo * frame);
+static void wgc_drainGpuWork(WGCInstance * this);
 static void wgc_copyFrameTextureRectCtx(ID3D11DeviceContext4 * ctx,
   ID3D11Resource * dst, ID3D11Resource * src, const RECT * rect);
 static bool wgc_ensureAllFrames(WGCInstance * this, ID3D11Texture2D * src);
@@ -656,6 +671,7 @@ static void wgc_updateDamage(WGCInstance * this, WGCFrameInfo * info,
 static bool wgc_shouldForceFullCopyAfterGap(WGCInstance * this,
   WGCFrameInfo * frame);
 static void wgc_maybeLogDebugStats(WGCInstance * this);
+static void wgc_maybeLogHDRStats(WGCInstance * this, ID3D11Texture2D * src);
 static void wgc_maybeDwmFlushOnGap(WGCInstance * this);
 static void wgc_recordProfileStage(WGCInstance * this, WGCProfileStage stage,
   uint64_t elapsedUs);
@@ -678,6 +694,10 @@ static bool wgc_createHString(const WCHAR * str, HSTRING * result);
 static void wgc_waitCallbacks(WGCFrameEventHandler * handler);
 static bool wgc_isIvshmemPublishMode(WGCPublishMode mode);
 static bool wgc_isNV12PackedIvshmem(const WGCInstance * this);
+static bool wgc_isP010PackedIvshmem(const WGCInstance * this);
+static bool wgc_isRGBA10PQIvshmem(const WGCInstance * this);
+static bool wgc_isPackedYuvIvshmem(const WGCInstance * this);
+static bool wgc_needsEncodeShader(const WGCInstance * this);
 static bool wgc_colorSpaceIsHDR(DXGI_COLOR_SPACE_TYPE colorSpace);
 
 static const ITypedEventHandler_Direct3D11CaptureFramePool_IInspectableVtbl
@@ -1065,6 +1085,8 @@ static bool wgc_init(D12Backend * instance, bool debug, ID3D12Device3 * device,
     goto exit;
   }
   this->outputRect = outputDesc.DesktopCoordinates;
+  this->output = output;
+  IDXGIOutput_AddRef(this->output);
 
   DISPLAYCONFIG_PATH_INFO pathInfo;
   if (display_getPathInfo(outputDesc.Monitor, &pathInfo))
@@ -1092,16 +1114,7 @@ static bool wgc_init(D12Backend * instance, bool debug, ID3D12Device3 * device,
     goto exit;
   }
 
-  comRef_defineLocal(IDXGIOutput6, output6);
-  hr = IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput6, (void **)output6);
-  if (FAILED(hr))
-    this->colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-  else
-  {
-    DXGI_OUTPUT_DESC1 desc1;
-    IDXGIOutput6_GetDesc1(*output6, &desc1);
-    this->colorSpace = desc1.ColorSpace;
-  }
+  this->colorSpace = wgc_getOutputColorSpace(this);
 
   // Prefer the explicitly passed D12 device; else use the loaned one
   // (typically the one bound to the D3D11On12 wrapper).
@@ -1335,6 +1348,24 @@ static bool wgc_deinit(D12Backend * instance)
 {
   WGCInstance * this = UPCAST(WGCInstance, instance);
 
+  if (this->handler)
+  {
+    InterlockedExchange(&this->handler->stopping, 1);
+    this->handler->owner = NULL;
+  }
+
+  if (this->framePool && *this->framePool && this->frameArrivedToken.value)
+  {
+    IDirect3D11CaptureFramePool_remove_FrameArrived(
+      *this->framePool, this->frameArrivedToken);
+    this->frameArrivedToken.value = 0;
+  }
+
+  if (this->handler)
+    wgc_waitCallbacks(this->handler);
+
+  wgc_drainGpuWork(this);
+
   for(unsigned i = 0; i < WGC_D3D12_COPY_QUEUE_MAX; ++i)
   {
     WGC_TRACY_D3D12_DESTROY(this->tracyD3D12CopyCtx[i]);
@@ -1364,22 +1395,6 @@ static bool wgc_deinit(D12Backend * instance)
     this->cursorLockCreated = false;
   }
 
-  if (this->handler)
-  {
-    InterlockedExchange(&this->handler->stopping, 1);
-    this->handler->owner = NULL;
-  }
-
-  if (this->framePool && *this->framePool && this->frameArrivedToken.value)
-  {
-    IDirect3D11CaptureFramePool_remove_FrameArrived(
-      *this->framePool, this->frameArrivedToken);
-    this->frameArrivedToken.value = 0;
-  }
-
-  if (this->handler)
-    wgc_waitCallbacks(this->handler);
-
   if (this->session && *this->session)
     wgc_closeInspectable((IInspectable *)*this->session);
 
@@ -1391,6 +1406,12 @@ static bool wgc_deinit(D12Backend * instance)
   comRef_release(this->item);
   comRef_release(this->graphicsDevice);
   comRef_release(this->nv12Shader);
+  comRef_release(this->hdrStatsTexture);
+  if (this->output)
+  {
+    IDXGIOutput_Release(this->output);
+    this->output = NULL;
+  }
 
   if (this->frameEvent)
   {
@@ -1496,6 +1517,16 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
     goto exit;
   }
 
+  const DXGI_COLOR_SPACE_TYPE colorSpace = wgc_getOutputColorSpace(this);
+  if (colorSpace != this->colorSpace)
+  {
+    DEBUG_INFO("WGC color space changed 0x%x -> 0x%x, reinitializing",
+      (unsigned)this->colorSpace, (unsigned)colorSpace);
+    this->colorSpace = colorSpace;
+    result = CAPTURE_RESULT_REINIT;
+    goto exit;
+  }
+
   if (!this->loggedFirstFrame)
   {
     D3D11_TEXTURE2D_DESC firstDesc;
@@ -1560,6 +1591,19 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
     DEBUG_WINERROR("Failed to get WGC D3D11 texture", hr);
     goto exit;
   }
+
+  D3D11_TEXTURE2D_DESC srcDesc;
+  ID3D11Texture2D_GetDesc(*src, &srcDesc);
+  const DXGI_FORMAT expectedFormat = wgc_expectedSourceFormat(this);
+  if (srcDesc.Format != expectedFormat)
+  {
+    DEBUG_INFO("WGC source format changed 0x%x -> 0x%x, reinitializing",
+      (unsigned)expectedFormat, (unsigned)srcDesc.Format);
+    result = CAPTURE_RESULT_REINIT;
+    goto exit;
+  }
+  wgc_maybeLogHDRStats(this, *src);
+
   if (profile)
     wgc_recordProfileStage(this, WGC_PROFILE_ACQUIRE,
       microtime() - profileStart);
@@ -2004,6 +2048,16 @@ static CaptureResult wgc_capture(D12Backend * instance,
 
   if (!frame)
   {
+    const DXGI_COLOR_SPACE_TYPE colorSpace = wgc_getOutputColorSpace(this);
+    if (colorSpace != this->colorSpace)
+    {
+      DEBUG_INFO("WGC color space changed while idle 0x%x -> 0x%x, reinitializing",
+        (unsigned)this->colorSpace, (unsigned)colorSpace);
+      this->colorSpace = colorSpace;
+      result = CAPTURE_RESULT_REINIT;
+      goto exit;
+    }
+
     wgc_maybeDwmFlushOnGap(this);
     if (++this->emptyPolls % 30 == 0)
       DEBUG_INFO("WGC has no pending frame (idx=%u publishMode=%d emptyPolls=%u events:%ld)",
@@ -2128,7 +2182,7 @@ static bool wgc_createCaptureItem(WGCInstance * this, HMONITOR monitor)
 {
   bool result = false;
   HRESULT hr;
-  comRef_scopePush(2);
+  comRef_scopePush(4);
 
   HSTRING className = NULL;
   if (!wgc_createHString(RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureItem,
@@ -2187,7 +2241,9 @@ static bool wgc_createFramePool(WGCInstance * this)
   const bool hdrSource = wgc_colorSpaceIsHDR(this->colorSpace);
   const bool hdrCapablePublish =
     this->ivshmemFormat == DXGI_FORMAT_R16G16B16A16_FLOAT ||
-    wgc_isNV12PackedIvshmem(this);
+    wgc_isRGBA10PQIvshmem(this) ||
+    this->captureFormatHint == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+    wgc_isPackedYuvIvshmem(this);
   const DirectXPixelFormat poolFormat =
     (hdrSource && hdrCapablePublish) ?
       DirectXPixelFormat_R16G16B16A16Float :
@@ -2404,6 +2460,145 @@ static void wgc_recordSample(volatile LONG * sampleCount,
     InterlockedExchange(overflow, 1);
 }
 
+static float wgc_halfToFloat(uint16_t h)
+{
+  const uint16_t sign = h >> 15;
+  const uint16_t exp  = (h >> 10) & 0x1f;
+  const uint16_t mant = h & 0x03ff;
+  float value;
+
+  if (exp == 0)
+    value = mant ? ldexpf((float)mant / 1024.0f, -14) : 0.0f;
+  else if (exp == 31)
+    value = mant ? 0.0f : 65504.0f;
+  else
+    value = ldexpf(1.0f + (float)mant / 1024.0f, (int)exp - 15);
+
+  return sign ? -value : value;
+}
+
+static bool wgc_ensureHDRStatsTexture(WGCInstance * this)
+{
+  if (this->hdrStatsTexture && *this->hdrStatsTexture)
+    return true;
+
+  comRef_scopePush(2);
+  comRef_defineLocal(ID3D11Texture2D, texture);
+  D3D11_TEXTURE2D_DESC desc =
+  {
+    .Width          = WGC_HDR_STATS_GRID,
+    .Height         = WGC_HDR_STATS_GRID,
+    .MipLevels      = 1,
+    .ArraySize      = 1,
+    .Format         = DXGI_FORMAT_R16G16B16A16_FLOAT,
+    .SampleDesc     = { .Count = 1, .Quality = 0 },
+    .Usage          = D3D11_USAGE_STAGING,
+    .CPUAccessFlags = D3D11_CPU_ACCESS_READ,
+  };
+
+  HRESULT hr = ID3D11Device5_CreateTexture2D(*this->device, &desc, NULL,
+    texture);
+  if (FAILED(hr))
+  {
+    DEBUG_WINERROR("WGC HDR stats staging texture creation failed", hr);
+    comRef_scopePop();
+    return false;
+  }
+
+  comRef_toGlobal(this->hdrStatsTexture, texture);
+  comRef_scopePop();
+  return true;
+}
+
+static void wgc_maybeLogHDRStats(WGCInstance * this, ID3D11Texture2D * src)
+{
+  if (!this->debugStats)
+    return;
+
+  const uint64_t now = microtime();
+  if (now - this->hdrStatsLastLog < 1000000)
+    return;
+
+  D3D11_TEXTURE2D_DESC srcDesc;
+  ID3D11Texture2D_GetDesc(src, &srcDesc);
+  if (srcDesc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT)
+    return;
+
+  this->hdrStatsLastLog = now;
+  if (!wgc_ensureHDRStatsTexture(this))
+    return;
+
+  for(unsigned y = 0; y < WGC_HDR_STATS_GRID; ++y)
+  {
+    const UINT sy = WGC_HDR_STATS_GRID == 1 ? 0 :
+      (UINT)(((uint64_t)y * (srcDesc.Height - 1)) /
+        (WGC_HDR_STATS_GRID - 1));
+    for(unsigned x = 0; x < WGC_HDR_STATS_GRID; ++x)
+    {
+      const UINT sx = WGC_HDR_STATS_GRID == 1 ? 0 :
+        (UINT)(((uint64_t)x * (srcDesc.Width - 1)) /
+          (WGC_HDR_STATS_GRID - 1));
+      const D3D11_BOX box =
+      {
+        .left   = sx,
+        .top    = sy,
+        .front  = 0,
+        .right  = sx + 1,
+        .bottom = sy + 1,
+        .back   = 1
+      };
+      ID3D11DeviceContext4_CopySubresourceRegion1(*this->context,
+        (ID3D11Resource *)*this->hdrStatsTexture,
+        0, x, y, 0, (ID3D11Resource *)src, 0, &box, 0);
+    }
+  }
+
+  D3D11_MAPPED_SUBRESOURCE mapped;
+  HRESULT hr = ID3D11DeviceContext4_Map(*this->context,
+    (ID3D11Resource *)*this->hdrStatsTexture, 0, D3D11_MAP_READ, 0, &mapped);
+  if (FAILED(hr))
+  {
+    DEBUG_WINERROR("WGC HDR stats staging map failed", hr);
+    return;
+  }
+
+  LONG64 lumMilli[WGC_HDR_STATS_GRID * WGC_HDR_STATS_GRID];
+  float minLum = FLT_MAX;
+  float maxLum = 0.0f;
+  double sumLum = 0.0;
+  unsigned count = 0;
+
+  for(unsigned y = 0; y < WGC_HDR_STATS_GRID; ++y)
+  {
+    const uint8_t * row = (const uint8_t *)mapped.pData +
+      (size_t)y * mapped.RowPitch;
+    for(unsigned x = 0; x < WGC_HDR_STATS_GRID; ++x)
+    {
+      const uint16_t * px = (const uint16_t *)row + x * 4;
+      const float r = max(0.0f, wgc_halfToFloat(px[0]));
+      const float g = max(0.0f, wgc_halfToFloat(px[1]));
+      const float b = max(0.0f, wgc_halfToFloat(px[2]));
+      const float lum = r * 0.2126f + g * 0.7152f + b * 0.0722f;
+      minLum = min(minLum, lum);
+      maxLum = max(maxLum, lum);
+      sumLum += lum;
+      lumMilli[count++] = (LONG64)(lum * 1000.0f + 0.5f);
+    }
+  }
+
+  ID3D11DeviceContext4_Unmap(*this->context,
+    (ID3D11Resource *)*this->hdrStatsTexture, 0);
+
+  const LONG64 p95 = wgc_percentileLong64(lumMilli, (LONG)count, 95);
+  const LONG64 p99 = wgc_percentileLong64(lumMilli, (LONG)count, 99);
+  const double avgLum = count ? sumLum / count : 0.0;
+  DEBUG_INFO("WGC HDR RGBA16F stats scRGB-luma min/avg/p95/p99/max: "
+    "%.3f/%.3f/%.3f/%.3f/%.3f samples:%u grid:%ux%u",
+    (double)minLum, avgLum, (double)p95 / 1000.0,
+    (double)p99 / 1000.0, (double)maxLum, count,
+    WGC_HDR_STATS_GRID, WGC_HDR_STATS_GRID);
+}
+
 static void wgc_maybeLogDebugStats(WGCInstance * this)
 {
   if (!this->debugStats)
@@ -2573,26 +2768,33 @@ static void wgc_clearAccumulatedDamage(WGCFrameInfo * frame)
   frame->nbPendingDirtyRects = 0;
 }
 
+static bool wgc_frameHasResources(const WGCFrameInfo * frame)
+{
+  return frame->texture || frame->d12Res || frame->fence ||
+    frame->d12Fence || frame->ivshmemD12Res || frame->bridgeA ||
+    frame->bridgeB || frame->bridge12 || frame->encodeUav;
+}
+
+static void wgc_releaseFrameResources(WGCFrameInfo * frame)
+{
+  comRef_release(frame->texture);
+  comRef_release(frame->d12Res);
+  comRef_release(frame->fence);
+  comRef_release(frame->d12Fence);
+  comRef_release(frame->ivshmemD12Res);
+  comRef_release(frame->bridgeA);
+  comRef_release(frame->bridgeB);
+  comRef_release(frame->bridge12);
+  comRef_release(frame->encodeUav);
+  memset(&frame->format, 0, sizeof(frame->format));
+  frame->fenceValue = 0;
+  frame->copiedOnce = false;
+  frame->ready      = false;
+}
+
 static void wgc_releaseFrameInfo(WGCFrameInfo * frame)
 {
-  if (frame->texture)
-    comRef_release(frame->texture);
-  if (frame->d12Res)
-    comRef_release(frame->d12Res);
-  if (frame->fence)
-    comRef_release(frame->fence);
-  if (frame->d12Fence)
-    comRef_release(frame->d12Fence);
-  if (frame->ivshmemD12Res)
-    comRef_release(frame->ivshmemD12Res);
-  if (frame->bridgeA)
-    comRef_release(frame->bridgeA);
-  if (frame->bridgeB)
-    comRef_release(frame->bridgeB);
-  if (frame->bridge12)
-    comRef_release(frame->bridge12);
-  if (frame->encodeUav)
-    comRef_release(frame->encodeUav);
+  wgc_releaseFrameResources(frame);
   memset(frame, 0, sizeof(*frame));
 }
 
@@ -2624,7 +2826,38 @@ static void wgc_copyFrameTextureRectCtx(ID3D11DeviceContext4 * ctx,
 
 static bool wgc_isNV12PackedIvshmem(const WGCInstance * this)
 {
-  return this->ivshmemFormat == DXGI_FORMAT_R8G8B8A8_UNORM;
+  return this->ivshmemFormat == DXGI_FORMAT_R8G8B8A8_UNORM &&
+    !wgc_isRGBA10PQIvshmem(this);
+}
+
+static bool wgc_isP010PackedIvshmem(const WGCInstance * this)
+{
+  return this->ivshmemFormat == DXGI_FORMAT_R16G16B16A16_UINT;
+}
+
+static bool wgc_isRGBA10PQIvshmem(const WGCInstance * this)
+{
+  return this->ivshmemFormat == DXGI_FORMAT_R8G8B8A8_UNORM &&
+    this->captureFormatHint == DXGI_FORMAT_R16G16B16A16_FLOAT;
+}
+
+static bool wgc_isPackedYuvIvshmem(const WGCInstance * this)
+{
+  return wgc_isNV12PackedIvshmem(this) || wgc_isP010PackedIvshmem(this);
+}
+
+static bool wgc_needsEncodeShader(const WGCInstance * this)
+{
+  return wgc_isPackedYuvIvshmem(this) || wgc_isRGBA10PQIvshmem(this);
+}
+
+static void wgc_invalidateNV12Shader(WGCInstance * this)
+{
+  if (!this)
+    return;
+
+  comRef_release(this->nv12Shader);
+  this->nv12ShaderStateValid = false;
 }
 
 static bool wgc_colorSpaceIsHDR(DXGI_COLOR_SPACE_TYPE colorSpace)
@@ -2632,6 +2865,39 @@ static bool wgc_colorSpaceIsHDR(DXGI_COLOR_SPACE_TYPE colorSpace)
   return colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
          colorSpace == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020 ||
          colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+}
+
+static DXGI_COLOR_SPACE_TYPE wgc_getOutputColorSpace(WGCInstance * this)
+{
+  if (!this->output)
+    return DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+
+  DXGI_COLOR_SPACE_TYPE colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+  IDXGIOutput6 * output6 = NULL;
+  HRESULT hr = IDXGIOutput_QueryInterface(this->output, &IID_IDXGIOutput6,
+    (void **)&output6);
+  if (SUCCEEDED(hr))
+  {
+    DXGI_OUTPUT_DESC1 desc1;
+    hr = IDXGIOutput6_GetDesc1(output6, &desc1);
+    if (SUCCEEDED(hr))
+      colorSpace = desc1.ColorSpace;
+    IDXGIOutput6_Release(output6);
+  }
+  return colorSpace;
+}
+
+static DXGI_FORMAT wgc_expectedSourceFormat(WGCInstance * this)
+{
+  const bool hdrSource = wgc_colorSpaceIsHDR(this->colorSpace);
+  const bool hdrCapablePublish =
+    this->ivshmemFormat == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+    this->captureFormatHint == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+    wgc_isPackedYuvIvshmem(this);
+
+  return (hdrSource && hdrCapablePublish) ?
+    DXGI_FORMAT_R16G16B16A16_FLOAT :
+    DXGI_FORMAT_B8G8R8A8_UNORM;
 }
 
 static unsigned wgc_nv12StorageHeight(unsigned height)
@@ -2646,12 +2912,67 @@ static unsigned wgc_nv12EncodedWidth(unsigned width)
 
 static bool wgc_ensureNV12Shader(WGCInstance * this)
 {
-  if (this->nv12Shader)
+  const bool pqPreserve = wgc_isP010PackedIvshmem(this);
+  const bool rgb10PQ = wgc_isRGBA10PQIvshmem(this);
+  const bool hdrToneMap = !pqPreserve && wgc_colorSpaceIsHDR(this->colorSpace);
+
+  if (this->nv12Shader && this->nv12ShaderStateValid &&
+      this->nv12ShaderPqPreserve     == pqPreserve &&
+      this->nv12ShaderHdrToneMap     == hdrToneMap &&
+      this->nv12ShaderColorSpace     == this->colorSpace &&
+      this->nv12ShaderIvshmemFormat  == this->ivshmemFormat)
     return true;
+
+  if (this->nv12Shader)
+  {
+    DEBUG_INFO("WGC YUV encoder shader state changed, rebuilding "
+      "(old toneMap:%d pq:%d colorSpace:0x%x format:0x%x, "
+      "new toneMap:%d pq:%d colorSpace:0x%x format:0x%x)",
+      this->nv12ShaderHdrToneMap,
+      this->nv12ShaderPqPreserve,
+      (unsigned)this->nv12ShaderColorSpace,
+      (unsigned)this->nv12ShaderIvshmemFormat,
+      hdrToneMap,
+      pqPreserve,
+      (unsigned)this->colorSpace,
+      (unsigned)this->ivshmemFormat);
+    wgc_invalidateNV12Shader(this);
+  }
 
   static const char shaderCode[] =
     "Texture2D<float4> srcTex : register(t0);\n"
+    "#if WGC_HDR_PQ_PRESERVE\n"
+    "RWTexture2D<uint4> dstTex : register(u0);\n"
+    "#else\n"
     "RWTexture2D<float4> dstTex : register(u0);\n"
+    "#endif\n"
+    "\n"
+    "uint pack16(float v)\n"
+    "{\n"
+    "  return (uint)floor(saturate(v) * 65535.0 + 0.5);\n"
+    "}\n"
+    "\n"
+    "uint pack10(float v)\n"
+    "{\n"
+    "  return (uint)floor(saturate(v) * 1023.0 + 0.5);\n"
+    "}\n"
+    "\n"
+    "float4 packRGBA10Bytes(float3 rgb)\n"
+    "{\n"
+    "  uint packed = pack10(rgb.r) | (pack10(rgb.g) << 10) |\n"
+    "    (pack10(rgb.b) << 20) | (3u << 30);\n"
+    "  return float4(packed & 255u, (packed >> 8) & 255u,\n"
+    "    (packed >> 16) & 255u, (packed >> 24) & 255u) / 255.0;\n"
+    "}\n"
+    "\n"
+    "void writePacked(uint2 p, float4 v)\n"
+    "{\n"
+    "#if WGC_HDR_PQ_PRESERVE\n"
+    "  dstTex[p] = uint4(pack16(v.r), pack16(v.g), pack16(v.b), pack16(v.a));\n"
+    "#else\n"
+    "  dstTex[p] = saturate(v);\n"
+    "#endif\n"
+    "}\n"
     "\n"
     "float3 bgraToRgb(float4 c)\n"
     "{\n"
@@ -2660,18 +2981,42 @@ static bool wgc_ensureNV12Shader(WGCInstance * this)
     "\n"
     "float3 prepareRgb(float3 rgb)\n"
     "{\n"
+    "#if WGC_HDR_PQ_PRESERVE || WGC_HDR_RGB10PQ\n"
+    "  float3 linear709 = max(rgb, float3(0.0, 0.0, 0.0));\n"
+    "  float3 linear2020;\n"
+    "  linear2020.r = dot(linear709, float3(0.6274039, 0.3292829, 0.0433131));\n"
+    "  linear2020.g = dot(linear709, float3(0.0690973, 0.9195404, 0.0113622));\n"
+    "  linear2020.b = dot(linear709, float3(0.0163914, 0.0880133, 0.8955953));\n"
+    "  float sdrWhiteNits = 80.0;\n"
+    "  float m1 = 2610.0 / 16384.0;\n"
+    "  float m2 = 2523.0 / 32.0;\n"
+    "  float pqC1 = 3424.0 / 4096.0;\n"
+    "  float pqC2 = 2413.0 / 128.0;\n"
+    "  float pqC3 = 2392.0 / 128.0;\n"
+    "  float3 n = saturate((linear2020 * sdrWhiteNits) / 10000.0);\n"
+    "  float3 p = pow(n, float3(m1, m1, m1));\n"
+    "  rgb = pow((float3(pqC1, pqC1, pqC1) + float3(pqC2, pqC2, pqC2) * p) /\n"
+    "    (float3(1.0, 1.0, 1.0) + float3(pqC3, pqC3, pqC3) * p),\n"
+    "    float3(m2, m2, m2));\n"
+    "  rgb = floor(saturate(rgb) * 1023.0 + 0.5) / 1023.0;\n"
+    "#else\n"
     "#if WGC_HDR_TONEMAP\n"
     "  rgb = max(rgb, 0.0.xxx);\n"
     "  float peak = max(rgb.r, max(rgb.g, rgb.b));\n"
     "  if (peak > 1.0)\n"
     "    rgb /= peak;\n"
     "#endif\n"
+    "#endif\n"
     "  return saturate(rgb);\n"
     "}\n"
     "\n"
     "float luma(float3 rgb)\n"
     "{\n"
+    "#if WGC_HDR_PQ_PRESERVE\n"
+    "  return dot(rgb, float3(0.2627, 0.6780, 0.0593));\n"
+    "#else\n"
     "  return dot(rgb, float3(0.2126, 0.7152, 0.0722));\n"
+    "#endif\n"
     "}\n"
     "\n"
     "[numthreads(16, 16, 1)]\n"
@@ -2679,6 +3024,13 @@ static bool wgc_ensureNV12Shader(WGCInstance * this)
     "{\n"
     "  uint srcW, srcH;\n"
     "  srcTex.GetDimensions(srcW, srcH);\n"
+    "#if WGC_HDR_RGB10PQ\n"
+    "  uint2 p = dt.xy;\n"
+    "  if (p.x >= srcW || p.y >= srcH)\n"
+    "    return;\n"
+    "  dstTex[p] = packRGBA10Bytes(prepareRgb(bgraToRgb(srcTex[p])));\n"
+    "  return;\n"
+    "#endif\n"
     "  uint2 p0 = uint2(dt.x * 4, dt.y * 2);\n"
     "  if (p0.x >= srcW || p0.y >= srcH)\n"
     "    return;\n"
@@ -2706,20 +3058,30 @@ static bool wgc_ensureNV12Shader(WGCInstance * this)
     "  float y5 = luma(c5);\n"
     "  float y6 = luma(c6);\n"
     "  float y7 = luma(c7);\n"
-    "  dstTex[uint2(dt.x, p0.y)] = saturate(float4(y0, y1, y4, y5));\n"
+    "  writePacked(uint2(dt.x, p0.y), float4(y0, y1, y4, y5));\n"
     "  if (p2.y < srcH)\n"
-    "    dstTex[uint2(dt.x, p2.y)] = saturate(float4(y2, y3, y6, y7));\n"
+    "    writePacked(uint2(dt.x, p2.y), float4(y2, y3, y6, y7));\n"
     "\n"
     "  float3 avg0 = (c0 + c1 + c2 + c3) * 0.25;\n"
     "  float yy0 = luma(avg0);\n"
+    "#if WGC_HDR_PQ_PRESERVE\n"
+    "  float u0 = saturate((avg0.b - yy0) * 0.5315 + 0.5);\n"
+    "  float v0 = saturate((avg0.r - yy0) * 0.6782 + 0.5);\n"
+    "#else\n"
     "  float u0 = saturate((avg0.b - yy0) * 0.5389 + 0.5);\n"
     "  float v0 = saturate((avg0.r - yy0) * 0.6350 + 0.5);\n"
+    "#endif\n"
     "  float3 avg1 = (c4 + c5 + c6 + c7) * 0.25;\n"
     "  float yy1 = luma(avg1);\n"
+    "#if WGC_HDR_PQ_PRESERVE\n"
+    "  float u1 = saturate((avg1.b - yy1) * 0.5315 + 0.5);\n"
+    "  float v1 = saturate((avg1.r - yy1) * 0.6782 + 0.5);\n"
+    "#else\n"
     "  float u1 = saturate((avg1.b - yy1) * 0.5389 + 0.5);\n"
     "  float v1 = saturate((avg1.r - yy1) * 0.6350 + 0.5);\n"
+    "#endif\n"
     "  uint uvY = srcH + dt.y;\n"
-    "  dstTex[uint2(dt.x, uvY)] = float4(u0, v0, u1, v1);\n"
+    "  writePacked(uint2(dt.x, uvY), float4(u0, v0, u1, v1));\n"
     "}\n";
 
   bool result = false;
@@ -2729,10 +3091,11 @@ static bool wgc_ensureNV12Shader(WGCInstance * this)
   comRef_defineLocal(ID3DBlob, error);
   comRef_defineLocal(ID3D11ComputeShader, shader);
 
-  const bool hdrToneMap = wgc_colorSpaceIsHDR(this->colorSpace);
   const D3D_SHADER_MACRO macros[] =
   {
     { "WGC_HDR_TONEMAP", hdrToneMap ? "1" : "0" },
+    { "WGC_HDR_PQ_PRESERVE", pqPreserve ? "1" : "0" },
+    { "WGC_HDR_RGB10PQ", rgb10PQ ? "1" : "0" },
     { NULL, NULL }
   };
   hr = D3DCompile(shaderCode, strlen(shaderCode),
@@ -2756,13 +3119,118 @@ static bool wgc_ensureNV12Shader(WGCInstance * this)
   }
 
   comRef_toGlobal(this->nv12Shader, shader);
-  DEBUG_INFO("WGC NV12 encoder shader ready (hdrToneMap:%d colorSpace:0x%x)",
-    hdrToneMap, (unsigned)this->colorSpace);
+  this->nv12ShaderStateValid    = true;
+  this->nv12ShaderPqPreserve    = pqPreserve;
+  this->nv12ShaderHdrToneMap    = hdrToneMap;
+  this->nv12ShaderColorSpace    = this->colorSpace;
+  this->nv12ShaderIvshmemFormat = this->ivshmemFormat;
+  DEBUG_INFO("WGC encode shader ready "
+    "(hdrToneMap:%d pqPreserve:%d rgb10PQ:%d colorSpace:0x%x format:0x%x)",
+    hdrToneMap, pqPreserve, rgb10PQ, (unsigned)this->colorSpace,
+    (unsigned)this->ivshmemFormat);
   result = true;
 
 exit:
   comRef_scopePop();
   return result;
+}
+
+static void wgc_logRGBA10PQTextureSample(WGCInstance * this,
+  ID3D11Texture2D * texture, const char * label)
+{
+  D3D11_TEXTURE2D_DESC desc;
+  ID3D11Texture2D_GetDesc(texture, &desc);
+  desc.BindFlags      = 0;
+  desc.MiscFlags      = 0;
+  desc.Usage          = D3D11_USAGE_STAGING;
+  desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+  ID3D11Texture2D * staging = NULL;
+  HRESULT hr = ID3D11Device5_CreateTexture2D(*this->device, &desc, NULL,
+    &staging);
+  if (FAILED(hr))
+  {
+    DEBUG_WINERROR("Create WGC RGBA10PQ staging failed", hr);
+    return;
+  }
+
+  ID3D11DeviceContext4_CopyResource(*this->context,
+    (ID3D11Resource *)staging, (ID3D11Resource *)texture);
+
+  D3D11_MAPPED_SUBRESOURCE mapped;
+  hr = ID3D11DeviceContext4_Map(*this->context,
+    (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &mapped);
+  if (FAILED(hr))
+  {
+    DEBUG_WINERROR("Map WGC RGBA10PQ staging failed", hr);
+    ID3D11Texture2D_Release(staging);
+    return;
+  }
+
+  uint16_t minR = UINT16_MAX, minG = UINT16_MAX, minB = UINT16_MAX;
+  uint16_t maxR = 0, maxG = 0, maxB = 0;
+  uint64_t sumR = 0, sumG = 0, sumB = 0;
+  uint32_t firstPacked = 0, centerPacked = 0, maxPacked = 0;
+  unsigned nonzero = 0;
+  unsigned samples = 0;
+
+  const unsigned stepY = max(1u, desc.Height / 36);
+  const unsigned stepX = max(1u, desc.Width  / 64);
+  for(unsigned y = 0; y < desc.Height; y += stepY)
+  {
+    const uint8_t * row = (const uint8_t *)mapped.pData +
+      (size_t)y * mapped.RowPitch;
+    for(unsigned x = 0; x < desc.Width; x += stepX)
+    {
+      const uint8_t * px = row + (size_t)x * 4;
+      const uint32_t packed =
+        (uint32_t)px[0] |
+        ((uint32_t)px[1] << 8) |
+        ((uint32_t)px[2] << 16) |
+        ((uint32_t)px[3] << 24);
+      const uint16_t r =  packed        & 0x3ffu;
+      const uint16_t g = (packed >> 10) & 0x3ffu;
+      const uint16_t b = (packed >> 20) & 0x3ffu;
+      if (!samples)
+        firstPacked = packed;
+      if (r || g || b)
+      {
+        ++nonzero;
+        maxPacked = packed;
+      }
+      minR = min(minR, r); minG = min(minG, g); minB = min(minB, b);
+      maxR = max(maxR, r); maxG = max(maxG, g); maxB = max(maxB, b);
+      sumR += r; sumG += g; sumB += b;
+      ++samples;
+    }
+  }
+
+  if (desc.Width && desc.Height)
+  {
+    const uint8_t * row = (const uint8_t *)mapped.pData +
+      (size_t)(desc.Height / 2) * mapped.RowPitch;
+    const uint8_t * px = row + (size_t)(desc.Width / 2) * 4;
+    centerPacked =
+      (uint32_t)px[0] |
+      ((uint32_t)px[1] << 8) |
+      ((uint32_t)px[2] << 16) |
+      ((uint32_t)px[3] << 24);
+  }
+
+  DEBUG_INFO("WGC RGBA10PQ %s samples rowPitch:%u size:%ux%u "
+    "R:min/avg/max:%u/%" PRIu64 "/%u "
+    "G:min/avg/max:%u/%" PRIu64 "/%u "
+    "B:min/avg/max:%u/%" PRIu64 "/%u nonzero:%u/%u "
+    "first:0x%08x center:0x%08x lastNonzero:0x%08x",
+    label, mapped.RowPitch, desc.Width, desc.Height,
+    minR == UINT16_MAX ? 0 : minR, samples ? sumR / samples : 0, maxR,
+    minG == UINT16_MAX ? 0 : minG, samples ? sumG / samples : 0, maxG,
+    minB == UINT16_MAX ? 0 : minB, samples ? sumB / samples : 0, maxB,
+    nonzero, samples, firstPacked, centerPacked, maxPacked);
+
+  ID3D11DeviceContext4_Unmap(*this->context,
+    (ID3D11Resource *)staging, 0);
+  ID3D11Texture2D_Release(staging);
 }
 
 static bool wgc_encodeFrameNV12(WGCInstance * this, WGCFrameInfo * dst,
@@ -2773,7 +3241,7 @@ static bool wgc_encodeFrameNV12(WGCInstance * this, WGCFrameInfo * dst,
 
   bool result = false;
   HRESULT hr;
-  comRef_scopePush(1);
+  comRef_scopePush(5);
   comRef_defineLocal(ID3D11ShaderResourceView, srv);
 
   D3D11_TEXTURE2D_DESC srcDesc;
@@ -2798,10 +3266,16 @@ static bool wgc_encodeFrameNV12(WGCInstance * this, WGCFrameInfo * dst,
   ID3D11DeviceContext4_CSSetShaderResources(*this->context, 0, 1, srvs);
   ID3D11DeviceContext4_CSSetUnorderedAccessViews(*this->context, 0, 1, uavs,
     NULL);
-  ID3D11DeviceContext4_Dispatch(*this->context,
-    (srcDesc.Width  + 31) / 32,
-    (srcDesc.Height + 31) / 32,
-    1);
+  if (wgc_isRGBA10PQIvshmem(this))
+    ID3D11DeviceContext4_Dispatch(*this->context,
+      (srcDesc.Width  + 15) / 16,
+      (srcDesc.Height + 15) / 16,
+      1);
+  else
+    ID3D11DeviceContext4_Dispatch(*this->context,
+      (srcDesc.Width  + 31) / 32,
+      (srcDesc.Height + 31) / 32,
+      1);
 
   ID3D11ShaderResourceView * nullSrvs[1] = { NULL };
   ID3D11UnorderedAccessView * nullUavs[1] = { NULL };
@@ -2809,6 +3283,152 @@ static bool wgc_encodeFrameNV12(WGCInstance * this, WGCFrameInfo * dst,
   ID3D11DeviceContext4_CSSetUnorderedAccessViews(*this->context, 0, 1,
     nullUavs, NULL);
   ID3D11DeviceContext4_CSSetShader(*this->context, NULL, NULL, 0);
+
+  bool doEncodeBridgeLog = false;
+  if (this->debugStats &&
+      (wgc_isP010PackedIvshmem(this) || wgc_isRGBA10PQIvshmem(this)))
+  {
+    static uint64_t lastEncodeBridgeLog = 0;
+    const uint64_t now = microtime();
+    if (now - lastEncodeBridgeLog >= 1000 * 1000)
+    {
+      lastEncodeBridgeLog = now;
+      doEncodeBridgeLog = true;
+    }
+  }
+
+  if (doEncodeBridgeLog && wgc_isRGBA10PQIvshmem(this) && dst->bridgeB)
+    wgc_logRGBA10PQTextureSample(this, *dst->bridgeB, "encode UAV");
+
+  if (doEncodeBridgeLog && wgc_isP010PackedIvshmem(this) && dst->bridgeB)
+  {
+      D3D11_TEXTURE2D_DESC encodeDesc;
+      ID3D11Texture2D_GetDesc(*dst->bridgeB, &encodeDesc);
+      encodeDesc.BindFlags      = 0;
+      encodeDesc.MiscFlags      = 0;
+      encodeDesc.Usage          = D3D11_USAGE_STAGING;
+      encodeDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+      comRef_defineLocal(ID3D11Texture2D, encodeStaging);
+      hr = ID3D11Device5_CreateTexture2D(*this->device, &encodeDesc, NULL,
+        encodeStaging);
+      if (SUCCEEDED(hr))
+      {
+        ID3D11DeviceContext4_CopyResource(*this->context,
+          (ID3D11Resource *)*encodeStaging, (ID3D11Resource *)*dst->bridgeB);
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        hr = ID3D11DeviceContext4_Map(*this->context,
+          (ID3D11Resource *)*encodeStaging, 0, D3D11_MAP_READ, 0, &mapped);
+        if (SUCCEEDED(hr))
+        {
+          uint16_t minY = UINT16_MAX;
+          uint16_t maxY = 0;
+          uint64_t sumY = 0;
+          unsigned nonzeroY = 0;
+          unsigned samplesY = 0;
+          const unsigned srcW = this->ivshmemWidth;
+          const unsigned srcH = this->ivshmemHeight;
+          for(unsigned y = 0; y < srcH; y += max(1u, srcH / 36))
+          {
+            for(unsigned x = 0; x < srcW; x += max(1u, srcW / 64))
+            {
+              const uint8_t * row = (const uint8_t *)mapped.pData +
+                (size_t)y * mapped.RowPitch;
+              const uint16_t * px = (const uint16_t *)(row +
+                (size_t)(x / 4) * 8);
+              const uint16_t value = px[x % 4];
+              minY = min(minY, value);
+              maxY = max(maxY, value);
+              sumY += value;
+              nonzeroY += value != 0;
+              ++samplesY;
+            }
+          }
+          DEBUG_INFO("WGC P010 encode UAV samples rowPitch:%u size:%ux%u "
+            "scan:min/avg/max:%u/%" PRIu64 "/%u nonzero:%u/%u",
+            mapped.RowPitch, srcW, srcH,
+            minY == UINT16_MAX ? 0 : minY,
+            samplesY ? sumY / samplesY : 0,
+            maxY, nonzeroY, samplesY);
+          ID3D11DeviceContext4_Unmap(*this->context,
+            (ID3D11Resource *)*encodeStaging, 0);
+        }
+        else
+          DEBUG_WINERROR("Map WGC P010 encode staging failed", hr);
+      }
+      else
+        DEBUG_WINERROR("Create WGC P010 encode staging failed", hr);
+  }
+
+  if (this->publishMode == WGC_PUBLISH_IVSHMEM_D3D12_COPY && dst->bridgeB)
+  {
+    ID3D11DeviceContext4_Flush(*this->context);
+    ID3D11DeviceContext4_CopyResource(*this->context,
+      (ID3D11Resource *)*dst->bridgeA, (ID3D11Resource *)*dst->bridgeB);
+  }
+
+  if (doEncodeBridgeLog && wgc_isRGBA10PQIvshmem(this))
+    wgc_logRGBA10PQTextureSample(this, *dst->bridgeA, "shared bridge");
+
+  if (doEncodeBridgeLog && wgc_isP010PackedIvshmem(this))
+  {
+      D3D11_TEXTURE2D_DESC bridgeDesc;
+      ID3D11Texture2D_GetDesc(*dst->bridgeA, &bridgeDesc);
+      bridgeDesc.BindFlags      = 0;
+      bridgeDesc.MiscFlags      = 0;
+      bridgeDesc.Usage          = D3D11_USAGE_STAGING;
+      bridgeDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+      comRef_defineLocal(ID3D11Texture2D, staging);
+      hr = ID3D11Device5_CreateTexture2D(*this->device, &bridgeDesc, NULL,
+        staging);
+      if (SUCCEEDED(hr))
+      {
+        ID3D11DeviceContext4_CopyResource(*this->context,
+          (ID3D11Resource *)*staging, (ID3D11Resource *)*dst->bridgeA);
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        hr = ID3D11DeviceContext4_Map(*this->context,
+          (ID3D11Resource *)*staging, 0, D3D11_MAP_READ, 0, &mapped);
+        if (SUCCEEDED(hr))
+        {
+          uint16_t minY = UINT16_MAX;
+          uint16_t maxY = 0;
+          uint64_t sumY = 0;
+          unsigned nonzeroY = 0;
+          unsigned samplesY = 0;
+          const unsigned srcW = this->ivshmemWidth;
+          const unsigned srcH = this->ivshmemHeight;
+          for(unsigned y = 0; y < srcH; y += max(1u, srcH / 36))
+          {
+            for(unsigned x = 0; x < srcW; x += max(1u, srcW / 64))
+            {
+              const uint8_t * row = (const uint8_t *)mapped.pData +
+                (size_t)y * mapped.RowPitch;
+              const uint16_t * px = (const uint16_t *)(row +
+                (size_t)(x / 4) * 8);
+              const uint16_t value = px[x % 4];
+              minY = min(minY, value);
+              maxY = max(maxY, value);
+              sumY += value;
+              nonzeroY += value != 0;
+              ++samplesY;
+            }
+          }
+          DEBUG_INFO("WGC P010 bridge samples rowPitch:%u size:%ux%u "
+            "scan:min/avg/max:%u/%" PRIu64 "/%u nonzero:%u/%u",
+            mapped.RowPitch, srcW, srcH,
+            minY == UINT16_MAX ? 0 : minY,
+            samplesY ? sumY / samplesY : 0,
+            maxY, nonzeroY, samplesY);
+          ID3D11DeviceContext4_Unmap(*this->context,
+            (ID3D11Resource *)*staging, 0);
+        }
+        else
+          DEBUG_WINERROR("Map WGC P010 bridge staging failed", hr);
+      }
+      else
+        DEBUG_WINERROR("Create WGC P010 bridge staging failed", hr);
+  }
 
   dst->fullCopy = true;
   result = true;
@@ -2845,7 +3465,7 @@ static void wgc_copyFrameTexture(WGCInstance * this, WGCFrameInfo * dst,
       "gpu wgc src->bridge" : "gpu wgc dirty src->bridge";
     WGCTracyD3D11Zone * gpuZone = WGC_TRACY_D3D11_ZONE_BEGIN_N(
       this->tracyWgcCtx, gpuName, strlen(gpuName));
-    if (wgc_isNV12PackedIvshmem(this))
+    if (wgc_needsEncodeShader(this))
     {
       if (!wgc_encodeFrameNV12(this, dst, src))
       {
@@ -2891,7 +3511,18 @@ static void wgc_copyFrameTexture(WGCInstance * this, WGCFrameInfo * dst,
       WGCTracyD3D11Zone * gpuZone =
         WGC_TRACY_D3D11_ZONE_BEGIN(this->tracyWgcCtx,
           "gpu wgc src->bridgeA");
-      if (dst->fullCopy)
+      if (wgc_needsEncodeShader(this))
+      {
+        if (!wgc_encodeFrameNV12(this, dst, src))
+        {
+          WGC_TRACY_D3D11_ZONE_END(gpuZone);
+          LG_PROFILE_ZONE_END(zoneCopy1);
+          InterlockedExchange(&this->forceNextFullCopy, 1);
+          dst->copyFailed = true;
+          return;
+        }
+      }
+      else if (dst->fullCopy)
         ID3D11DeviceContext4_CopyResource(*this->context,
           (ID3D11Resource *)*dst->bridgeA, (ID3D11Resource *)src);
       else
@@ -3098,6 +3729,9 @@ static bool wgc_copyFrameTextureD3D12(WGCInstance * this, WGCFrameInfo * dst)
     if (activeQueues > dst->format.Height)
       activeQueues = dst->format.Height;
   }
+  const bool needsEncode = wgc_needsEncodeShader(this);
+  if (needsEncode)
+    activeQueues = 1;
 
   for(unsigned i = 0; i < activeQueues; ++i)
   {
@@ -3144,6 +3778,37 @@ static bool wgc_copyFrameTextureD3D12(WGCInstance * this, WGCFrameInfo * dst)
     WGCTracyD3D12Zone * gpuZone = WGC_TRACY_D3D12_ZONE_BEGIN_N(
       this->tracyD3D12CopyCtx[i], *cmd->gfxList, gpuName, strlen(gpuName));
 
+    if (needsEncode)
+    {
+      const D3D12_RESOURCE_BARRIER barriers[2] =
+      {
+        {
+          .Type       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+          .Flags      = D3D12_RESOURCE_BARRIER_FLAG_NONE,
+          .Transition =
+          {
+            .pResource   = *dst->bridge12,
+            .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            .StateBefore = D3D12_RESOURCE_STATE_COMMON,
+            .StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE
+          }
+        },
+        {
+          .Type       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+          .Flags      = D3D12_RESOURCE_BARRIER_FLAG_NONE,
+          .Transition =
+          {
+            .pResource   = *dst->ivshmemD12Res,
+            .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            .StateBefore = D3D12_RESOURCE_STATE_COMMON,
+            .StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST
+          }
+        }
+      };
+      ID3D12GraphicsCommandList_ResourceBarrier(*cmd->gfxList,
+        ARRAY_LENGTH(barriers), barriers);
+    }
+
     if (copyFull)
     {
       if (activeQueues == 1)
@@ -3187,6 +3852,37 @@ static bool wgc_copyFrameTextureD3D12(WGCInstance * this, WGCFrameInfo * dst)
         ID3D12GraphicsCommandList_CopyTextureRegion(*cmd->gfxList,
           &dstLoc, box.left, box.top, 0, &srcLoc, &box);
       }
+    }
+
+    if (needsEncode)
+    {
+      const D3D12_RESOURCE_BARRIER barriers[2] =
+      {
+        {
+          .Type       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+          .Flags      = D3D12_RESOURCE_BARRIER_FLAG_NONE,
+          .Transition =
+          {
+            .pResource   = *dst->bridge12,
+            .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            .StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE,
+            .StateAfter  = D3D12_RESOURCE_STATE_COMMON
+          }
+        },
+        {
+          .Type       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+          .Flags      = D3D12_RESOURCE_BARRIER_FLAG_NONE,
+          .Transition =
+          {
+            .pResource   = *dst->ivshmemD12Res,
+            .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            .StateBefore = D3D12_RESOURCE_STATE_COPY_DEST,
+            .StateAfter  = D3D12_RESOURCE_STATE_COMMON
+          }
+        }
+      };
+      ID3D12GraphicsCommandList_ResourceBarrier(*cmd->gfxList,
+        ARRAY_LENGTH(barriers), barriers);
     }
 
     WGC_TRACY_D3D12_ZONE_END(gpuZone);
@@ -3269,6 +3965,22 @@ static void wgc_waitFrameD3D12Copy(WGCInstance * this, WGCFrameInfo * frame)
   frame->d3d12CopyQueueCount = 0;
 }
 
+static void wgc_drainGpuWork(WGCInstance * this)
+{
+  if (this->frames)
+    for(unsigned i = 0; i < this->frameCount; ++i)
+      wgc_waitFrameD3D12Copy(this, &this->frames[i]);
+
+  for(unsigned i = 0; i < WGC_D3D12_COPY_QUEUE_MAX; ++i)
+    if (this->d3d12CopyCommandReady[i])
+      d12_commandGroupWait(&this->d3d12CopyCommands[i]);
+
+  if (this->context && *this->context)
+    ID3D11DeviceContext4_Flush(*this->context);
+  if (this->on12Context && *this->on12Context)
+    ID3D11DeviceContext4_Flush(*this->on12Context);
+}
+
 static uint64_t wgc_copyFramePixels(const WGCFrameInfo * frame)
 {
   if (frame->fullCopy)
@@ -3339,10 +4051,11 @@ static bool wgc_ensureFrameIvshmemDirect(WGCInstance * this, WGCFrameInfo * fram
     return false;
   }
 
-  const bool nv12Packed = wgc_isNV12PackedIvshmem(this);
+  const bool packedYuv = wgc_isPackedYuvIvshmem(this);
+  const bool packedRgb10 = wgc_isRGBA10PQIvshmem(this);
   if (srcDesc->Width  != this->ivshmemWidth ||
       srcDesc->Height != this->ivshmemHeight ||
-      (!nv12Packed && srcDesc->Format != this->ivshmemFormat))
+      (!packedYuv && !packedRgb10 && srcDesc->Format != this->ivshmemFormat))
   {
     DEBUG_ERROR("WGC source (%ux%u fmt 0x%x) does not match the IVSHMEM-direct "
       "target (%ux%u fmt 0x%x). Cannot recover without renegotiating the "
@@ -3367,13 +4080,13 @@ static bool wgc_ensureFrameIvshmemDirect(WGCInstance * this, WGCFrameInfo * fram
   {
     .Dimension          = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
     .Alignment          = 0,
-    .Width              = nv12Packed ?
+    .Width              = packedYuv ?
       wgc_nv12EncodedWidth(this->ivshmemWidth) : this->ivshmemWidth,
-    .Height             = nv12Packed ?
+    .Height             = packedYuv ?
       wgc_nv12StorageHeight(this->ivshmemHeight) : this->ivshmemHeight,
     .DepthOrArraySize   = 1,
     .MipLevels          = 1,
-    .Format             = nv12Packed ? DXGI_FORMAT_R8G8B8A8_UNORM :
+    .Format             = (packedYuv || packedRgb10) ? this->ivshmemFormat :
       srcDesc->Format,
     .SampleDesc         = { .Count = 1, .Quality = 0 },
     .Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
@@ -3441,7 +4154,8 @@ static bool wgc_ensureFrameIvshmemDirect(WGCInstance * this, WGCFrameInfo * fram
       .SampleDesc     = { .Count = 1, .Quality = 0 },
       .Usage          = D3D11_USAGE_DEFAULT,
       .BindFlags      = D3D11_BIND_SHADER_RESOURCE |
-                        (nv12Packed ? D3D11_BIND_UNORDERED_ACCESS : 0),
+                        (wgc_needsEncodeShader(this) && !d3d12Copy ?
+                          D3D11_BIND_UNORDERED_ACCESS : 0),
       .CPUAccessFlags = 0,
       .MiscFlags      = D3D11_RESOURCE_MISC_SHARED |
                         D3D11_RESOURCE_MISC_SHARED_NTHANDLE
@@ -3456,19 +4170,36 @@ static bool wgc_ensureFrameIvshmemDirect(WGCInstance * this, WGCFrameInfo * fram
       return false;
     }
 
-    if (nv12Packed)
+    if (wgc_needsEncodeShader(this) && d3d12Copy)
+    {
+      D3D11_TEXTURE2D_DESC encodeDesc = bridgeDesc;
+      encodeDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+      encodeDesc.MiscFlags = 0;
+      hr = ID3D11Device5_CreateTexture2D(*this->device, &encodeDesc, NULL,
+        bridgeB);
+      if (FAILED(hr))
+      {
+        DEBUG_WINERROR("ivshmem-d3d12-copy: CreateTexture2D encode "
+          "bridge failed", hr);
+        comRef_scopePop();
+        return false;
+      }
+    }
+
+    if (wgc_needsEncodeShader(this))
     {
       D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc =
       {
-        .Format        = DXGI_FORMAT_R8G8B8A8_UNORM,
+        .Format        = this->ivshmemFormat,
         .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
         .Texture2D     = { .MipSlice = 0 }
       };
+      ID3D11Texture2D * uavTexture = d3d12Copy ? *bridgeB : *bridgeA;
       hr = ID3D11Device5_CreateUnorderedAccessView(*this->device,
-        (ID3D11Resource *)*bridgeA, &uavDesc, encodeUav);
+        (ID3D11Resource *)uavTexture, &uavDesc, encodeUav);
       if (FAILED(hr))
       {
-        DEBUG_WINERROR("ivshmem-d3d12-copy: CreateUnorderedAccessView NV12 "
+        DEBUG_WINERROR("ivshmem-d3d12-copy: CreateUnorderedAccessView encode "
           "bridge failed", hr);
         comRef_scopePop();
         return false;
@@ -3531,20 +4262,24 @@ static bool wgc_ensureFrameIvshmemDirect(WGCInstance * this, WGCFrameInfo * fram
     comRef_toGlobal(frame->bridgeA, bridgeA);
     comRef_toGlobal(frame->bridgeB, bridgeB);
   }
+  if (wgc_needsEncodeShader(this))
+    comRef_toGlobal(frame->encodeUav, encodeUav);
   if (d3d12Copy)
   {
     comRef_toGlobal(frame->bridgeA , bridgeA );
+    if (wgc_needsEncodeShader(this))
+      comRef_toGlobal(frame->bridgeB , bridgeB );
     comRef_toGlobal(frame->bridge12, bridge12);
-    if (nv12Packed)
-      comRef_toGlobal(frame->encodeUav, encodeUav);
   }
   memcpy(&frame->format, srcDesc, sizeof(frame->format));
-  if (nv12Packed)
+  if (packedYuv)
   {
     frame->format.Width  = wgc_nv12EncodedWidth(this->ivshmemWidth);
     frame->format.Height = wgc_nv12StorageHeight(this->ivshmemHeight);
-    frame->format.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    frame->format.Format = this->ivshmemFormat;
   }
+  else if (packedRgb10)
+    frame->format.Format = this->ivshmemFormat;
   frame->fenceValue = 0;
   frame->ready      = true;
   comRef_scopePop();
@@ -3559,37 +4294,30 @@ static bool wgc_ensureFrame(WGCInstance * this, WGCFrameInfo * frame,
   const bool ivshmemDirectSlot =
     wgc_isIvshmemPublishMode(this->publishMode) &&
     frame != &this->frames[0];
-  const bool nv12PackedSlot = ivshmemDirectSlot &&
-    wgc_isNV12PackedIvshmem(this);
+  const bool packedYuvSlot = ivshmemDirectSlot &&
+    wgc_isPackedYuvIvshmem(this);
+  const bool packedRgb10Slot = ivshmemDirectSlot &&
+    wgc_isRGBA10PQIvshmem(this);
 
   if (frame->ready && (
-      (!nv12PackedSlot &&
+      (!packedYuvSlot && !packedRgb10Slot &&
        frame->format.Width  == srcDesc.Width  &&
        frame->format.Height == srcDesc.Height &&
        frame->format.Format == srcDesc.Format) ||
-      (nv12PackedSlot &&
+      (packedYuvSlot &&
        frame->format.Width  == wgc_nv12EncodedWidth(this->ivshmemWidth) &&
        frame->format.Height == wgc_nv12StorageHeight(this->ivshmemHeight) &&
-       frame->format.Format == DXGI_FORMAT_R8G8B8A8_UNORM)))
+       frame->format.Format == this->ivshmemFormat) ||
+      (packedRgb10Slot &&
+       frame->format.Width  == this->ivshmemWidth &&
+       frame->format.Height == this->ivshmemHeight &&
+       frame->format.Format == this->ivshmemFormat)))
     return true;
 
   frame->ready = false;
 
-  if (frame->texture)
-  {
-    comRef_release(frame->texture);
-    comRef_release(frame->d12Res);
-    comRef_release(frame->fence);
-    comRef_release(frame->d12Fence);
-    comRef_release(frame->ivshmemD12Res);
-    comRef_release(frame->bridgeA);
-    comRef_release(frame->bridgeB);
-    comRef_release(frame->bridge12);
-    comRef_release(frame->encodeUav);
-    memset(&frame->format, 0, sizeof(frame->format));
-    frame->fenceValue = 0;
-    frame->copiedOnce = false;
-  }
+  if (wgc_frameHasResources(frame))
+    wgc_releaseFrameResources(frame);
 
   // IVSHMEM-direct path: only publish slots (not the accumulator) live in
   // IVSHMEM. Accumulator stays VRAM-local in this mode.
@@ -3632,7 +4360,7 @@ static bool wgc_ensureFrame(WGCInstance * this, WGCFrameInfo * frame,
   {
     // CPU-staging accumulator: GPU-local copy-only texture.
     dstDesc.Usage          = D3D11_USAGE_DEFAULT;
-    dstDesc.BindFlags      = wgc_isNV12PackedIvshmem(this) ?
+    dstDesc.BindFlags      = wgc_needsEncodeShader(this) ?
       D3D11_BIND_SHADER_RESOURCE : 0;
     dstDesc.CPUAccessFlags = 0;
     dstDesc.MiscFlags      = 0;
@@ -4179,6 +4907,13 @@ void wgc_setLoanedDevices(WGCInstance * this,
   this->loanedD12Device  = (ID3D12Device3       *)d12Device;
 }
 
+void wgc_setCaptureFormatHint(WGCInstance * this, unsigned format)
+{
+  if (!this)
+    return;
+  this->captureFormatHint = (DXGI_FORMAT)format;
+}
+
 bool wgc_setIvshmemEnv(WGCInstance * this,
   IUnknown * ivshmemHeap,
   IUnknown * d11on12Device,
@@ -4189,6 +4924,7 @@ bool wgc_setIvshmemEnv(WGCInstance * this,
   if (!this || !ivshmemHeap || !d11on12Device)
     return false;
 
+  const DXGI_FORMAT oldFormat = this->ivshmemFormat;
   this->ivshmemHeap      = (ID3D12Heap *)ivshmemHeap;
   this->d11on12Device    = (ID3D11On12Device *)d11on12Device;
   this->ivshmemWidth     = width;
@@ -4199,6 +4935,8 @@ bool wgc_setIvshmemEnv(WGCInstance * this,
 
   DEBUG_INFO("wgc_setIvshmemEnv: %ux%u, format 0x%x", width, height,
     (unsigned)this->ivshmemFormat);
+  if (oldFormat != this->ivshmemFormat)
+    wgc_invalidateNV12Shader(this);
   return true;
 }
 
@@ -4212,6 +4950,7 @@ bool wgc_setIvshmemD3D12CopyEnv(WGCInstance * this,
   if (!this || !ivshmemHeap || !d3d12Queue)
     return false;
 
+  const DXGI_FORMAT oldFormat = this->ivshmemFormat;
   this->ivshmemHeap        = (ID3D12Heap *)ivshmemHeap;
   this->d3d12CopyQueues[0] = (ID3D12CommandQueue *)d3d12Queue;
   ID3D12CommandQueue_AddRef(this->d3d12CopyQueues[0]);
@@ -4223,6 +4962,8 @@ bool wgc_setIvshmemD3D12CopyEnv(WGCInstance * this,
 
   DEBUG_INFO("wgc_setIvshmemD3D12CopyEnv: %ux%u, format 0x%x",
     width, height, (unsigned)this->ivshmemFormat);
+  if (oldFormat != this->ivshmemFormat)
+    wgc_invalidateNV12Shader(this);
   return true;
 }
 
@@ -4244,19 +4985,8 @@ bool wgc_setIvshmemSlot(WGCInstance * this,
   {
     // Offset changed for an already-ready slot. Drop the wrapped texture +
     // bridges so wgc_ensureFrame recreates them at the new offset.
-    if (frame->texture || frame->ivshmemD12Res ||
-        frame->bridgeA || frame->bridgeB || frame->bridge12)
-    {
-      comRef_release(frame->texture);
-      comRef_release(frame->ivshmemD12Res);
-      comRef_release(frame->bridgeA);
-      comRef_release(frame->bridgeB);
-      comRef_release(frame->bridge12);
-      comRef_release(frame->encodeUav);
-      memset(&frame->format, 0, sizeof(frame->format));
-      frame->ready      = false;
-      frame->copiedOnce = false;
-    }
+    if (wgc_frameHasResources(frame))
+      wgc_releaseFrameResources(frame);
   }
 
   frame->ivshmemOffset    = offset;
@@ -4414,12 +5144,13 @@ bool wgc_fetchIvshmemDirect(WGCInstance * this, unsigned frameBufferIndex,
   // For row_major TEXTURE2D placed resources, the natural pitch is
   // width * bpp aligned to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (256). We
   // recover bpp from the format.
-  const unsigned bpp = (frame->format.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
-    ? 8 : 4;
+  const unsigned bpp =
+    (frame->format.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+     frame->format.Format == DXGI_FORMAT_R16G16B16A16_UINT) ? 8 : 4;
   *pitch  = (frame->format.Width * bpp + 255u) & ~255u;
-  *width  = wgc_isNV12PackedIvshmem(this) ?
+  *width  = wgc_isPackedYuvIvshmem(this) ?
     this->ivshmemWidth : frame->format.Width;
-  *height = wgc_isNV12PackedIvshmem(this) ?
+  *height = wgc_isPackedYuvIvshmem(this) ?
     this->ivshmemHeight : frame->format.Height;
 
   desc->dirtyRects            = frame->dirtyRects;

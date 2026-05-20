@@ -31,11 +31,17 @@
 #ifndef DRM_FORMAT_NV12
 #define DRM_FORMAT_NV12 fourcc_code('N', 'V', '1', '2')
 #endif
+#ifndef DRM_FORMAT_P010
+#define DRM_FORMAT_P010 fourcc_code('P', '0', '1', '0')
+#endif
 #ifndef DRM_FORMAT_YUYV
 #define DRM_FORMAT_YUYV fourcc_code('Y', 'U', 'Y', 'V')
 #endif
 #ifndef DRM_FORMAT_UYVY
 #define DRM_FORMAT_UYVY fourcc_code('U', 'Y', 'V', 'Y')
+#endif
+#ifndef GL_RGBA16_EXT
+#define GL_RGBA16_EXT 0x805B
 #endif
 
 bool egl_texUtilGetFormat(const EGL_TexSetup * setup, EGL_TexFormat * fmt)
@@ -107,6 +113,16 @@ bool egl_texUtilGetFormat(const EGL_TexSetup * setup, EGL_TexFormat * fmt)
       fmt->intFormat  = GL_RGBA;
       fmt->dataType   = GL_UNSIGNED_BYTE;
       fmt->fourcc     = DRM_FORMAT_NV12;
+      break;
+
+    case EGL_PF_P010:
+      // Single-buffer P010 transport: Y plane followed by interleaved UV,
+      // packed as four normalized 16-bit samples per RGBA16 texel.
+      fmt->bpp        = 8;
+      fmt->format     = GL_RGBA;
+      fmt->intFormat  = GL_RGBA16_EXT;
+      fmt->dataType   = GL_UNSIGNED_SHORT;
+      fmt->fourcc     = DRM_FORMAT_P010;
       break;
 
     case EGL_PF_YUY2:

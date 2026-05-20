@@ -47,6 +47,8 @@
 #include "wayland-idle-inhibit-unstable-v1-client-protocol.h"
 #include "wayland-xdg-output-unstable-v1-client-protocol.h"
 #include "wayland-xdg-activation-v1-client-protocol.h"
+#include "wayland-frog-color-management-v1-client-protocol.h"
+#include "wayland-color-management-v1-client-protocol.h"
 
 #include "scale.h"
 
@@ -109,6 +111,19 @@ struct WaylandDSState
   struct wl_seat * seat;
   struct wl_shm * shm;
   struct wl_compositor * compositor;
+  struct frog_color_management_factory_v1 * frogColorManagement;
+  struct frog_color_managed_surface * frogColorSurface;
+  struct wp_color_manager_v1 * colorManager;
+  struct wp_color_management_surface_v1 * colorSurface;
+  struct wp_color_management_surface_feedback_v1 * colorFeedback;
+  bool colorManagerDone;
+  bool colorIntentPerceptual;
+  bool colorFeatureParametric;
+  bool colorFeatureSetLuminances;
+  bool colorFeatureSetMastering;
+  bool colorFeatureWindowsScRGB;
+  bool colorTFPQ;
+  bool colorPrimariesBT2020;
 
   struct WaylandScale scale;
   bool fractionalScale;

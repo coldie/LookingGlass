@@ -344,6 +344,11 @@ static bool sendFrame(CaptureResult result, bool * restart)
       fi->type = FRAME_TYPE_NV12;
       break;
 
+    case CAPTURE_FMT_P010:
+      fi->type = FRAME_TYPE_P010;
+      flags   |= FRAME_FLAG_HDR | FRAME_FLAG_HDR_PQ;
+      break;
+
     default:
       DEBUG_ERROR("Unsupported frame format %d, skipping frame", frame.format);
       return true;

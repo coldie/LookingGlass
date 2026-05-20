@@ -21,13 +21,16 @@
 #include "wayland.h"
 
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <wayland-client.h>
 
 #include "app.h"
 #include "common/debug.h"
 #include "common/event.h"
+#include "common/option.h"
 
 // Surface-handling listeners.
 
@@ -85,6 +88,430 @@ static const struct wl_surface_listener wlSurfaceListener = {
   .leave = wlSurfaceLeaveHandler,
 };
 
+struct WaylandImageDescriptionState
+{
+  bool ready;
+  bool failed;
+};
+
+struct WaylandImageInfoState
+{
+  struct wp_image_description_v1 * imageDescription;
+  const char * label;
+  bool primaryNamed;
+  bool tfNamed;
+  bool luminances;
+  bool targetLuminance;
+  bool targetMaxCLL;
+  bool targetMaxFALL;
+  uint32_t primaries;
+  uint32_t tf;
+  uint32_t minLum;
+  uint32_t maxLum;
+  uint32_t referenceLum;
+  uint32_t targetMinLum;
+  uint32_t targetMaxLum;
+  uint32_t maxCLL;
+  uint32_t maxFALL;
+};
+
+static void imageDescriptionFailed(void * data,
+    struct wp_image_description_v1 * imageDescription,
+    uint32_t cause, const char * msg)
+{
+  struct WaylandImageDescriptionState * state = data;
+  state->failed = true;
+  DEBUG_WARN("Wayland color image description failed (%u): %s",
+      cause, msg ? msg : "");
+}
+
+static void imageDescriptionReady(void * data,
+    struct wp_image_description_v1 * imageDescription, uint32_t identity)
+{
+  struct WaylandImageDescriptionState * state = data;
+  state->ready = true;
+}
+
+static const struct wp_image_description_v1_listener imageDescriptionListener = {
+  .failed = imageDescriptionFailed,
+  .ready  = imageDescriptionReady,
+};
+
+static void imageInfoDone(void * data,
+    struct wp_image_description_info_v1 * info)
+{
+  struct WaylandImageInfoState * state = data;
+
+  DEBUG_INFO("Wayland %s HDR image description: primaries:%s%u "
+      "tf:%s%u luminance:%s%.4f/%u/%u nits target:%s%.4f/%u nits "
+      "maxCLL:%s%u nits maxFALL:%s%u nits",
+      state->label ? state->label : "unknown",
+      state->primaryNamed ? "" : "?", state->primaries,
+      state->tfNamed ? "" : "?", state->tf,
+      state->luminances ? "" : "?",
+      (double)state->minLum / 10000.0, state->maxLum, state->referenceLum,
+      state->targetLuminance ? "" : "?",
+      (double)state->targetMinLum / 10000.0, state->targetMaxLum,
+      state->targetMaxCLL ? "" : "?", state->maxCLL,
+      state->targetMaxFALL ? "" : "?", state->maxFALL);
+
+  if (state->imageDescription)
+    wp_image_description_v1_destroy(state->imageDescription);
+  free(state);
+}
+
+static void imageInfoICCFile(void * data,
+    struct wp_image_description_info_v1 * info, int32_t icc, uint32_t size)
+{
+  if (icc >= 0)
+    close(icc);
+}
+
+static void imageInfoPrimaries(void * data,
+    struct wp_image_description_info_v1 * info,
+    int32_t rx, int32_t ry, int32_t gx, int32_t gy,
+    int32_t bx, int32_t by, int32_t wx, int32_t wy)
+{
+}
+
+static void imageInfoPrimariesNamed(void * data,
+    struct wp_image_description_info_v1 * info, uint32_t primaries)
+{
+  struct WaylandImageInfoState * state = data;
+  state->primaryNamed = true;
+  state->primaries = primaries;
+}
+
+static void imageInfoTFPower(void * data,
+    struct wp_image_description_info_v1 * info, uint32_t eexp)
+{
+}
+
+static void imageInfoTFNamed(void * data,
+    struct wp_image_description_info_v1 * info, uint32_t tf)
+{
+  struct WaylandImageInfoState * state = data;
+  state->tfNamed = true;
+  state->tf = tf;
+}
+
+static void imageInfoLuminances(void * data,
+    struct wp_image_description_info_v1 * info,
+    uint32_t minLum, uint32_t maxLum, uint32_t referenceLum)
+{
+  struct WaylandImageInfoState * state = data;
+  state->luminances = true;
+  state->minLum = minLum;
+  state->maxLum = maxLum;
+  state->referenceLum = referenceLum;
+}
+
+static void imageInfoTargetPrimaries(void * data,
+    struct wp_image_description_info_v1 * info,
+    int32_t rx, int32_t ry, int32_t gx, int32_t gy,
+    int32_t bx, int32_t by, int32_t wx, int32_t wy)
+{
+}
+
+static void imageInfoTargetLuminance(void * data,
+    struct wp_image_description_info_v1 * info,
+    uint32_t minLum, uint32_t maxLum)
+{
+  struct WaylandImageInfoState * state = data;
+  state->targetLuminance = true;
+  state->targetMinLum = minLum;
+  state->targetMaxLum = maxLum;
+}
+
+static void imageInfoTargetMaxCLL(void * data,
+    struct wp_image_description_info_v1 * info, uint32_t maxCLL)
+{
+  struct WaylandImageInfoState * state = data;
+  state->targetMaxCLL = true;
+  state->maxCLL = maxCLL;
+}
+
+static void imageInfoTargetMaxFALL(void * data,
+    struct wp_image_description_info_v1 * info, uint32_t maxFALL)
+{
+  struct WaylandImageInfoState * state = data;
+  state->targetMaxFALL = true;
+  state->maxFALL = maxFALL;
+}
+
+static const struct wp_image_description_info_v1_listener imageInfoListener = {
+  .done             = imageInfoDone,
+  .icc_file         = imageInfoICCFile,
+  .primaries        = imageInfoPrimaries,
+  .primaries_named  = imageInfoPrimariesNamed,
+  .tf_power         = imageInfoTFPower,
+  .tf_named         = imageInfoTFNamed,
+  .luminances       = imageInfoLuminances,
+  .target_primaries = imageInfoTargetPrimaries,
+  .target_luminance = imageInfoTargetLuminance,
+  .target_max_cll   = imageInfoTargetMaxCLL,
+  .target_max_fall  = imageInfoTargetMaxFALL,
+};
+
+static void preferredImageDescriptionReady(void * data,
+    struct wp_image_description_v1 * imageDescription, uint32_t identity)
+{
+  struct WaylandImageInfoState * state = data;
+  struct wp_image_description_info_v1 * info =
+    wp_image_description_v1_get_information(imageDescription);
+
+  if (!info)
+  {
+    wp_image_description_v1_destroy(imageDescription);
+    free(state);
+    return;
+  }
+
+  state->imageDescription = imageDescription;
+  wp_image_description_info_v1_add_listener(info, &imageInfoListener, state);
+}
+
+static void preferredImageDescriptionFailed(void * data,
+    struct wp_image_description_v1 * imageDescription,
+    uint32_t cause, const char * msg)
+{
+  DEBUG_WARN("Wayland preferred image description failed (%u): %s",
+      cause, msg ? msg : "");
+  wp_image_description_v1_destroy(imageDescription);
+  free(data);
+}
+
+static const struct wp_image_description_v1_listener preferredImageListener = {
+  .failed = preferredImageDescriptionFailed,
+  .ready  = preferredImageDescriptionReady,
+};
+
+static void waylandQueryPreferredImageDescription(void)
+{
+  if (!wlWm.colorFeedback)
+    return;
+
+  struct WaylandImageInfoState * state = calloc(1, sizeof(*state));
+  if (!state)
+    return;
+  state->label = "preferred";
+
+  struct wp_image_description_v1 * imageDescription =
+    wp_color_management_surface_feedback_v1_get_preferred_parametric(
+        wlWm.colorFeedback);
+  if (!imageDescription)
+  {
+    free(state);
+    return;
+  }
+
+  wp_image_description_v1_add_listener(imageDescription,
+      &preferredImageListener, state);
+}
+
+static void colorFeedbackPreferredChanged(void * data,
+    struct wp_color_management_surface_feedback_v1 * feedback,
+    uint32_t identity)
+{
+  waylandQueryPreferredImageDescription();
+}
+
+static const struct wp_color_management_surface_feedback_v1_listener
+colorFeedbackListener = {
+  .preferred_changed = colorFeedbackPreferredChanged,
+};
+
+static bool waylandWaitImageDescription(
+    struct wp_image_description_v1 * imageDescription)
+{
+  struct WaylandImageDescriptionState state = { 0 };
+  wp_image_description_v1_add_listener(imageDescription,
+      &imageDescriptionListener, &state);
+
+  for (int i = 0; i < 4 && !state.ready && !state.failed; ++i)
+  {
+    if (wl_display_roundtrip(wlWm.display) < 0)
+      break;
+  }
+
+  return state.ready && !state.failed;
+}
+
+static struct wp_image_description_v1 * waylandCreatePQDescription(void)
+{
+  if (!wlWm.colorFeatureParametric || !wlWm.colorTFPQ ||
+      !wlWm.colorPrimariesBT2020)
+  {
+    DEBUG_WARN("Wayland color-management PQ output unavailable "
+        "(parametric:%d pq:%d bt2020:%d)",
+        wlWm.colorFeatureParametric, wlWm.colorTFPQ,
+        wlWm.colorPrimariesBT2020);
+    return NULL;
+  }
+
+  struct wp_image_description_creator_params_v1 * params =
+    wp_color_manager_v1_create_parametric_creator(wlWm.colorManager);
+  if (!params)
+    return NULL;
+
+  wp_image_description_creator_params_v1_set_tf_named(params,
+      WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ);
+  wp_image_description_creator_params_v1_set_primaries_named(params,
+      WP_COLOR_MANAGER_V1_PRIMARIES_BT2020);
+
+  const int metadataPeak = option_get_int("egl", "hdrMetadataPeak");
+  const int metadataFALL = option_get_int("egl", "hdrMetadataFALL");
+  const uint32_t metadataMax =
+    metadataPeak > 0 ? (uint32_t)metadataPeak : 10000;
+  DEBUG_INFO("Wayland HDR metadata request: BT.2020/PQ luminance:0.0050/10000/203 nits "
+      "mastering:0.0050/%u nits maxCLL:%u nits maxFALL:%d nits",
+      metadataMax, metadataMax, metadataFALL);
+
+  if (wlWm.colorFeatureSetLuminances)
+    wp_image_description_creator_params_v1_set_luminances(params,
+        50, 10000, 203);
+
+  if (wlWm.colorFeatureSetMastering)
+  {
+    wp_image_description_creator_params_v1_set_mastering_display_primaries(
+        params,
+        708000, 292000,
+        170000, 797000,
+        131000,  46000,
+        312700, 329000);
+    wp_image_description_creator_params_v1_set_mastering_luminance(
+        params, 50, metadataMax);
+  }
+
+  if (metadataPeak > 0)
+    wp_image_description_creator_params_v1_set_max_cll(params, metadataMax);
+  if (metadataFALL > 0)
+    wp_image_description_creator_params_v1_set_max_fall(
+        params, (uint32_t)metadataFALL);
+
+  return wp_image_description_creator_params_v1_create(params);
+}
+
+static struct wp_image_description_v1 * waylandCreateScRGBDescription(void)
+{
+  if (!wlWm.colorFeatureWindowsScRGB)
+  {
+    DEBUG_WARN("Wayland color-management Windows-scRGB output unavailable");
+    return NULL;
+  }
+
+  return wp_color_manager_v1_create_windows_scrgb(wlWm.colorManager);
+}
+
+static bool waylandWindowInitColorManagement(
+    bool pqOutput, bool scRGBOutput)
+{
+  if (!wlWm.colorManager || !wlWm.colorManagerDone)
+    return false;
+
+  if (!wlWm.colorIntentPerceptual)
+  {
+    DEBUG_WARN("Wayland color-management did not advertise perceptual intent");
+    return false;
+  }
+
+  wlWm.colorSurface =
+    wp_color_manager_v1_get_surface(wlWm.colorManager, wlWm.surface);
+  if (!wlWm.colorSurface)
+    return false;
+
+  wlWm.colorFeedback =
+    wp_color_manager_v1_get_surface_feedback(wlWm.colorManager, wlWm.surface);
+  if (wlWm.colorFeedback)
+  {
+    wp_color_management_surface_feedback_v1_add_listener(
+        wlWm.colorFeedback, &colorFeedbackListener, NULL);
+    waylandQueryPreferredImageDescription();
+  }
+
+  struct wp_image_description_v1 * imageDescription =
+    pqOutput ? waylandCreatePQDescription() : waylandCreateScRGBDescription();
+  if (!imageDescription)
+    return false;
+
+  if (!waylandWaitImageDescription(imageDescription))
+  {
+    wp_image_description_v1_destroy(imageDescription);
+    return false;
+  }
+
+  wp_color_management_surface_v1_set_image_description(
+      wlWm.colorSurface, imageDescription,
+      WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
+  wp_image_description_v1_destroy(imageDescription);
+
+  DEBUG_INFO("Wayland HDR output: %s via color-management-v1",
+    pqOutput ? "BT.2020/PQ" : "Windows-scRGB");
+  return true;
+}
+
+static bool waylandWindowInitFrogColor(
+    bool pqOutput, bool scRGBOutput, const char * hdrOutput)
+{
+  if (!pqOutput && !scRGBOutput)
+    return true;
+
+  if (!wlWm.frogColorManagement)
+  {
+    DEBUG_WARN("egl:hdrOutput=%s requested, but frog color management is unavailable",
+      hdrOutput);
+    return false;
+  }
+
+  wlWm.frogColorSurface =
+    frog_color_management_factory_v1_get_color_managed_surface(
+        wlWm.frogColorManagement, wlWm.surface);
+  if (!wlWm.frogColorSurface)
+  {
+    DEBUG_WARN("Failed to create frog color managed surface");
+    return false;
+  }
+
+  frog_color_managed_surface_set_known_transfer_function(
+      wlWm.frogColorSurface,
+      pqOutput ?
+        FROG_COLOR_MANAGED_SURFACE_TRANSFER_FUNCTION_ST2084_PQ :
+        FROG_COLOR_MANAGED_SURFACE_TRANSFER_FUNCTION_SCRGB_LINEAR);
+  frog_color_managed_surface_set_known_container_color_volume(
+      wlWm.frogColorSurface,
+      pqOutput ?
+        FROG_COLOR_MANAGED_SURFACE_PRIMARIES_REC2020 :
+        FROG_COLOR_MANAGED_SURFACE_PRIMARIES_REC709);
+  frog_color_managed_surface_set_render_intent(
+      wlWm.frogColorSurface,
+      FROG_COLOR_MANAGED_SURFACE_RENDER_INTENT_PERCEPTUAL);
+
+  if (pqOutput)
+    frog_color_managed_surface_set_hdr_metadata(
+        wlWm.frogColorSurface,
+        34000, 16000, 13250, 34500, 7500, 3000, 15635, 16450,
+        10000, 1, 10000, 400);
+
+  DEBUG_INFO("Wayland HDR output: %s via frog color management",
+    pqOutput ? "BT.2020/PQ" : "scRGB linear");
+  return true;
+}
+
+static void waylandWindowInitHDR(void)
+{
+  const char * hdrOutput = option_get_string("egl", "hdrOutput");
+  const bool pqOutput = hdrOutput && strcmp(hdrOutput, "pq") == 0;
+  const bool scRGBOutput = hdrOutput &&
+    (strcmp(hdrOutput, "scrgb") == 0 || strcmp(hdrOutput, "scRGB") == 0);
+  if (!pqOutput && !scRGBOutput)
+    return;
+
+  if (waylandWindowInitColorManagement(pqOutput, scRGBOutput))
+    return;
+
+  waylandWindowInitFrogColor(pqOutput, scRGBOutput, hdrOutput);
+}
+
 bool waylandWindowInit(const char * title, const char * appId, bool fullscreen, bool maximize, bool borderless, bool resizable)
 {
   wlWm.scale = waylandScaleFromInt(1);
@@ -111,6 +538,7 @@ bool waylandWindowInit(const char * title, const char * appId, bool fullscreen, 
   }
 
   wl_surface_add_listener(wlWm.surface, &wlSurfaceListener, NULL);
+  waylandWindowInitHDR();
 
   if (!wlWm.desktop->shellInit(wlWm.display, wlWm.surface,
         title, appId, fullscreen, maximize, borderless, resizable))
@@ -122,6 +550,12 @@ bool waylandWindowInit(const char * title, const char * appId, bool fullscreen, 
 
 void waylandWindowFree(void)
 {
+  if (wlWm.colorFeedback)
+    wp_color_management_surface_feedback_v1_destroy(wlWm.colorFeedback);
+  if (wlWm.colorSurface)
+    wp_color_management_surface_v1_destroy(wlWm.colorSurface);
+  if (wlWm.frogColorSurface)
+    frog_color_managed_surface_destroy(wlWm.frogColorSurface);
   wl_surface_destroy(wlWm.surface);
   lgFreeEvent(wlWm.frameEvent);
 }

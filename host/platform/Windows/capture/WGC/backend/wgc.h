@@ -103,6 +103,11 @@ void wgc_setLoanedDevices(WGCInstance * this,
   IUnknown * d11Context,       // ID3D11DeviceContext*
   IUnknown * d12Device);       // ID3D12Device3*
 
+// Request a source capture format independent of the publish target. This is
+// used by wrapper-level encoders that consume WGC RGBA16F frames and repack
+// them before publishing.
+void wgc_setCaptureFormatHint(WGCInstance * this, unsigned format);
+
 // Configure the IVSHMEM-direct publish environment. Must be called BEFORE
 // wgc_initInstance when publishMode is WGC_PUBLISH_IVSHMEM_DIRECT.
 //

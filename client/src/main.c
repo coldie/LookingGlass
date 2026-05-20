@@ -578,7 +578,11 @@ int main_frameThread(void * unused)
 
   struct DMAFrameInfo dmaInfo[LGMP_Q_FRAME_LEN] = {0};
   if (g_state.useDMA)
+  {
     DEBUG_INFO("Using DMA buffer support");
+    for(int i = 0; i < ARRAY_LENGTH(dmaInfo); ++i)
+      dmaInfo[i].fd = -1;
+  }
 
   lgWaitEvent(e_startup, TIMEOUT_INFINITE);
   if (g_state.state != APP_STATE_RUNNING)
@@ -654,6 +658,16 @@ int main_frameThread(void * unused)
 
     if (!g_state.formatValid || frame->formatVer != formatVer)
     {
+      if (g_state.useDMA)
+      {
+        for(int i = 0; i < ARRAY_LENGTH(dmaInfo); ++i)
+        {
+          if (dmaInfo[i].fd >= 0)
+            close(dmaInfo[i].fd);
+          dmaInfo[i] = (struct DMAFrameInfo) { .fd = -1 };
+        }
+      }
+
       // setup the renderer format with the frame format details
       lgrFormat.type         = frame->type;
       lgrFormat.screenWidth  = frame->screenWidth;
@@ -726,6 +740,10 @@ int main_frameThread(void * unused)
 
         case FRAME_TYPE_NV12:
           lgrFormat.bpp = 12;
+          break;
+
+        case FRAME_TYPE_P010:
+          lgrFormat.bpp = 24;
           break;
 
         default:

@@ -27,6 +27,64 @@
 
 #include "common/debug.h"
 
+static void colorManagerSupportedIntent(void * data,
+    struct wp_color_manager_v1 * colorManager, uint32_t renderIntent)
+{
+  if (renderIntent == WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL)
+    wlWm.colorIntentPerceptual = true;
+}
+
+static void colorManagerSupportedFeature(void * data,
+    struct wp_color_manager_v1 * colorManager, uint32_t feature)
+{
+  switch (feature)
+  {
+    case WP_COLOR_MANAGER_V1_FEATURE_PARAMETRIC:
+      wlWm.colorFeatureParametric = true;
+      break;
+
+    case WP_COLOR_MANAGER_V1_FEATURE_SET_LUMINANCES:
+      wlWm.colorFeatureSetLuminances = true;
+      break;
+
+    case WP_COLOR_MANAGER_V1_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES:
+      wlWm.colorFeatureSetMastering = true;
+      break;
+
+    case WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_SCRGB:
+      wlWm.colorFeatureWindowsScRGB = true;
+      break;
+  }
+}
+
+static void colorManagerSupportedTF(void * data,
+    struct wp_color_manager_v1 * colorManager, uint32_t tf)
+{
+  if (tf == WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ)
+    wlWm.colorTFPQ = true;
+}
+
+static void colorManagerSupportedPrimaries(void * data,
+    struct wp_color_manager_v1 * colorManager, uint32_t primaries)
+{
+  if (primaries == WP_COLOR_MANAGER_V1_PRIMARIES_BT2020)
+    wlWm.colorPrimariesBT2020 = true;
+}
+
+static void colorManagerDone(void * data,
+    struct wp_color_manager_v1 * colorManager)
+{
+  wlWm.colorManagerDone = true;
+}
+
+static const struct wp_color_manager_v1_listener colorManagerListener = {
+  .supported_intent          = colorManagerSupportedIntent,
+  .supported_feature         = colorManagerSupportedFeature,
+  .supported_tf_named        = colorManagerSupportedTF,
+  .supported_primaries_named = colorManagerSupportedPrimaries,
+  .done                      = colorManagerDone,
+};
+
 static void registryGlobalHandler(void * data, struct wl_registry * registry,
     uint32_t name, const char * interface, uint32_t version)
 {
@@ -68,6 +126,16 @@ static void registryGlobalHandler(void * data, struct wl_registry * registry,
   else if (!strcmp(interface, xdg_activation_v1_interface.name))
     wlWm.xdgActivation = wl_registry_bind(wlWm.registry, name,
         &xdg_activation_v1_interface, 1);
+  else if (!strcmp(interface, frog_color_management_factory_v1_interface.name))
+    wlWm.frogColorManagement = wl_registry_bind(wlWm.registry, name,
+        &frog_color_management_factory_v1_interface, 1);
+  else if (!strcmp(interface, wp_color_manager_v1_interface.name))
+  {
+    wlWm.colorManager = wl_registry_bind(wlWm.registry, name,
+        &wp_color_manager_v1_interface, 1);
+    wp_color_manager_v1_add_listener(wlWm.colorManager,
+        &colorManagerListener, NULL);
+  }
   else if (wlWm.desktop->registryGlobalHandler(
         data, registry, name, interface, version))
     return;
@@ -95,6 +163,8 @@ bool waylandRegistryInit(void)
 
   wl_registry_add_listener(wlWm.registry, &registryListener, NULL);
   wl_display_roundtrip(wlWm.display);
+  if (wlWm.colorManager && !wlWm.colorManagerDone)
+    wl_display_roundtrip(wlWm.display);
   return true;
 }
 
