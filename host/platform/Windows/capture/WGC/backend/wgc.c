@@ -232,6 +232,68 @@ interface IDirect3D11CaptureFrame2
   (This)->lpVtbl->QueryInterface(This,riid,ppvObject)
 #define IDirect3D11CaptureFrame2_get_DirtyRegions(This,value) \
   (This)->lpVtbl->get_DirtyRegions(This,value)
+#define IDirect3D11CaptureFrame2_get_DirtyRegionMode(This,value) \
+  (This)->lpVtbl->get_DirtyRegionMode(This,value)
+#endif
+
+#ifndef IID_IGraphicsCaptureSession4
+DEFINE_GUID(IID_IGraphicsCaptureSession4,
+  0xae99813c, 0xc257, 0x5759, 0x8e, 0xd0, 0x66, 0x8c, 0x9b, 0x55, 0x7e, 0xd4);
+
+typedef enum WGCGraphicsCaptureDirtyRegionMode
+{
+  WGC_GRAPHICS_CAPTURE_DIRTY_REGION_MODE_REPORT_ONLY       = 0,
+  WGC_GRAPHICS_CAPTURE_DIRTY_REGION_MODE_REPORT_AND_RENDER = 1
+}
+WGCGraphicsCaptureDirtyRegionMode;
+
+typedef interface IGraphicsCaptureSession4 IGraphicsCaptureSession4;
+typedef struct IGraphicsCaptureSession4Vtbl
+{
+  BEGIN_INTERFACE
+
+  HRESULT (STDMETHODCALLTYPE *QueryInterface)(
+    IGraphicsCaptureSession4 * This,
+    REFIID riid,
+    void ** ppvObject);
+
+  ULONG (STDMETHODCALLTYPE *AddRef)(IGraphicsCaptureSession4 * This);
+  ULONG (STDMETHODCALLTYPE *Release)(IGraphicsCaptureSession4 * This);
+
+  HRESULT (STDMETHODCALLTYPE *GetIids)(
+    IGraphicsCaptureSession4 * This,
+    ULONG * iidCount,
+    IID ** iids);
+
+  HRESULT (STDMETHODCALLTYPE *GetRuntimeClassName)(
+    IGraphicsCaptureSession4 * This,
+    HSTRING * className);
+
+  HRESULT (STDMETHODCALLTYPE *GetTrustLevel)(
+    IGraphicsCaptureSession4 * This,
+    TrustLevel * trustLevel);
+
+  HRESULT (STDMETHODCALLTYPE *get_DirtyRegionMode)(
+    IGraphicsCaptureSession4 * This,
+    WGCGraphicsCaptureDirtyRegionMode * value);
+
+  HRESULT (STDMETHODCALLTYPE *put_DirtyRegionMode)(
+    IGraphicsCaptureSession4 * This,
+    WGCGraphicsCaptureDirtyRegionMode value);
+
+  END_INTERFACE
+}
+IGraphicsCaptureSession4Vtbl;
+
+interface IGraphicsCaptureSession4
+{
+  CONST_VTBL IGraphicsCaptureSession4Vtbl * lpVtbl;
+};
+
+#define IGraphicsCaptureSession4_QueryInterface(This,riid,ppvObject) \
+  (This)->lpVtbl->QueryInterface(This,riid,ppvObject)
+#define IGraphicsCaptureSession4_put_DirtyRegionMode(This,value) \
+  (This)->lpVtbl->put_DirtyRegionMode(This,value)
 #endif
 
 #ifndef IID_IGraphicsCaptureSession5
@@ -483,6 +545,7 @@ struct WGCInstance
   ID3D12Fence       ** wgcD3D12Fence;
   UINT64               wgcFenceValue;
   ID3D11ComputeShader ** nv12Shader;
+  ID3D11Buffer        ** nv12ShaderConsts;
   bool                 nv12ShaderStateValid;
   bool                 nv12ShaderPqPreserve;
   bool                 nv12ShaderHdrToneMap;
@@ -586,6 +649,8 @@ struct WGCInstance
   uint64_t lastDwmFlushUs;
   bool hasLastSystemRelativeTime;
   int64_t lastSystemRelativeTime;
+  RECT previousDirtyRects[D12_MAX_DIRTY_RECTS];
+  unsigned nbPreviousDirtyRects;
 
   bool mouseHookCreated;
   CRITICAL_SECTION cursorLock;
@@ -668,6 +733,8 @@ static bool wgc_shareFrame(WGCInstance * this, WGCFrameInfo * frame);
 static void wgc_releaseFrameInfo(WGCFrameInfo * frame);
 static void wgc_updateDamage(WGCInstance * this, WGCFrameInfo * info,
   IDirect3D11CaptureFrame * frame);
+static void wgc_extendDamageWithPrevious(WGCInstance * this,
+  WGCFrameInfo * info);
 static bool wgc_shouldForceFullCopyAfterGap(WGCInstance * this,
   WGCFrameInfo * frame);
 static void wgc_maybeLogDebugStats(WGCInstance * this);
@@ -1406,6 +1473,7 @@ static bool wgc_deinit(D12Backend * instance)
   comRef_release(this->item);
   comRef_release(this->graphicsDevice);
   comRef_release(this->nv12Shader);
+  comRef_release(this->nv12ShaderConsts);
   comRef_release(this->hdrStatsTexture);
   if (this->output)
   {
@@ -1678,6 +1746,7 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
     profileStart = profile ? microtime() : 0;
     timingStart = timings ? microtime() : 0;
     wgc_updateDamage(this, dst, frame);
+    wgc_extendDamageWithPrevious(this, dst);
     const bool forceFullCopyAfterGap =
       wgc_shouldForceFullCopyAfterGap(this, dst);
     const bool forceNextFullCopy =
@@ -1808,6 +1877,7 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
   profileStart = profile ? microtime() : 0;
   timingStart = timings ? microtime() : 0;
   wgc_updateDamage(this, accum, frame);
+  wgc_extendDamageWithPrevious(this, accum);
   const bool forceFullCopyAfterGap =
     wgc_shouldForceFullCopyAfterGap(this, accum);
   const bool forceNextFullCopy =
@@ -2220,7 +2290,7 @@ static bool wgc_createFramePool(WGCInstance * this)
 {
   bool result = false;
   HRESULT hr;
-  comRef_scopePush(5);
+  comRef_scopePush(7);
 
   HSTRING className = NULL;
   if (!wgc_createHString(
@@ -2296,6 +2366,24 @@ static bool wgc_createFramePool(WGCInstance * this)
   }
   else
     DEBUG_WARN("WGC capture border control is not available on this OS");
+
+  if (this->base.trackDamage)
+  {
+    comRef_defineLocal(IGraphicsCaptureSession4, session4);
+    hr = IGraphicsCaptureSession_QueryInterface(
+      *session, &IID_IGraphicsCaptureSession4, (void **)session4);
+    if (SUCCEEDED(hr))
+    {
+      hr = IGraphicsCaptureSession4_put_DirtyRegionMode(
+        *session4, WGC_GRAPHICS_CAPTURE_DIRTY_REGION_MODE_REPORT_ONLY);
+      if (FAILED(hr))
+        DEBUG_WINERROR("Failed to enable WGC dirty region reporting", hr);
+      else
+        DEBUG_INFO("WGC dirty region reporting enabled");
+    }
+    else
+      DEBUG_WARN("WGC dirty region reporting is not available on this OS");
+  }
 
   if (this->includeSecondaryWindows)
   {
@@ -2387,6 +2475,41 @@ static void wgc_updateDamage(WGCInstance * this, WGCFrameInfo * info,
 
 exit:
   comRef_scopePop();
+}
+
+static void wgc_extendDamageWithPrevious(WGCInstance * this, WGCFrameInfo * info)
+{
+  if (!this->base.trackDamage)
+    return;
+
+  const unsigned currentCount = info->nbDirtyRects;
+  RECT current[D12_MAX_DIRTY_RECTS];
+  if (currentCount > 0)
+    memcpy(current, info->dirtyRects, currentCount * sizeof(*current));
+
+  if (currentCount > 0 && this->nbPreviousDirtyRects > 0)
+  {
+    const unsigned available = D12_MAX_DIRTY_RECTS - info->nbDirtyRects;
+    if (this->nbPreviousDirtyRects <= available)
+    {
+      memcpy(info->dirtyRects + info->nbDirtyRects, this->previousDirtyRects,
+        this->nbPreviousDirtyRects * sizeof(*info->dirtyRects));
+      info->nbDirtyRects += this->nbPreviousDirtyRects;
+    }
+    else
+    {
+      // Too many regions to preserve correctness cheaply; force full copy.
+      info->nbDirtyRects = 0;
+    }
+  }
+
+  if (currentCount > 0)
+  {
+    memcpy(this->previousDirtyRects, current, currentCount * sizeof(*current));
+    this->nbPreviousDirtyRects = currentCount;
+  }
+  else
+    this->nbPreviousDirtyRects = 0;
 }
 
 static bool wgc_shouldForceFullCopyAfterGap(WGCInstance * this,
@@ -2851,12 +2974,21 @@ static bool wgc_needsEncodeShader(const WGCInstance * this)
   return wgc_isPackedYuvIvshmem(this) || wgc_isRGBA10PQIvshmem(this);
 }
 
+typedef struct WGCEncodeShaderConsts
+{
+  UINT originX;
+  UINT originY;
+  UINT pad[2];
+}
+WGCEncodeShaderConsts;
+
 static void wgc_invalidateNV12Shader(WGCInstance * this)
 {
   if (!this)
     return;
 
   comRef_release(this->nv12Shader);
+  comRef_release(this->nv12ShaderConsts);
   this->nv12ShaderStateValid = false;
 }
 
@@ -2946,6 +3078,11 @@ static bool wgc_ensureNV12Shader(WGCInstance * this)
     "#else\n"
     "RWTexture2D<float4> dstTex : register(u0);\n"
     "#endif\n"
+    "cbuffer EncodeConsts : register(b0)\n"
+    "{\n"
+    "  uint2 origin;\n"
+    "  uint2 pad;\n"
+    "};\n"
     "\n"
     "uint pack16(float v)\n"
     "{\n"
@@ -3025,13 +3162,13 @@ static bool wgc_ensureNV12Shader(WGCInstance * this)
     "  uint srcW, srcH;\n"
     "  srcTex.GetDimensions(srcW, srcH);\n"
     "#if WGC_HDR_RGB10PQ\n"
-    "  uint2 p = dt.xy;\n"
+    "  uint2 p = dt.xy + origin;\n"
     "  if (p.x >= srcW || p.y >= srcH)\n"
     "    return;\n"
     "  dstTex[p] = packRGBA10Bytes(prepareRgb(bgraToRgb(srcTex[p])));\n"
     "  return;\n"
     "#endif\n"
-    "  uint2 p0 = uint2(dt.x * 4, dt.y * 2);\n"
+    "  uint2 p0 = uint2(dt.x * 4, dt.y * 2) + origin;\n"
     "  if (p0.x >= srcW || p0.y >= srcH)\n"
     "    return;\n"
     "\n"
@@ -3058,9 +3195,10 @@ static bool wgc_ensureNV12Shader(WGCInstance * this)
     "  float y5 = luma(c5);\n"
     "  float y6 = luma(c6);\n"
     "  float y7 = luma(c7);\n"
-    "  writePacked(uint2(dt.x, p0.y), float4(y0, y1, y4, y5));\n"
+    "  uint dstX = p0.x / 4;\n"
+    "  writePacked(uint2(dstX, p0.y), float4(y0, y1, y4, y5));\n"
     "  if (p2.y < srcH)\n"
-    "    writePacked(uint2(dt.x, p2.y), float4(y2, y3, y6, y7));\n"
+    "    writePacked(uint2(dstX, p2.y), float4(y2, y3, y6, y7));\n"
     "\n"
     "  float3 avg0 = (c0 + c1 + c2 + c3) * 0.25;\n"
     "  float yy0 = luma(avg0);\n"
@@ -3080,16 +3218,17 @@ static bool wgc_ensureNV12Shader(WGCInstance * this)
     "  float u1 = saturate((avg1.b - yy1) * 0.5389 + 0.5);\n"
     "  float v1 = saturate((avg1.r - yy1) * 0.6350 + 0.5);\n"
     "#endif\n"
-    "  uint uvY = srcH + dt.y;\n"
-    "  writePacked(uint2(dt.x, uvY), float4(u0, v0, u1, v1));\n"
+    "  uint uvY = srcH + p0.y / 2;\n"
+    "  writePacked(uint2(dstX, uvY), float4(u0, v0, u1, v1));\n"
     "}\n";
 
   bool result = false;
   HRESULT hr;
-  comRef_scopePush(3);
+  comRef_scopePush(4);
   comRef_defineLocal(ID3DBlob, blob);
   comRef_defineLocal(ID3DBlob, error);
   comRef_defineLocal(ID3D11ComputeShader, shader);
+  comRef_defineLocal(ID3D11Buffer, consts);
 
   const D3D_SHADER_MACRO macros[] =
   {
@@ -3118,7 +3257,21 @@ static bool wgc_ensureNV12Shader(WGCInstance * this)
     goto exit;
   }
 
+  D3D11_BUFFER_DESC bufferDesc =
+  {
+    .ByteWidth = sizeof(WGCEncodeShaderConsts),
+    .Usage     = D3D11_USAGE_DEFAULT,
+    .BindFlags = D3D11_BIND_CONSTANT_BUFFER,
+  };
+  hr = ID3D11Device5_CreateBuffer(*this->device, &bufferDesc, NULL, consts);
+  if (FAILED(hr))
+  {
+    DEBUG_WINERROR("Create WGC encode constant buffer failed", hr);
+    goto exit;
+  }
+
   comRef_toGlobal(this->nv12Shader, shader);
+  comRef_toGlobal(this->nv12ShaderConsts, consts);
   this->nv12ShaderStateValid    = true;
   this->nv12ShaderPqPreserve    = pqPreserve;
   this->nv12ShaderHdrToneMap    = hdrToneMap;
@@ -3233,6 +3386,74 @@ static void wgc_logRGBA10PQTextureSample(WGCInstance * this,
   ID3D11Texture2D_Release(staging);
 }
 
+static void wgc_setEncodeOrigin(WGCInstance * this, UINT originX, UINT originY)
+{
+  const WGCEncodeShaderConsts consts =
+  {
+    .originX = originX,
+    .originY = originY,
+  };
+
+  ID3D11DeviceContext4_UpdateSubresource(*this->context,
+    (ID3D11Resource *)*this->nv12ShaderConsts, 0, NULL, &consts, 0, 0);
+}
+
+static void wgc_dispatchEncodeFull(WGCInstance * this,
+  const D3D11_TEXTURE2D_DESC * srcDesc)
+{
+  wgc_setEncodeOrigin(this, 0, 0);
+
+  if (wgc_isRGBA10PQIvshmem(this))
+    ID3D11DeviceContext4_Dispatch(*this->context,
+      (srcDesc->Width  + 15) / 16,
+      (srcDesc->Height + 15) / 16,
+      1);
+  else
+    ID3D11DeviceContext4_Dispatch(*this->context,
+      (srcDesc->Width  + 31) / 32,
+      (srcDesc->Height + 31) / 32,
+      1);
+}
+
+static bool wgc_dispatchEncodeDirtyPackedYuv(WGCInstance * this,
+  const WGCFrameInfo * dst, const D3D11_TEXTURE2D_DESC * srcDesc)
+{
+  if (!wgc_isPackedYuvIvshmem(this) || dst->fullCopy ||
+      this->d3d12FullCopyAlways ||
+      dst->nbDirtyRects == 0)
+    return false;
+
+  bool dispatched = false;
+  for(const RECT * rect = dst->dirtyRects;
+      rect < dst->dirtyRects + dst->nbDirtyRects; ++rect)
+  {
+    UINT left   = (UINT)max(0, min(rect->left  , (LONG)srcDesc->Width ));
+    UINT top    = (UINT)max(0, min(rect->top   , (LONG)srcDesc->Height));
+    UINT right  = (UINT)max(0, min(rect->right , (LONG)srcDesc->Width ));
+    UINT bottom = (UINT)max(0, min(rect->bottom, (LONG)srcDesc->Height));
+    if (right <= left || bottom <= top)
+      continue;
+
+    left   &= ~3u;
+    top    &= ~1u;
+    right   = min(srcDesc->Width , (right  + 3u) & ~3u);
+    bottom  = min(srcDesc->Height, (bottom + 1u) & ~1u);
+    if (right <= left || bottom <= top)
+      continue;
+
+    wgc_setEncodeOrigin(this, left, top);
+    const UINT threadsX = (right  - left + 3u) / 4u;
+    const UINT threadsY = (bottom - top  + 1u) / 2u;
+    ID3D11DeviceContext4_Dispatch(*this->context,
+      (threadsX + 15u) / 16u,
+      (threadsY + 15u) / 16u,
+      1);
+    dispatched = true;
+  }
+
+  return dispatched;
+}
+
 static bool wgc_encodeFrameNV12(WGCInstance * this, WGCFrameInfo * dst,
   ID3D11Texture2D * src)
 {
@@ -3262,24 +3483,22 @@ static bool wgc_encodeFrameNV12(WGCInstance * this, WGCFrameInfo * dst,
 
   ID3D11ShaderResourceView * srvs[1] = { *srv };
   ID3D11UnorderedAccessView * uavs[1] = { *dst->encodeUav };
+  ID3D11Buffer * constBuffers[1] = { *this->nv12ShaderConsts };
   ID3D11DeviceContext4_CSSetShader(*this->context, *this->nv12Shader, NULL, 0);
   ID3D11DeviceContext4_CSSetShaderResources(*this->context, 0, 1, srvs);
+  ID3D11DeviceContext4_CSSetConstantBuffers(*this->context, 0, 1,
+    constBuffers);
   ID3D11DeviceContext4_CSSetUnorderedAccessViews(*this->context, 0, 1, uavs,
     NULL);
-  if (wgc_isRGBA10PQIvshmem(this))
-    ID3D11DeviceContext4_Dispatch(*this->context,
-      (srcDesc.Width  + 15) / 16,
-      (srcDesc.Height + 15) / 16,
-      1);
-  else
-    ID3D11DeviceContext4_Dispatch(*this->context,
-      (srcDesc.Width  + 31) / 32,
-      (srcDesc.Height + 31) / 32,
-      1);
+  if (!wgc_dispatchEncodeDirtyPackedYuv(this, dst, &srcDesc))
+    wgc_dispatchEncodeFull(this, &srcDesc);
 
   ID3D11ShaderResourceView * nullSrvs[1] = { NULL };
   ID3D11UnorderedAccessView * nullUavs[1] = { NULL };
+  ID3D11Buffer * nullConstBuffers[1] = { NULL };
   ID3D11DeviceContext4_CSSetShaderResources(*this->context, 0, 1, nullSrvs);
+  ID3D11DeviceContext4_CSSetConstantBuffers(*this->context, 0, 1,
+    nullConstBuffers);
   ID3D11DeviceContext4_CSSetUnorderedAccessViews(*this->context, 0, 1,
     nullUavs, NULL);
   ID3D11DeviceContext4_CSSetShader(*this->context, NULL, NULL, 0);
@@ -3430,7 +3649,13 @@ static bool wgc_encodeFrameNV12(WGCInstance * this, WGCFrameInfo * dst,
         DEBUG_WINERROR("Create WGC P010 bridge staging failed", hr);
   }
 
-  dst->fullCopy = true;
+  // Packed RGB10/PQ has the same dimensions as the source frame. Packed
+  // YUV/P010 does not, but the D3D12 IVSHMEM copy path remaps source dirty
+  // rects into packed-buffer rects before publishing.
+  if (!wgc_isRGBA10PQIvshmem(this) &&
+      !(wgc_isPackedYuvIvshmem(this) &&
+        this->publishMode == WGC_PUBLISH_IVSHMEM_D3D12_COPY))
+    dst->fullCopy = true;
   result = true;
 
 exit:
@@ -3681,6 +3906,55 @@ static bool wgc_buildTileSpans(WGCInstance * this, const WGCFrameInfo * frame,
   return ok && *spanCount > 0;
 }
 
+static bool wgc_mapPackedYuvCopyRects(WGCInstance * this,
+  const RECT * srcRects, unsigned srcCount,
+  RECT * dstRects, unsigned dstCapacity, unsigned * dstCount)
+{
+  *dstCount = 0;
+
+  const LONG frameWidth  = (LONG)this->ivshmemWidth;
+  const LONG frameHeight = (LONG)this->ivshmemHeight;
+
+  for(const RECT * src = srcRects; src < srcRects + srcCount; ++src)
+  {
+    const LONG left   = max(0, min(src->left  , frameWidth ));
+    const LONG top    = max(0, min(src->top   , frameHeight));
+    const LONG right  = max(0, min(src->right , frameWidth ));
+    const LONG bottom = max(0, min(src->bottom, frameHeight));
+    if (right <= left || bottom <= top)
+      continue;
+
+    if (*dstCount + 2 > dstCapacity)
+      return false;
+
+    const LONG yLeft  = left / 4;
+    const LONG yRight = (right + 3) / 4;
+    dstRects[(*dstCount)++] = (RECT)
+    {
+      .left   = yLeft,
+      .top    = top,
+      .right  = yRight,
+      .bottom = bottom,
+    };
+
+    const LONG pairStart = left / 2;
+    const LONG pairEnd   = (right + 1) / 2;
+    const LONG uvLeft    = (pairStart * 2) / 4;
+    const LONG uvRight   = (pairEnd * 2 + 3) / 4;
+    const LONG uvTop     = frameHeight + top / 2;
+    const LONG uvBottom  = frameHeight + (bottom + 1) / 2;
+    dstRects[(*dstCount)++] = (RECT)
+    {
+      .left   = uvLeft,
+      .top    = uvTop,
+      .right  = uvRight,
+      .bottom = uvBottom,
+    };
+  }
+
+  return *dstCount > 0;
+}
+
 static bool wgc_copyFrameTextureD3D12(WGCInstance * this, WGCFrameInfo * dst)
 {
   if (this->d3d12CopyQueueCount == 0 || !this->d3d12CopyCommandReady[0] ||
@@ -3710,13 +3984,28 @@ static bool wgc_copyFrameTextureD3D12(WGCInstance * this, WGCFrameInfo * dst)
   const RECT * copyRects = dst->dirtyRects;
   unsigned copyRectCount = dst->nbDirtyRects;
 
-  if (!copyFull && this->tiledCopyMode == WGC_TILED_COPY_DIRTY)
+  if (!copyFull && !wgc_isPackedYuvIvshmem(this) &&
+      this->tiledCopyMode == WGC_TILED_COPY_DIRTY)
   {
     if (wgc_buildTileSpans(this, dst, tileSpans,
         WGC_D3D12_TILE_SPAN_MAX, &tileSpanCount, &tilePixels))
     {
       copyRects = tileSpans;
       copyRectCount = tileSpanCount;
+    }
+    else
+      copyFull = true;
+  }
+
+  RECT packedYuvRects[D12_MAX_DIRTY_RECTS * 2];
+  unsigned packedYuvRectCount = 0;
+  if (!copyFull && wgc_isPackedYuvIvshmem(this))
+  {
+    if (wgc_mapPackedYuvCopyRects(this, copyRects, copyRectCount,
+        packedYuvRects, ARRAY_LENGTH(packedYuvRects), &packedYuvRectCount))
+    {
+      copyRects = packedYuvRects;
+      copyRectCount = packedYuvRectCount;
     }
     else
       copyFull = true;
