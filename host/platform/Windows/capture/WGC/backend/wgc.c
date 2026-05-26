@@ -404,6 +404,9 @@ interface IGraphicsCaptureSession6
 
 #define FRAME_POOL_BUFFERS 2
 #define WGC_CURSOR_MAX_SIZE (512 * 512 * 4)
+#define WGC_STALL_REINIT_US (3ULL * 1000ULL * 1000ULL)
+#define WGC_STALL_BACKOFF_INITIAL_US (2ULL * 1000ULL * 1000ULL)
+#define WGC_STALL_BACKOFF_MAX_US (30ULL * 1000ULL * 1000ULL)
 
 #define WGC_FRAME_FREE      0
 #define WGC_FRAME_WRITING   1
@@ -640,6 +643,10 @@ struct WGCInstance
   DXGI_COLOR_SPACE_TYPE colorSpace;
   bool roInitialized;
   unsigned emptyPolls;
+  uint64_t emptyPollStartUs;
+  LONG emptyPollStartEvents;
+  LONG emptyPollStartPulled;
+  LONG emptyPollStartConsumed;
   bool loggedFirstFrame;
   WGCCursorMode cursorMode;
   int maxFPS;
@@ -677,6 +684,8 @@ struct WGCInstance
 };
 
 static WGCInstance * wgcCursorInstance;
+static uint64_t wgcNextStarvationReinitUs = 0;
+static uint64_t wgcStarvationBackoffUs = 0;
 
 static HRESULT STDMETHODCALLTYPE wgc_eventQueryInterface(
   ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable * iface,
@@ -740,6 +749,7 @@ static bool wgc_shouldForceFullCopyAfterGap(WGCInstance * this,
 static void wgc_maybeLogDebugStats(WGCInstance * this);
 static void wgc_maybeLogHDRStats(WGCInstance * this, ID3D11Texture2D * src);
 static void wgc_maybeDwmFlushOnGap(WGCInstance * this);
+static bool wgc_shouldReinitAfterStarvation(WGCInstance * this, uint64_t now);
 static void wgc_recordProfileStage(WGCInstance * this, WGCProfileStage stage,
   uint64_t elapsedUs);
 static void wgc_interlockedMax64(volatile LONG64 * target, LONG64 value);
@@ -2062,7 +2072,9 @@ static CaptureResult wgc_capture(D12Backend * instance,
     d12_timingRecord(D12_TIMING_WGC_WAIT, microtime() - timingStart);
   if (wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT)
   {
-    DEBUG_WINERROR("Waiting for a WGC frame failed", GetLastError());
+    DEBUG_WINERROR("Waiting for a WGC frame failed, reinitializing",
+      GetLastError());
+    result = CAPTURE_RESULT_REINIT;
     goto exit;
   }
 
@@ -2102,7 +2114,15 @@ static CaptureResult wgc_capture(D12Backend * instance,
     IDirect3D11CaptureFrame * polled = NULL;
     HRESULT pollHr = IDirect3D11CaptureFramePool_TryGetNextFrame(
       *this->framePool, &polled);
-    if (SUCCEEDED(pollHr) && polled)
+    if (FAILED(pollHr))
+    {
+      DEBUG_WINERROR("WGC direct TryGetNextFrame failed, reinitializing",
+        pollHr);
+      result = CAPTURE_RESULT_REINIT;
+      goto exit;
+    }
+
+    if (polled)
     {
       DEBUG_INFO("WGC direct: pulled frame via direct TryGetNextFrame poll "
         "(FrameArrived was silent)");
@@ -2113,11 +2133,13 @@ static CaptureResult wgc_capture(D12Backend * instance,
       DEBUG_INFO("WGC direct: TryGetNextFrame poll returned NULL "
         "(hr=0x%08lx emptyPolls=%u events:%ld) — pool is empty",
         (unsigned long)pollHr, this->emptyPolls,
-        this->handler ? this->handler->events : 0);
+        this->handler ?
+          InterlockedCompareExchange(&this->handler->events, 0, 0) : 0);
   }
 
   if (!frame)
   {
+    const uint64_t now = microtime();
     const DXGI_COLOR_SPACE_TYPE colorSpace = wgc_getOutputColorSpace(this);
     if (colorSpace != this->colorSpace)
     {
@@ -2128,15 +2150,34 @@ static CaptureResult wgc_capture(D12Backend * instance,
       goto exit;
     }
 
+    if (wgc_shouldReinitAfterStarvation(this, now))
+    {
+      result = CAPTURE_RESULT_REINIT;
+      goto exit;
+    }
+
     wgc_maybeDwmFlushOnGap(this);
     if (++this->emptyPolls % 30 == 0)
-      DEBUG_INFO("WGC has no pending frame (idx=%u publishMode=%d emptyPolls=%u events:%ld)",
+    {
+      const LONG events = this->handler ?
+        InterlockedCompareExchange(&this->handler->events, 0, 0) : 0;
+      const LONG pulled = this->handler ?
+        InterlockedCompareExchange(&this->handler->framesPulled, 0, 0) : 0;
+      const LONG consumed = this->handler ?
+        InterlockedCompareExchange(&this->handler->framesConsumed, 0, 0) : 0;
+      DEBUG_INFO("WGC has no pending frame (idx=%u publishMode=%d emptyPolls=%u "
+        "events:%ld pulled:%ld consumed:%ld)",
         frameBufferIndex, (int)this->publishMode, this->emptyPolls,
-        this->handler ? this->handler->events : 0);
+        events, pulled, consumed);
+    }
     result = CAPTURE_RESULT_TIMEOUT;
     goto exit;
   }
   this->emptyPolls = 0;
+  this->emptyPollStartUs = 0;
+  this->emptyPollStartEvents = 0;
+  this->emptyPollStartPulled = 0;
+  this->emptyPollStartConsumed = 0;
   if (this->handler && !this->asyncCapture)
     InterlockedIncrement(&this->handler->framesConsumed);
 
@@ -2148,6 +2189,58 @@ exit:
   wgc_releaseFrame(&frame);
   comRef_scopePop();
   return result;
+}
+
+static bool wgc_shouldReinitAfterStarvation(WGCInstance * this, uint64_t now)
+{
+  const LONG events = this->handler ?
+    InterlockedCompareExchange(&this->handler->events, 0, 0) : 0;
+  const LONG pulled = this->handler ?
+    InterlockedCompareExchange(&this->handler->framesPulled, 0, 0) : 0;
+  const LONG consumed = this->handler ?
+    InterlockedCompareExchange(&this->handler->framesConsumed, 0, 0) : 0;
+
+  if (!this->emptyPollStartUs ||
+      events   != this->emptyPollStartEvents ||
+      pulled   != this->emptyPollStartPulled ||
+      consumed != this->emptyPollStartConsumed)
+  {
+    this->emptyPollStartUs = now;
+    this->emptyPollStartEvents = events;
+    this->emptyPollStartPulled = pulled;
+    this->emptyPollStartConsumed = consumed;
+    return false;
+  }
+
+  const uint64_t stalledUs = now - this->emptyPollStartUs;
+  if (stalledUs < WGC_STALL_REINIT_US)
+    return false;
+
+  if (now < wgcNextStarvationReinitUs)
+  {
+    if (this->emptyPolls % 120 == 0)
+      DEBUG_WARN("WGC capture appears starved for %.2fs, reinit suppressed "
+        "by backoff for %.2fs (events:%ld pulled:%ld consumed:%ld)",
+        (double)stalledUs / 1000000.0,
+        (double)(wgcNextStarvationReinitUs - now) / 1000000.0,
+        events, pulled, consumed);
+    return false;
+  }
+
+  if (!wgcStarvationBackoffUs)
+    wgcStarvationBackoffUs = WGC_STALL_BACKOFF_INITIAL_US;
+  else
+    wgcStarvationBackoffUs = min(
+      wgcStarvationBackoffUs * 2, WGC_STALL_BACKOFF_MAX_US);
+  wgcNextStarvationReinitUs = now + wgcStarvationBackoffUs;
+
+  DEBUG_WARN("WGC capture starved for %.2fs with no callback/queue progress "
+    "(events:%ld pulled:%ld consumed:%ld), reinitializing; next starvation "
+    "reinit backoff %.2fs",
+    (double)stalledUs / 1000000.0,
+    events, pulled, consumed,
+    (double)wgcStarvationBackoffUs / 1000000.0);
+  return true;
 }
 
 static void wgc_maybeDwmFlushOnGap(WGCInstance * this)
