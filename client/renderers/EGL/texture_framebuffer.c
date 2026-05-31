@@ -39,6 +39,63 @@ typedef struct TexFB
 }
 TexFB;
 
+static bool egl_texFBIsPackedYUV(const EGL_Texture * texture)
+{
+  return texture->format.pixFmt == EGL_PF_NV12 ||
+         texture->format.pixFmt == EGL_PF_P010;
+}
+
+static int egl_texFBMapPackedYUVRects(const EGL_Texture * texture,
+  const FrameDamageRect * src, int srcCount,
+  FrameDamageRect * dst, int dstCapacity)
+{
+  if (srcCount <= 0)
+    return 0;
+
+  const int frameWidth  = (int)texture->format.width * 4;
+  const int frameHeight = (int)(texture->format.height * 2 / 3);
+  int dstCount = 0;
+
+  for(int i = 0; i < srcCount; ++i)
+  {
+    int left   = clamp(src[i].x, 0, frameWidth);
+    int top    = clamp(src[i].y, 0, frameHeight);
+    int right  = clamp(src[i].x + src[i].width , 0, frameWidth);
+    int bottom = clamp(src[i].y + src[i].height, 0, frameHeight);
+    if (right <= left || bottom <= top)
+      continue;
+
+    if (dstCount + 2 > dstCapacity)
+      return -1;
+
+    const int yLeft  = left / 4;
+    const int yRight = (right + 3) / 4;
+    dst[dstCount++] = (FrameDamageRect)
+    {
+      .x      = yLeft,
+      .y      = top,
+      .width  = yRight - yLeft,
+      .height = bottom - top,
+    };
+
+    const int pairStart = left / 2;
+    const int pairEnd   = (right + 1) / 2;
+    const int uvLeft    = (pairStart * 2) / 4;
+    const int uvRight   = (pairEnd * 2 + 3) / 4;
+    const int uvTop     = frameHeight + top / 2;
+    const int uvBottom  = frameHeight + (bottom + 1) / 2;
+    dst[dstCount++] = (FrameDamageRect)
+    {
+      .x      = uvLeft,
+      .y      = uvTop,
+      .width  = uvRight - uvLeft,
+      .height = uvBottom - uvTop,
+    };
+  }
+
+  return rectsMergeOverlapping(dst, dstCount);
+}
+
 static bool egl_texFBInit(EGL_Texture ** texture, EGL_TexType type,
     EGLDisplay * display)
 {
@@ -94,9 +151,25 @@ static bool egl_texFBUpdate(EGL_Texture * texture, const EGL_TexUpdate * update)
 
   LG_LOCK(parent->copyLock);
 
+  FrameDamageRect mappedRects[KVMFR_MAX_DAMAGE_RECTS];
+  const FrameDamageRect * updateRects = update->rects;
+  int updateRectCount = update->rectCount;
+  if (update->rects && update->rectCount > 0 && egl_texFBIsPackedYUV(texture))
+  {
+    updateRectCount = egl_texFBMapPackedYUVRects(texture,
+      update->rects, update->rectCount, mappedRects, KVMFR_MAX_DAMAGE_RECTS);
+    if (updateRectCount < 0)
+    {
+      updateRects = NULL;
+      updateRectCount = 0;
+    }
+    else
+      updateRects = mappedRects;
+  }
+
   struct TexDamage * damage = this->damage + parent->bufIndex;
-  bool damageAll = !update->rects || update->rectCount == 0 || damage->count < 0 ||
-    damage->count + update->rectCount > KVMFR_MAX_DAMAGE_RECTS;
+  bool damageAll = !updateRects || updateRectCount == 0 || damage->count < 0 ||
+    damage->count + updateRectCount > KVMFR_MAX_DAMAGE_RECTS;
 
   struct TexDamage * upload = this->uploadDamage + parent->bufIndex;
 
@@ -116,9 +189,9 @@ static bool egl_texFBUpdate(EGL_Texture * texture, const EGL_TexUpdate * update)
   }
   else
   {
-    memcpy(damage->rects + damage->count, update->rects,
-      update->rectCount * sizeof(FrameDamageRect));
-    damage->count += update->rectCount;
+    memcpy(damage->rects + damage->count, updateRects,
+      updateRectCount * sizeof(FrameDamageRect));
+    damage->count += updateRectCount;
 
     if (texture->format.pixFmt == EGL_PF_BGR_32)
     {
@@ -184,12 +257,12 @@ static bool egl_texFBUpdate(EGL_Texture * texture, const EGL_TexUpdate * update)
     struct TexDamage * damage = this->damage + i;
     if (i == parent->bufIndex)
       damage->count = 0;
-    else if (update->rects && update->rectCount > 0 && damage->count >= 0 &&
-             damage->count + update->rectCount <= KVMFR_MAX_DAMAGE_RECTS)
+    else if (updateRects && updateRectCount > 0 && damage->count >= 0 &&
+             damage->count + updateRectCount <= KVMFR_MAX_DAMAGE_RECTS)
     {
-      memcpy(damage->rects + damage->count, update->rects,
-        update->rectCount * sizeof(FrameDamageRect));
-      damage->count += update->rectCount;
+      memcpy(damage->rects + damage->count, updateRects,
+        updateRectCount * sizeof(FrameDamageRect));
+      damage->count += updateRectCount;
     }
     else
       damage->count = -1;

@@ -1,7 +1,8 @@
 # test-d3d11on12-ivshmem
 
-Standalone validation tool for the IVSHMEM-direct buffer design (Phase 1
-of `~/.claude/plans/ivshmem-direct-buffers.md`).
+> **Developer tool** — This is a standalone validation harness for the IVSHMEM-direct buffer design. It is not needed for normal use of Looking Glass.
+
+Standalone validation tool for the IVSHMEM-direct buffer design.
 
 ## What it tests
 

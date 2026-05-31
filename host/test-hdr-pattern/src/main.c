@@ -1,3 +1,23 @@
+/**
+ * Looking Glass
+ * Copyright © 2017-2025 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
@@ -19,6 +39,8 @@ Vertex;
 static HWND hwnd;
 static bool running = true;
 static bool fullscreen = false;
+static bool staticMode = false;
+static bool needsRender = true;
 static RECT windowRect;
 static DWORD windowStyle;
 static int winW = 1920;
@@ -825,6 +847,8 @@ static void resize(UINT w, UINT h)
   ID3D11Texture2D_Release(back);
   if (FAILED(hr))
     die("CreateRenderTargetView", hr);
+
+  needsRender = true;
 }
 
 static void toggleFullscreen(void)
@@ -865,11 +889,22 @@ static LRESULT CALLBACK wndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SIZE:
       resize(LOWORD(lp), HIWORD(lp));
       return 0;
+    case WM_PAINT:
+    {
+      PAINTSTRUCT ps;
+      BeginPaint(wnd, &ps);
+      EndPaint(wnd, &ps);
+      needsRender = true;
+      return 0;
+    }
     case WM_KEYDOWN:
       if (wp == VK_ESCAPE)
         DestroyWindow(wnd);
       else if (wp == VK_F11)
+      {
         toggleFullscreen();
+        needsRender = true;
+      }
       return 0;
   }
   return DefWindowProc(wnd, msg, wp, lp);
@@ -977,6 +1012,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 
   if (strstr(cmd, "--fullscreen"))
     fullscreen = true;
+  if (strstr(cmd, "--static"))
+    staticMode = true;
 
   WNDCLASS wc =
   {
@@ -1011,7 +1048,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
       TranslateMessage(&msg);
       DispatchMessage(&msg);
     }
-    render();
+
+    if (!staticMode || needsRender)
+    {
+      render();
+      needsRender = false;
+    }
+
+    if (staticMode)
+      WaitMessage();
   }
 
   return 0;

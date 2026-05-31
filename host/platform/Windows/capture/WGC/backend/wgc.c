@@ -158,19 +158,6 @@ static void wgc_setD3D12ObjectName(ID3D12Object * object, const char * name)
   (void)object;
   (void)name;
   return;
-
-#if 0
-  if (!object || !name || !*name)
-    return;
-
-  wchar_t wideName[128];
-  const int written = MultiByteToWideChar(CP_UTF8, 0, name, -1,
-    wideName, ARRAYSIZE(wideName));
-  if (written <= 0)
-    return;
-
-  ID3D12Object_SetName(object, wideName);
-#endif
 }
 
 static void wgc_setD3D12ObjectNameI(ID3D12Object * object,
@@ -603,6 +590,8 @@ struct WGCInstance
   WGCFrameInfo * consumerFrame;
   volatile LONG asyncNextSlot;
   bool asyncCapture;
+  bool pollFramePool;
+  int pollFramePoolMs;
   bool debugStats;
   LONG asyncTimeouts;
   LONG asyncReadyBeforeWait;
@@ -656,6 +645,9 @@ struct WGCInstance
   uint64_t lastDwmFlushUs;
   bool hasLastSystemRelativeTime;
   int64_t lastSystemRelativeTime;
+  volatile LONG64 systemRelativeGapTotalUs;
+  volatile LONG64 systemRelativeGapMaxUs;
+  volatile LONG64 systemRelativeGapCount;
   RECT previousDirtyRects[D12_MAX_DIRTY_RECTS];
   unsigned nbPreviousDirtyRects;
 
@@ -683,9 +675,9 @@ struct WGCInstance
   bool cursorShapeValid;
 };
 
-static WGCInstance * wgcCursorInstance;
-static uint64_t wgcNextStarvationReinitUs = 0;
-static uint64_t wgcStarvationBackoffUs = 0;
+static WGCInstance * volatile wgcCursorInstance;
+static volatile uint64_t wgcNextStarvationReinitUs = 0;
+static volatile uint64_t wgcStarvationBackoffUs = 0;
 
 static HRESULT STDMETHODCALLTYPE wgc_eventQueryInterface(
   ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable * iface,
@@ -979,7 +971,7 @@ static bool wgc_init(D12Backend * instance, bool debug, ID3D12Device3 * device,
 
   bool result = false;
   HRESULT hr;
-  comRef_scopePush(20);
+  comRef_scopePush(24);
 
   this->cursorMode = wgc_parseCursorMode();
   this->maxFPS     = option_get_int("wgc", "maxFPS");
@@ -1000,16 +992,19 @@ static bool wgc_init(D12Backend * instance, bool debug, ID3D12Device3 * device,
     &this->tileWidth, &this->tileHeight);
   this->dirtyMaxTiles = max(1, option_get_int("wgc", "dirtyMaxTiles"));
   this->asyncCapture = option_get_bool("wgc", "asyncCapture");
+  this->pollFramePool = option_get_bool("wgc", "pollFramePool");
+  this->pollFramePoolMs = max(0, option_get_int("wgc", "pollFramePoolMs"));
   this->debugStats = option_get_bool("wgc", "debugStats");
   this->includeSecondaryWindows =
     option_get_bool("wgc", "includeSecondaryWindows");
   this->dwmFlushOnGap = option_get_bool("wgc", "dwmFlushOnGap");
   this->dwmFlushGapMs = max(1, option_get_int("wgc", "dwmFlushGapMs"));
   this->lastDwmFlushUs = 0;
-  DEBUG_INFO("WGC cursor:%s cursorMaxHz:%d maxFPS:%d asyncCapture:%d includeSecondaryWindows:%d debugStats:%d dwmFlushOnGap:%d/%dms tiled:%s tileSize:%ux%u dirtyMaxTiles:%u",
+  DEBUG_INFO("WGC cursor:%s cursorMaxHz:%d maxFPS:%d asyncCapture:%d pollFramePool:%d/%dms includeSecondaryWindows:%d debugStats:%d dwmFlushOnGap:%d/%dms tiled:%s tileSize:%ux%u dirtyMaxTiles:%u",
     this->cursorMode == WGC_CURSOR_MODE_SEPARATE ? "separate" :
     this->cursorMode == WGC_CURSOR_MODE_EMBEDDED ? "embedded" : "none",
     this->cursorMaxHz, this->maxFPS, this->asyncCapture,
+    this->pollFramePool, this->pollFramePoolMs,
     this->includeSecondaryWindows, this->debugStats, this->dwmFlushOnGap,
     this->dwmFlushGapMs,
     this->tiledCopyMode == WGC_TILED_COPY_DIRTY ? "dirty" : "none",
@@ -2067,7 +2062,8 @@ static CaptureResult wgc_capture(D12Backend * instance,
   }
 
   uint64_t timingStart = timings ? microtime() : 0;
-  const DWORD wait = WaitForSingleObject(this->frameEvent, 1000);
+  const DWORD wait = WaitForSingleObject(this->frameEvent,
+    this->pollFramePool ? (DWORD)this->pollFramePoolMs : 1000);
   if (timings)
     d12_timingRecord(D12_TIMING_WGC_WAIT, microtime() - timingStart);
   if (wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT)
@@ -2103,12 +2099,11 @@ static CaptureResult wgc_capture(D12Backend * instance,
   if (timings)
     d12_timingRecord(D12_TIMING_WGC_TAKE_FRAME, microtime() - timingStart);
 
-  // IVSHMEM_DIRECT diagnostic: if the callback hasn't given us a pending
-  // frame, poll the frame pool directly. This tells us whether (a) the
-  // FrameArrived notification stopped firing while frames are still queued
-  // (we'd get a frame here) or (b) the compositor capture pipeline itself
-  // has stopped producing (we'd get NULL).
-  if (!frame && wgc_isIvshmemPublishMode(this->publishMode) &&
+  // IVSHMEM diagnostic: if the callback hasn't given us a pending frame,
+  // optionally poll the frame pool directly. This tells us whether
+  // FrameArrived notification delivery is the bottleneck.
+  if (!frame && (this->pollFramePool ||
+        wgc_isIvshmemPublishMode(this->publishMode)) &&
       this->framePool)
   {
     IDirect3D11CaptureFrame * polled = NULL;
@@ -2124,12 +2119,13 @@ static CaptureResult wgc_capture(D12Backend * instance,
 
     if (polled)
     {
-      DEBUG_INFO("WGC direct: pulled frame via direct TryGetNextFrame poll "
-        "(FrameArrived was silent)");
+      if (!this->pollFramePool)
+        DEBUG_INFO("WGC direct: pulled frame via direct TryGetNextFrame poll "
+          "(FrameArrived was silent)");
       frame = polled;
       LG_PROFILE_FRAME("wgc polled frame");
     }
-    else if (++this->emptyPolls % 3 == 0)
+    else if (!this->pollFramePool && ++this->emptyPolls % 3 == 0)
       DEBUG_INFO("WGC direct: TryGetNextFrame poll returned NULL "
         "(hr=0x%08lx emptyPolls=%u events:%ld) — pool is empty",
         (unsigned long)pollHr, this->emptyPolls,
@@ -2617,6 +2613,13 @@ static bool wgc_shouldForceFullCopyAfterGap(WGCInstance * this,
   {
     const int64_t delta =
       frame->systemRelativeTime - this->lastSystemRelativeTime;
+    if (this->debugStats)
+    {
+      const LONG64 deltaUs = (LONG64)(delta / 10);
+      InterlockedExchangeAdd64(&this->systemRelativeGapTotalUs, deltaUs);
+      InterlockedIncrement64(&this->systemRelativeGapCount);
+      wgc_interlockedMax64(&this->systemRelativeGapMaxUs, deltaUs);
+    }
     forceFullCopy = delta > WGC_FULL_COPY_GAP_100NS;
   }
 
@@ -2828,6 +2831,10 @@ static void wgc_maybeLogDebugStats(WGCInstance * this)
     InterlockedExchange64(&this->handler->callbackGapCount, 0) : 0;
   const LONG64 cbGapTotal = this->handler ?
     InterlockedExchange64(&this->handler->callbackGapTotalUs, 0) : 0;
+  const LONG64 sysRelGapCount =
+    InterlockedExchange64(&this->systemRelativeGapCount, 0);
+  const LONG64 sysRelGapTotal =
+    InterlockedExchange64(&this->systemRelativeGapTotalUs, 0);
   LONG64 profileCount[WGC_PROFILE_COUNT];
   LONG64 profileTotal[WGC_PROFILE_COUNT];
   LONG64 profileMax  [WGC_PROFILE_COUNT];
@@ -2886,7 +2893,7 @@ static void wgc_maybeLogDebugStats(WGCInstance * this)
   histOverflow |= InterlockedExchange(&this->d3d12FenceWaitSampleOverflow, 0);
 
   DEBUG_INFO(
-    "WGC debug stats ready-pre:%ld ready-post:%ld timeouts:%ld bursts:%ld max-batch:%ld cb-gap-avg-us:%lld cb-gap-max-us:%lld cb-gap-count:%lld gap-full:%ld slot-busy:%ld events:%ld pulled:%ld consumed:%ld copy-accum-full:%lld copy-accum-dirty:%lld copy-accum-kpix:%lld copy-publish-full:%lld copy-publish-dirty:%lld copy-publish-kpix:%lld prof-acquire-avg/max:%lld/%lld prof-ensure-avg/max:%lld/%lld prof-damage-avg/max:%lld/%lld prof-accum-copy-avg/max:%lld/%lld prof-pointer-avg/max:%lld/%lld prof-publish-copy-avg/max:%lld/%lld prof-publish-copy-p50/p95/p99:%lld/%lld/%lld prof-flush-avg/max:%lld/%lld d3d12-copy-submit-avg/max:%lld/%lld d3d12-copy-submit-p50/p95/p99:%lld/%lld/%lld d3d12-fence-wait-avg/max:%lld/%lld d3d12-fence-wait-p50/p95/p99:%lld/%lld/%lld hist-overflow:%ld",
+    "WGC debug stats ready-pre:%ld ready-post:%ld timeouts:%ld bursts:%ld max-batch:%ld cb-gap-avg-us:%lld cb-gap-max-us:%lld cb-gap-count:%lld sysrel-gap-avg-us:%lld sysrel-gap-max-us:%lld sysrel-gap-count:%lld gap-full:%ld slot-busy:%ld events:%ld pulled:%ld consumed:%ld copy-accum-full:%lld copy-accum-dirty:%lld copy-accum-kpix:%lld copy-publish-full:%lld copy-publish-dirty:%lld copy-publish-kpix:%lld prof-acquire-avg/max:%lld/%lld prof-ensure-avg/max:%lld/%lld prof-damage-avg/max:%lld/%lld prof-accum-copy-avg/max:%lld/%lld prof-pointer-avg/max:%lld/%lld prof-publish-copy-avg/max:%lld/%lld prof-publish-copy-p50/p95/p99:%lld/%lld/%lld prof-flush-avg/max:%lld/%lld d3d12-copy-submit-avg/max:%lld/%lld d3d12-copy-submit-p50/p95/p99:%lld/%lld/%lld d3d12-fence-wait-avg/max:%lld/%lld d3d12-fence-wait-p50/p95/p99:%lld/%lld/%lld hist-overflow:%ld",
     InterlockedExchange(&this->asyncReadyBeforeWait, 0),
     InterlockedExchange(&this->asyncReadyAfterWait, 0),
     InterlockedExchange(&this->asyncTimeouts, 0),
@@ -2896,6 +2903,9 @@ static void wgc_maybeLogDebugStats(WGCInstance * this)
     (long long)(this->handler ?
       InterlockedExchange64(&this->handler->callbackGapMaxUs, 0) : 0),
     (long long)cbGapCount,
+    (long long)(sysRelGapCount ? sysRelGapTotal / sysRelGapCount : 0),
+    (long long)InterlockedExchange64(&this->systemRelativeGapMaxUs, 0),
+    (long long)sysRelGapCount,
     InterlockedExchange(&this->fullCopyAfterGap, 0),
     InterlockedExchange(&this->asyncSlotBusy, 0),
     this->handler ? InterlockedCompareExchange(&this->handler->events, 0, 0) : 0,

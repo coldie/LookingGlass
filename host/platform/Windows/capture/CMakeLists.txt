@@ -65,7 +65,7 @@ if(USE_WGC)
 endif()
 
 add_feature_info(USE_D12             USE_D12             "DirectX12 capture backend.")
-add_feature_info(USE_WGC             USE_WGC             "Windows Graphics Capture backend (CPU publish).")
+add_feature_info(USE_WGC             USE_WGC             "Windows Graphics Capture backend (GPU publish).")
 add_feature_info(USE_D12_WGC_BACKEND USE_D12_WGC_BACKEND "Legacy D12+WGC backend (Capture_D12WGC).")
 add_feature_info(USE_DXGI            USE_DXGI            "DXGI Desktop Duplication capture backend.")
 add_feature_info(USE_NVFBC           USE_NVFBC           "NVFBC capture backend.")

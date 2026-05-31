@@ -24,18 +24,12 @@ set(EXE_FLAGS "-Wl,--gc-sections")
 set(CMAKE_C_STANDARD 11)
 
 execute_process(
-	COMMAND			git describe --always --abbrev=10 --dirty=+ --tags
-	WORKING_DIRECTORY	"${PROJECT_TOP}"
-	OUTPUT_VARIABLE		BUILD_VERSION
-	ERROR_QUIET
-	OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND         cat ../../VERSION
+    WORKING_DIRECTORY   ${PROJECT_SOURCE_DIR}
+    OUTPUT_VARIABLE     BUILD_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
 )
-
-if ("${BUILD_VERSION}" STREQUAL "")
-	set(BUILD_VERSION "UNKNOWN")
-endif()
-
-add_definitions(-D PROFILE_BUILD_VERSION='"${BUILD_VERSION}"')
+add_definitions(-D BUILD_VERSION='"${BUILD_VERSION}"')
 
 include_directories(
 	${PROJECT_SOURCE_DIR}/include

@@ -125,12 +125,14 @@ struct Inst
   bool showSpice;
   int  spiceWidth, spiceHeight;
 
+#ifdef ENABLE_HDR_DIAGNOSTICS
   bool hdrScreenshotDone;
   GLuint hdrScreenshotFBO;
   GLuint hdrScreenshotTex;
   int hdrScreenshotWidth;
   int hdrScreenshotHeight;
   int hdrScreenshotDelay;
+#endif
 };
 
 static struct Option egl_options[] =
@@ -269,6 +271,7 @@ static struct Option egl_options[] =
     .type           = OPTION_TYPE_STRING,
     .value.x_string = "sdr",
   },
+#ifdef ENABLE_HDR_DIAGNOSTICS
   {
     .module         = "egl",
     .name           = "hdrScreenshot",
@@ -325,6 +328,7 @@ static struct Option egl_options[] =
     .type         = OPTION_TYPE_BOOL,
     .value.x_bool = false,
   },
+#endif
 
   {0}
 };
@@ -379,7 +383,9 @@ static bool egl_create(LG_Renderer ** renderer, const LG_RendererParams params,
   this->importTimings = ringbuffer_new(256, sizeof(float));
   this->importGraph   = app_registerGraph("IMPORT", this->importTimings,
       0.0f, 5.0f, NULL);
+#ifdef ENABLE_HDR_DIAGNOSTICS
   this->hdrScreenshotDelay = option_get_int("egl", "hdrScreenshotDelay");
+#endif
 
   *needsOpenGL = false;
   return true;
@@ -405,10 +411,12 @@ static void egl_deinitialize(LG_Renderer * renderer)
   egl_cursorFree (&this->cursor);
   egl_damageFree (&this->damage);
 
+#ifdef ENABLE_HDR_DIAGNOSTICS
   if (this->hdrScreenshotTex)
     glDeleteTextures(1, &this->hdrScreenshotTex);
   if (this->hdrScreenshotFBO)
     glDeleteFramebuffers(1, &this->hdrScreenshotFBO);
+#endif
 
   LG_LOCK_FREE(this->lock);
   LG_LOCK_FREE(this->desktopDamageLock);
@@ -1169,6 +1177,7 @@ inline static EGLint egl_bufferAge(struct Inst * this)
   return result;
 }
 
+#ifdef ENABLE_HDR_DIAGNOSTICS
 static bool egl_hdrScreenshotEnabled(struct Inst * this)
 {
   if (this->hdrScreenshotDone)
@@ -1389,6 +1398,7 @@ static void egl_hdrScreenshot(struct Inst * this)
   free(data);
   this->hdrScreenshotDone = true;
 }
+#endif
 
 inline static void renderLetterBox(struct Inst * this)
 {
@@ -1437,7 +1447,11 @@ static bool egl_render(LG_Renderer * renderer, LG_RendererRotate rotate,
   EGLint bufferAge   = egl_bufferAge(this);
   bool renderAll     = invalidateWindow || this->hadOverlay ||
                        bufferAge <= 0 || bufferAge > MAX_BUFFER_AGE ||
-                       this->showSpice || egl_hdrScreenshotEnabled(this);
+                       this->showSpice
+#ifdef ENABLE_HDR_DIAGNOSTICS
+                       || egl_hdrScreenshotEnabled(this)
+#endif
+                       ;
 
   bool hasOverlay = false;
   struct CursorState cursorState = { .visible = false };
@@ -1530,7 +1544,9 @@ static bool egl_render(LG_Renderer * renderer, LG_RendererRotate rotate,
   }
 
   renderLetterBox(this);
+#ifdef ENABLE_HDR_DIAGNOSTICS
   egl_hdrScreenshot(this);
+#endif
 
   hasOverlay |=
     egl_damageRender(this->damage, rotate, newFrame ? desktopDamage : NULL) |
@@ -1553,6 +1569,10 @@ static bool egl_render(LG_Renderer * renderer, LG_RendererRotate rotate,
   if (likely(damageIdx >= 0 && cursorState.visible))
     damage[damageIdx++] = cursorState.rect;
 
+  if (likely(damageIdx >= 0 && !hasOverlay && !this->hadOverlay &&
+      this->cursorLast.visible))
+    damage[damageIdx++] = this->cursorLast.rect;
+
   int overlayHistoryIdx = this->overlayHistoryIdx % DESKTOP_DAMAGE_COUNT;
   if (unlikely(hasOverlay))
     this->overlayHistoryCount[overlayHistoryIdx] = -1;
@@ -1566,9 +1586,6 @@ static bool egl_render(LG_Renderer * renderer, LG_RendererRotate rotate,
 
   if (unlikely(!hasOverlay && !this->hadOverlay))
   {
-    if (this->cursorLast.visible)
-      damage[damageIdx++] = this->cursorLast.rect;
-
     if (desktopDamage->count == -1)
       // -1 damage count means invalidating entire window.
       damageIdx = 0;

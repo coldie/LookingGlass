@@ -250,16 +250,16 @@ static void wgc_capture_initOptions(void)
     {
       .module         = "wgc",
       .name           = "maxFPS",
-      .description    = "Maximum WGC capture rate via MinUpdateInterval (0 = OS default)",
+      .description    = "Maximum WGC capture rate via MinUpdateInterval (0 = OS default, commonly 60Hz)",
       .type           = OPTION_TYPE_INT,
-      .value.x_int    = 250
+      .value.x_int    = 240 // 240Hz covers high-refresh displays; 0 uses OS default (~60Hz)
     },
     {
       .module         = "wgc",
       .name           = "cursorMaxHz",
       .description    = "Maximum separate-cursor position update rate (0 = unlimited)",
       .type           = OPTION_TYPE_INT,
-      .value.x_int    = 120
+      .value.x_int    = 120 // 120Hz cursor position polling
     },
     {
       .module         = "wgc",
@@ -284,10 +284,24 @@ static void wgc_capture_initOptions(void)
     },
     {
       .module         = "wgc",
+      .name           = "pollFramePool",
+      .description    = "Poll the WGC frame pool on short timeouts instead of relying only on FrameArrived",
+      .type           = OPTION_TYPE_BOOL,
+      .value.x_bool   = false
+    },
+    {
+      .module         = "wgc",
+      .name           = "pollFramePoolMs",
+      .description    = "Frame pool polling wait in milliseconds when wgc:pollFramePool is enabled",
+      .type           = OPTION_TYPE_INT,
+      .value.x_int    = 1
+    },
+    {
+      .module         = "wgc",
       .name           = "includeSecondaryWindows",
       .description    = "Capture secondary windows for the selected WGC item when supported by the OS",
       .type           = OPTION_TYPE_BOOL,
-      .value.x_bool   = false
+      .value.x_bool   = true
     },
     {
       .module         = "wgc",
@@ -308,7 +322,8 @@ static void wgc_capture_initOptions(void)
       .name           = "dirtyFullCopyPercent",
       .description    = "Use a full IVSHMEM write when merged dirty area reaches this frame percentage (0 = never)",
       .type           = OPTION_TYPE_INT,
-      .value.x_int    = 65
+      .value.x_int    = 65 // 65% is a sweet spot: benefits of dirty copies before the overhead
+                            // of many small rects approaches that of a full copy
     },
     {
       .module         = "wgc",
@@ -322,7 +337,7 @@ static void wgc_capture_initOptions(void)
       .name           = "d3d12FullCopyAlways",
       .description    = "Always use full-frame D3D12 bridge-to-IVSHMEM copies while preserving client damage rects",
       .type           = OPTION_TYPE_BOOL,
-      .value.x_bool   = false
+      .value.x_bool   = true
     },
     {
       .module         = "wgc",
@@ -343,7 +358,7 @@ static void wgc_capture_initOptions(void)
       .name           = "dirtyMaxTiles",
       .description    = "Maximum tile spans before falling back to full D3D12 copy",
       .type           = OPTION_TYPE_INT,
-      .value.x_int    = 128
+      .value.x_int    = 128 // 128 tiles ~= 2 MiB of copy commands; beyond this a full copy is cheaper
     },
     {0}
   };
@@ -689,7 +704,10 @@ static bool wgc_capture_create(
   const char * enc = option_get_string("wgc", "encoding");
   const char * pf  = option_get_string("wgc", "publishFormat");
   if ((!enc || strcmp(enc, "auto") == 0) && pf && strcmp(pf, "auto") != 0)
+  {
+    DEBUG_INFO("wgc:publishFormat is deprecated; use wgc:encoding instead");
     enc = pf;
+  }
 
   this->requestedEncoding = wgc_capture_parseEncoding(enc,
     WGC_CAPTURE_PUBLISH_FORMAT_AUTO, "encoding");

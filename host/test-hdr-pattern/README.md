@@ -1,5 +1,7 @@
 # HDR Pattern Generator
 
+> **Developer tool** — This is a standalone D3D11 test pattern generator for WGC HDR capture validation. It is not needed for normal use of Looking Glass.
+
 Standalone Windows D3D11 scRGB test pattern for validating WGC HDR capture
 paths. It renders into an `R16G16B16A16_FLOAT` swapchain so Windows HDR/WGC
 should see linear values above SDR white.
@@ -15,6 +17,13 @@ Run on the Windows guest:
 
 ```powershell
 .\test-hdr-pattern.exe --fullscreen
+```
+
+For dirty-region capture tests, use static mode so the pattern presents once and
+then sleeps until the window is resized or repainted:
+
+```powershell
+.\test-hdr-pattern.exe --fullscreen --static
 ```
 
 Controls:

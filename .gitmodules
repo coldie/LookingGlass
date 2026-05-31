@@ -13,3 +13,6 @@
 [submodule "repos/nanosvg"]
 	path = repos/nanosvg
 	url = https://github.com/memononen/nanosvg.git
+[submodule "repos/tracy"]
+	path = repos/tracy
+	url = https://github.com/wolfpld/tracy.git

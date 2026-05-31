@@ -4,7 +4,6 @@ project(test-d3d11on12-ivshmem LANGUAGES C)
 include(CheckIncludeFile)
 
 # Standalone validation tool for the IVSHMEM-direct buffer design.
-# See /home/jeffy/.claude/plans/ivshmem-direct-buffers.md (Phase 1).
 #
 # Validates that:
 #   1. ID3D12Device3::OpenExistingHeapFromAddress works on IVSHMEM

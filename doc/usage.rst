@@ -416,6 +416,12 @@ All command line options
   +-------------------+-------+-------+---------------------------------------------------------------------------+
   | egl:hdrMetadataFALL|       | 500   | Maximum frame-average luminance in nits for HDR presentation metadata     |
   +-------------------+-------+-------+---------------------------------------------------------------------------+
+  | egl:hdrMapping    |       | simple| HDR to SDR mapping mode: simple, reinhard, aces, clip, or off             |
+  +-------------------+-------+-------+---------------------------------------------------------------------------+
+  | egl:hdrView       |       | normal| HDR diagnostic view: normal or false-color                                |
+  +-------------------+-------+-------+---------------------------------------------------------------------------+
+  | egl:hdrOutput     |       | sdr   | HDR presentation mode: sdr, pq (BT.2020/PQ), or scrgb (scRGB linear)      |
+  +-------------------+-------+-------+---------------------------------------------------------------------------+
   | egl:preset        |       | NULL  | The initial filter preset to load                                         |
   +-------------------+-------+-------+---------------------------------------------------------------------------+
 
@@ -649,6 +655,56 @@ NvFBC Configuration Options
 This capture interface also looks for and reads the value of the system
 environment variable ``NVFBC_PRIV_DATA`` if it has been set, documentation on
 its usage however is unavailable (Google is your friend).
+
+.. _host_capture_wgc:
+
+Windows Graphics Capture (WGC)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The WGC capture interface (``D12`` backend with ``wgc:`` options) provides GPU-direct capture
+on Windows 10 1903+ and Windows 11. It is the primary capture path for D12.
+
+WGC Configuration Options
+"""""""""""""""""""""""""
+
+* ``adapter`` - The name of the specific adapter to capture
+
+* ``output`` - The name of the specific output to capture
+
+* ``maxFPS`` (default ``240``) - Maximum capture rate via ``MinUpdateInterval``.
+  Set to ``0`` for the OS default (commonly 60 Hz).
+
+* ``cursorMaxHz`` (default ``120``) - Maximum separate-cursor position update rate.
+  Set to ``0`` for unlimited.
+
+* ``publishMode`` (default ``auto``) - Publish path: ``auto``, ``ivshmem-direct``,
+  ``ivshmem-d3d12-copy``, or ``cpu-staging``. ``auto`` selects the best GPU-direct
+  path available and falls back to cpu-staging.
+
+* ``encoding`` (default ``auto``) - WGC publish encoding:
+  ``auto`` (uses ``sdrEncoding``/``hdrEncoding``), ``bgra8``, ``rgba16f``, ``nv12``,
+  ``p010``, or ``rgba10pq``.
+
+* ``sdrEncoding`` (default ``nv12``) - Encoding used by ``encoding=auto`` for
+  SDR sources: ``bgra8``, ``rgba16f``, ``nv12``, or ``p010``.
+
+* ``hdrEncoding`` (default ``p010``) - Encoding used by ``encoding=auto`` for
+  HDR sources: ``bgra8``, ``rgba16f``, ``nv12``, or ``p010``.
+
+* ``hdrMode`` (default ``preserve-pq``) - HDR source handling: ``auto``,
+  ``off``, ``tonemap``, ``preserve``, or ``preserve-pq``.
+
+* ``trackDamage`` (default ``yes``) - Perform damage-aware copies to save bandwidth.
+
+* ``debug`` - Enable debug logging for the WGC capture path.
+
+* ``debugStats`` - Log lightweight WGC burst/stall/dirty-copy diagnostics.
+
+* ``asyncCapture`` (default ``no``) - Copy WGC frames in the ``FrameArrived``
+  callback.
+
+* ``includeSecondaryWindows`` (default ``yes``) - Capture secondary windows on
+  supported OS versions.
 
 .. _host_select_ivshmem:
 

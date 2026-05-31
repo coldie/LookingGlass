@@ -45,6 +45,7 @@
 #include "postprocess.h"
 #include "filters.h"
 
+#ifdef ENABLE_HDR_DIAGNOSTICS
 static float egl_desktopHalfToFloat(uint16_t h)
 {
   const uint32_t s = (uint32_t)(h & 0x8000) << 16;
@@ -77,6 +78,7 @@ static float egl_desktopHalfToFloat(uint16_t h)
   memcpy(&out, &f, sizeof(out));
   return out;
 }
+#endif
 
 struct DesktopShader
 {
@@ -155,6 +157,7 @@ struct EGL_Desktop
   int   maxCLL;
   int   hdrMappingMode;
   int   hdrViewMode;
+#ifdef ENABLE_HDR_DIAGNOSTICS
   bool  debugP010;
   bool  debugRGBA10;
   bool  p010ScreenshotDone;
@@ -165,6 +168,7 @@ struct EGL_Desktop
   GLuint desktopScreenshotTex;
   int   desktopScreenshotWidth;
   int   desktopScreenshotHeight;
+#endif
 
   EGL_PostProcess * pp;
   _Atomic(bool) processFrame;
@@ -312,6 +316,7 @@ bool egl_desktopInit(EGL * egl, EGL_Desktop ** desktop_, EGLDisplay * display,
     egl_parseHDRMappingMode(option_get_string("egl", "hdrMapping"));
   desktop->hdrViewMode =
     egl_parseHDRViewMode(option_get_string("egl", "hdrView"));
+#ifdef ENABLE_HDR_DIAGNOSTICS
   desktop->debugP010    = option_get_bool("egl", "debugP010");
   desktop->debugRGBA10  = option_get_bool("egl", "debugRGBA10");
   desktop->p010ScreenshotDelay = option_get_int("egl", "p010ScreenshotDelay");
@@ -319,6 +324,7 @@ bool egl_desktopInit(EGL * egl, EGL_Desktop ** desktop_, EGLDisplay * display,
   desktop->desktopScreenshotDelay =
     option_get_int("egl", "desktopScreenshotDelay");
   desktop->desktopScreenshotDone = false;
+#endif
 
   if (!egl_postProcessInit(&desktop->pp))
   {
@@ -368,10 +374,12 @@ void egl_desktopFree(EGL_Desktop ** desktop)
   egl_shaderFree     (&(*desktop)->dmaShader.shader);
   egl_desktopRectsFree(&(*desktop)->mesh           );
   countedBufferRelease(&(*desktop)->matrix         );
+#ifdef ENABLE_HDR_DIAGNOSTICS
   if ((*desktop)->desktopScreenshotTex)
     glDeleteTextures(1, &(*desktop)->desktopScreenshotTex);
   if ((*desktop)->desktopScreenshotFBO)
     glDeleteFramebuffers(1, &(*desktop)->desktopScreenshotFBO);
+#endif
 
   egl_postProcessFree(&(*desktop)->pp);
 
@@ -398,6 +406,7 @@ static const char * hdrViewNames[EGL_HDR_VIEW_MAX] = {
   [EGL_HDR_VIEW_FALSE_COLOR] = "False color"
 };
 
+#ifdef ENABLE_HDR_DIAGNOSTICS
 static uint16_t egl_p010ReadSample(const FrameBuffer * frame, size_t offset)
 {
   uint16_t value = 0;
@@ -585,7 +594,9 @@ static void egl_desktopLogRGBA10Samples(
 
   DEBUG_INFO("%s", msg);
 }
+#endif
 
+#ifdef ENABLE_HDR_DIAGNOSTICS
 static void egl_desktopWriteP010Screenshot(
   EGL_Desktop * desktop, const FrameBuffer * frame)
 {
@@ -667,7 +678,9 @@ static void egl_desktopWriteP010Screenshot(
 
   desktop->p010ScreenshotDone = true;
 }
+#endif
 
+#ifdef ENABLE_HDR_DIAGNOSTICS
 static void egl_desktopWriteRenderedScreenshot(
   EGL_Desktop * desktop, const struct DesktopShader * shader,
   EGL_Texture * texture, unsigned int desktopWidth, unsigned int desktopHeight,
@@ -809,6 +822,7 @@ static void egl_desktopWriteRenderedScreenshot(
   free(half);
   desktop->desktopScreenshotDone = true;
 }
+#endif
 
 void egl_desktopConfigUI(EGL_Desktop * desktop)
 {
@@ -1005,8 +1019,10 @@ bool egl_desktopUpdate(EGL_Desktop * desktop, const FrameBuffer * frame, int dma
     desktop->format.type == FRAME_TYPE_YUY2 ||
     desktop->format.type == FRAME_TYPE_UYVY;
 
+#ifdef ENABLE_HDR_DIAGNOSTICS
   if (desktop->debugRGBA10 && desktop->format.type == FRAME_TYPE_RGBA10)
     egl_desktopLogRGBA10Samples(desktop, frame);
+#endif
 
   if (likely(desktop->useDMA && dmaFd >= 0 && !yuvFrame))
   {
@@ -1050,9 +1066,11 @@ bool egl_desktopUpdate(EGL_Desktop * desktop, const FrameBuffer * frame, int dma
   {
     damageRects = NULL;
     damageRectsCount = 0;
+#ifdef ENABLE_HDR_DIAGNOSTICS
     if (desktop->debugP010 && desktop->format.type == FRAME_TYPE_P010)
       egl_desktopLogP010Samples(desktop, frame);
     egl_desktopWriteP010Screenshot(desktop, frame);
+#endif
   }
 
   if (likely(egl_textureUpdateFromFrame(desktop->texture, frame,
@@ -1252,8 +1270,10 @@ bool egl_desktopRender(EGL_Desktop * desktop, unsigned int outputWidth,
   };
 
   egl_shaderSetUniforms(shader->shader, uniforms, ARRAY_LENGTH(uniforms));
+#ifdef ENABLE_HDR_DIAGNOSTICS
   egl_desktopWriteRenderedScreenshot(desktop, shader, texture, width, height,
       width, height);
+#endif
 
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   egl_resetViewport(desktop->egl);

@@ -155,6 +155,7 @@ void main()
     }
 
     case EGL_SCALE_LINEAR:
+    default:
     {
       color = texture(sampler1, uv);
       break;

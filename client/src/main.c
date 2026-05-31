@@ -117,6 +117,7 @@ static bool fpsTimerFn(void * unused)
       memory_order_acquire);
 
   uint64_t frameCount = 0;
+  float elapsedMs = 0.0f;
   float fps, ups;
   if (renderCount > 0)
   {
@@ -125,11 +126,11 @@ static bool fpsTimerFn(void * unused)
 
     const uint64_t time      = nanotime();
     const uint64_t elapsedNs = time - last;
-    const float    elapsedMs = (float)elapsedNs / 1e6f;
+    elapsedMs = (float)elapsedNs / 1e6f;
 
     last = time;
     fps  = 1e3f / (elapsedMs / (float)renderCount);
-    ups  = 1e3f / (elapsedMs / (float)frameCount);
+    ups  = frameCount > 0 ? 1e3f / (elapsedMs / (float)frameCount) : 0.0f;
   }
   else
   {
@@ -142,9 +143,11 @@ static bool fpsTimerFn(void * unused)
   atomic_store_explicit(&g_state.ups, ups, memory_order_relaxed);
 
   if (g_params.logFPS)
-    DEBUG_INFO("Client timings fps:%.2f ups:%.2f renders:%llu frames:%llu",
-        fps, ups, (unsigned long long)renderCount,
-        (unsigned long long)frameCount);
+    DEBUG_INFO(
+      "Client timings interval:%.2fms renderFPS:%.2f frameFPS:%.2f "
+      "renders:%llu frames:%llu",
+      elapsedMs, fps, ups, (unsigned long long)renderCount,
+      (unsigned long long)frameCount);
 
   return true;
 }
@@ -707,7 +710,7 @@ int main_frameThread(void * unused)
         case FRAME_ROT_270: lgrFormat.rotate = LG_ROTATE_270; break;
 
         default:
-          DEBUG_ERROR("Unsupported/invalid frame rotation");
+          DEBUG_ERROR("Unsupported/invalid frame rotation: %u", frame->rotation);
           lgrFormat.rotate = LG_ROTATE_0;
           break;
       }
@@ -747,7 +750,12 @@ int main_frameThread(void * unused)
           break;
 
         default:
-          DEBUG_ERROR("Unsupported frameType");
+          DEBUG_ERROR(
+            "Unsupported frameType: type:%u data:%ux%u frame:%ux%u "
+            "screen:%ux%u stride:%u pitch:%u flags:0x%x",
+            frame->type, frame->dataWidth, frame->dataHeight,
+            frame->frameWidth, frame->frameHeight, frame->screenWidth,
+            frame->screenHeight, frame->stride, frame->pitch, frame->flags);
           error = true;
           break;
       }

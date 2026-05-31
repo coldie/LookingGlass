@@ -170,5 +170,10 @@ bool waylandRegistryInit(void)
 
 void waylandRegistryFree(void)
 {
+  if (wlWm.colorManager)
+  {
+    wp_color_manager_v1_destroy(wlWm.colorManager);
+    wlWm.colorManager = NULL;
+  }
   wl_registry_destroy(wlWm.registry);
 }
