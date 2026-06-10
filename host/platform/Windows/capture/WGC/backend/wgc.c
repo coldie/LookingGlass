@@ -1974,6 +1974,19 @@ static bool wgc_shouldReinitAfterStarvation(WGCInstance * this, uint64_t now)
     if (dwmFrames == this->emptyPollStartDwmFrames)
       return false;
 
+    // with a separate cursor the pointer is composited by DWM without
+    // producing capturable content, so recent pointer activity means the
+    // composition may be cursor-driven, not starvation
+    if (this->cursorLastPostUs &&
+        now - this->cursorLastPostUs < WGC_STALL_DWM_IDLE_US)
+    {
+      this->emptyPollStartDwmFrames  = dwmFrames;
+      this->emptyPollLastDwmFrames   = dwmFrames;
+      this->emptyPollLastDwmChangeUs = now;
+      this->emptyPollDwmAdvanceUs    = 0;
+      return false;
+    }
+
     if (dwmFrames != this->emptyPollLastDwmFrames)
     {
       this->emptyPollLastDwmFrames = dwmFrames;
