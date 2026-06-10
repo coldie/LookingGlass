@@ -68,6 +68,7 @@ struct Inst
   LG_Renderer base;
 
   bool dmaSupport;
+  bool hasTextureNorm16;
   LG_RendererParams params;
   struct Options    opt;
 
@@ -253,9 +254,9 @@ static struct Option egl_options[] =
   {
     .module         = "egl",
     .name           = "hdrMapping",
-    .description    = "HDR to SDR mapping mode: simple|reinhard|aces|clip|off",
+    .description    = "HDR to SDR mapping mode: auto|simple|reinhard|aces|clip|off",
     .type           = OPTION_TYPE_STRING,
-    .value.x_string = "simple",
+    .value.x_string = "auto",
   },
   {
     .module         = "egl",
@@ -692,6 +693,13 @@ static bool egl_onMouseEvent(LG_Renderer * renderer, const bool visible,
 static bool egl_onFrameFormat(LG_Renderer * renderer, const LG_RendererFormat format)
 {
   struct Inst * this = UPCAST(struct Inst, renderer);
+
+  if (format.type == FRAME_TYPE_P010 && !this->hasTextureNorm16)
+  {
+    DEBUG_ERROR("GL_EXT_texture_norm16 is needed for P010 frames");
+    return false;
+  }
+
   memcpy(&this->format, &format, sizeof(LG_RendererFormat));
   this->formatValid = true;
 
@@ -1075,6 +1083,11 @@ static bool egl_renderStartup(LG_Renderer * renderer, bool useDMA)
     DEBUG_ERROR("GL_EXT_texture_format_BGRA8888 is needed to use EGL backend");
     return false;
   }
+
+  this->hasTextureNorm16 = util_hasGLExt(gl_exts, "GL_EXT_texture_norm16");
+  if (!this->hasTextureNorm16)
+    DEBUG_WARN("GL_EXT_texture_norm16 is not supported, P010 frames will be "
+        "unavailable");
 
   this->hasBufferAge = util_hasGLExt(client_exts, "EGL_EXT_buffer_age");
   if (!this->hasBufferAge)

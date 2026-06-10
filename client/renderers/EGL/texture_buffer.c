@@ -218,28 +218,69 @@ static bool egl_texBufferStreamUpdate(EGL_Texture * texture,
   return true;
 }
 
+EGL_TexStatus egl_texBufferPollSync(TextureBuffer * this)
+{
+  if (!this->sync)
+    return EGL_TEX_STATUS_OK;
+
+  switch(glClientWaitSync(
+        this->sync, GL_SYNC_FLUSH_COMMANDS_BIT, 0)) //non-blocking
+  {
+    case GL_ALREADY_SIGNALED:
+    case GL_CONDITION_SATISFIED:
+      glDeleteSync(this->sync);
+      this->sync = 0;
+      return EGL_TEX_STATUS_OK;
+
+    case GL_TIMEOUT_EXPIRED:
+      return EGL_TEX_STATUS_NOTREADY;
+
+    case GL_WAIT_FAILED:
+    case GL_INVALID_VALUE:
+    default:
+      glDeleteSync(this->sync);
+      this->sync = 0;
+      DEBUG_GL_ERROR("glClientWaitSync failed");
+      return EGL_TEX_STATUS_ERROR;
+  }
+}
+
 EGL_TexStatus egl_texBufferStreamProcess(EGL_Texture * texture)
 {
   TextureBuffer * this = UPCAST(TextureBuffer, texture);
 
+  switch(egl_texBufferPollSync(this))
+  {
+    case EGL_TEX_STATUS_NOTREADY:
+      // the prior upload is still in flight so the next PBO may still be
+      // read by the GPU; leave the frame queued and retry next call
+      return EGL_TEX_STATUS_OK;
+
+    case EGL_TEX_STATUS_ERROR:
+      return EGL_TEX_STATUS_ERROR;
+
+    default:
+      break;
+  }
+
   LG_LOCK(this->copyLock);
 
-  GLuint          tex    = this->tex[this->bufIndex];
-  EGL_TexBuffer * buffer = &this->buf[this->bufIndex];
+  GLuint          tex     = this->tex[this->bufIndex];
+  EGL_TexBuffer * buffer  = &this->buf[this->bufIndex];
+  const bool      updated = buffer->updated;
 
-  if (buffer->updated && this->sync == 0)
+  if (updated)
   {
-    this->rIndex = this->bufIndex;
+    buffer->updated = false;
+    this->rIndex    = this->bufIndex;
     if (++this->bufIndex == this->texCount)
       this->bufIndex = 0;
   }
 
   LG_UNLOCK(this->copyLock);
 
-  if (buffer->updated)
+  if (updated)
   {
-    buffer->updated = false;
-
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buffer->pbo);
     glBindTexture(GL_TEXTURE_2D, tex);
 
@@ -268,38 +309,9 @@ EGL_TexStatus egl_texBufferStreamGet(EGL_Texture * texture, GLuint * tex,
   if (this->rIndex == -1)
     return EGL_TEX_STATUS_NOTREADY;
 
-  if (this->sync)
-  {
-    switch(glClientWaitSync(
-          this->sync, GL_SYNC_FLUSH_COMMANDS_BIT, 0)) //non-blocking
-    {
-      case GL_ALREADY_SIGNALED:
-      case GL_CONDITION_SATISFIED:
-        glDeleteSync(this->sync);
-        this->sync = 0;
-        break;
-
-      case GL_TIMEOUT_EXPIRED:
-        // Upload still in flight; leave the sync for the next call to poll.
-        // Fall back to the previously-completed texture in the ping-pong
-        // so the render thread never stalls. Only safe when we have more
-        // than one texture and at least one frame has been completed.
-        if (this->texCount > 1 && this->rIndex != -1)
-        {
-          *tex = this->tex[(this->rIndex + 1) % 2];
-          return EGL_TEX_STATUS_OK;
-        }
-        return EGL_TEX_STATUS_NOTREADY;
-
-      case GL_WAIT_FAILED:
-      case GL_INVALID_VALUE:
-        glDeleteSync(this->sync);
-        this->sync = 0;
-        DEBUG_GL_ERROR("glClientWaitSync failed");
-        return EGL_TEX_STATUS_ERROR;
-    }
-  }
-
+  // GL command ordering within our context guarantees the upload completes
+  // before any draw that samples the texture; the sync only gates CPU reuse
+  // of the PBO in egl_texBufferStreamProcess
   *tex = this->tex[this->rIndex];
   return EGL_TEX_STATUS_OK;
 }

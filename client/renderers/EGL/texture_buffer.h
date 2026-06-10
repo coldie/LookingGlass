@@ -51,6 +51,8 @@ EGL_TexStatus egl_texBufferGet(EGL_Texture * texture_, GLuint * tex,
     EGL_PixelFormat * fmt);
 EGL_TexStatus egl_texBufferBind(EGL_Texture * texture_);
 
+EGL_TexStatus egl_texBufferPollSync(TextureBuffer * this);
+
 bool egl_texBufferStreamInit(EGL_Texture ** texture_, EGL_TexType type,
     EGLDisplay * display);
 bool egl_texBufferStreamSetup(EGL_Texture * texture_,

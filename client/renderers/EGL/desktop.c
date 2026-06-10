@@ -154,6 +154,7 @@ struct EGL_Desktop
   // map HDR content to SDR
   bool  mapHDRtoSDR;
   int   peakLuminance;
+  int   hdrMetadataPeak;
   int   maxCLL;
   int   hdrMappingMode;
   int   hdrViewMode;
@@ -215,9 +216,13 @@ static bool egl_initDesktopShader(
   return true;
 }
 
-static int egl_parseHDRMappingMode(const char * value)
+static int egl_parseHDRMappingMode(const char * value, bool hdrOutputPQ)
 {
-  if (!value || !strcmp(value, "simple") || !strcmp(value, "compress"))
+  // tone mapping by default would crush a PQ passthrough stream, so "auto"
+  // only enables it when the output is not PQ
+  if (!value || !strcmp(value, "auto"))
+    return hdrOutputPQ ? EGL_HDR_MAPPING_OFF : EGL_HDR_MAPPING_SIMPLE;
+  if (!strcmp(value, "simple") || !strcmp(value, "compress"))
     return EGL_HDR_MAPPING_SIMPLE;
   if (!strcmp(value, "reinhard"))
     return EGL_HDR_MAPPING_REINHARD;
@@ -311,9 +316,11 @@ bool egl_desktopInit(EGL * egl, EGL_Desktop ** desktop_, EGLDisplay * display,
   desktop->hdrOutputPQ   =
     strcmp(option_get_string("egl", "hdrOutput"), "pq") == 0;
   desktop->peakLuminance = option_get_int ("egl", "peakLuminance");
+  desktop->hdrMetadataPeak = option_get_int("egl", "hdrMetadataPeak");
   desktop->maxCLL        = option_get_int ("egl", "maxCLL"       );
   desktop->hdrMappingMode =
-    egl_parseHDRMappingMode(option_get_string("egl", "hdrMapping"));
+    egl_parseHDRMappingMode(option_get_string("egl", "hdrMapping"),
+      desktop->hdrOutputPQ);
   desktop->hdrViewMode =
     egl_parseHDRViewMode(option_get_string("egl", "hdrView"));
 #ifdef ENABLE_HDR_DIAGNOSTICS
@@ -1190,7 +1197,13 @@ bool egl_desktopRender(EGL_Desktop * desktop, unsigned int outputWidth,
     dma && texture == desktop->texture ?
       &desktop->dmaShader : &desktop->shader;
 
-  const float mapHDRGain = desktop->peakLuminance;
+  // in PQ output mode the tone map target is the display peak, not the SDR
+  // peak luminance; it must match the max_cll advertised to the compositor
+  // (10000 nits when hdrMetadataPeak is unset) or the content will be tone
+  // mapped twice
+  const float mapHDRGain = desktop->hdrOutputPQ ?
+    (desktop->hdrMetadataPeak > 0 ? desktop->hdrMetadataPeak : 10000) :
+    desktop->peakLuminance;
   const bool mapHDRtoSDR =
     desktop->mapHDRtoSDR && desktop->hdrMappingMode != EGL_HDR_MAPPING_OFF;
 

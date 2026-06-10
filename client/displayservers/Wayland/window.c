@@ -359,6 +359,9 @@ static struct wp_image_description_v1 * waylandCreatePQDescription(void)
   wp_image_description_creator_params_v1_set_primaries_named(params,
       WP_COLOR_MANAGER_V1_PRIMARIES_BT2020);
 
+  // hdrMetadataPeak is also the EGL renderer's PQ tone map target; the
+  // max_cll advertised here must match it or the compositor will tone map
+  // the content a second time
   const int metadataPeak = option_get_int("egl", "hdrMetadataPeak");
   const int metadataFALL = option_get_int("egl", "hdrMetadataFALL");
   const uint32_t metadataMax =

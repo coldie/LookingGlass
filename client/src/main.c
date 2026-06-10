@@ -578,6 +578,7 @@ int main_frameThread(void * unused)
   uint32_t          formatVer   = 0;
   size_t            dataSize    = 0;
   LG_RendererFormat lgrFormat;
+  LG_RendererFormat lastFormat  = {0};
 
   struct DMAFrameInfo dmaInfo[LGMP_Q_FRAME_LEN] = {0};
   if (g_state.useDMA)
@@ -672,6 +673,8 @@ int main_frameThread(void * unused)
       }
 
       // setup the renderer format with the frame format details
+      // the struct contains padding, zero it so it can be compared via memcmp
+      memset(&lgrFormat, 0, sizeof(lgrFormat));
       lgrFormat.type         = frame->type;
       lgrFormat.screenWidth  = frame->screenWidth;
       lgrFormat.screenHeight = frame->screenHeight;
@@ -767,35 +770,45 @@ int main_frameThread(void * unused)
         break;
       }
 
+      /* if the format version changed but the format itself did not there is
+       * no need to reconfigure the renderer, except when using DMA as the
+       * buffers were just closed above */
+      const bool sameFormat = g_state.formatValid && !g_state.useDMA &&
+        memcmp(&lgrFormat, &lastFormat, sizeof(lgrFormat)) == 0;
+
       g_state.formatValid = true;
       formatVer = frame->formatVer;
+      memcpy(&lastFormat, &lgrFormat, sizeof(lgrFormat));
 
-      DEBUG_INFO("Format: %s %ux%u (%ux%u) stride:%u pitch:%u rotation:%d hdr:%d pq:%d",
-          FrameTypeStr[frame->type],
-          frame->frameWidth, frame->frameHeight,
-          frame->dataWidth , frame->dataHeight ,
-          frame->stride, frame->pitch,
-          frame->rotation,
-          frame->flags & FRAME_FLAG_HDR    ? 1 : 0,
-          frame->flags & FRAME_FLAG_HDR_PQ ? 1 : 0);
-
-      LG_LOCK(g_state.lgrLock);
-      if (!RENDERER(onFrameFormat, lgrFormat))
+      if (!sameFormat)
       {
-        DEBUG_ERROR("renderer failed to configure format");
-        g_state.state = APP_STATE_SHUTDOWN;
+        DEBUG_INFO("Format: %s %ux%u (%ux%u) stride:%u pitch:%u rotation:%d hdr:%d pq:%d",
+            FrameTypeStr[frame->type],
+            frame->frameWidth, frame->frameHeight,
+            frame->dataWidth , frame->dataHeight ,
+            frame->stride, frame->pitch,
+            frame->rotation,
+            frame->flags & FRAME_FLAG_HDR    ? 1 : 0,
+            frame->flags & FRAME_FLAG_HDR_PQ ? 1 : 0);
+
+        LG_LOCK(g_state.lgrLock);
+        if (!RENDERER(onFrameFormat, lgrFormat))
+        {
+          DEBUG_ERROR("renderer failed to configure format");
+          g_state.state = APP_STATE_SHUTDOWN;
+          LG_UNLOCK(g_state.lgrLock);
+          break;
+        }
         LG_UNLOCK(g_state.lgrLock);
-        break;
+
+        g_state.srcSize.x = lgrFormat.screenWidth;
+        g_state.srcSize.y = lgrFormat.screenHeight;
+        g_state.haveSrcSize = true;
+        if (g_params.autoResize)
+          g_state.ds->setWindowSize(lgrFormat.frameWidth, lgrFormat.frameHeight);
+
+        core_updatePositionInfo();
       }
-      LG_UNLOCK(g_state.lgrLock);
-
-      g_state.srcSize.x = lgrFormat.screenWidth;
-      g_state.srcSize.y = lgrFormat.screenHeight;
-      g_state.haveSrcSize = true;
-      if (g_params.autoResize)
-        g_state.ds->setWindowSize(lgrFormat.frameWidth, lgrFormat.frameHeight);
-
-      core_updatePositionInfo();
     }
 
     if (g_state.useDMA)

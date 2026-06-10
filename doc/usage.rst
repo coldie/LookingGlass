@@ -416,7 +416,7 @@ All command line options
   +-------------------+-------+-------+---------------------------------------------------------------------------+
   | egl:hdrMetadataFALL|       | 500   | Maximum frame-average luminance in nits for HDR presentation metadata     |
   +-------------------+-------+-------+---------------------------------------------------------------------------+
-  | egl:hdrMapping    |       | simple| HDR to SDR mapping mode: simple, reinhard, aces, clip, or off             |
+  | egl:hdrMapping    |       | auto  | HDR to SDR mapping mode: auto, simple, reinhard, aces, clip, or off       |
   +-------------------+-------+-------+---------------------------------------------------------------------------+
   | egl:hdrView       |       | normal| HDR diagnostic view: normal or false-color                                |
   +-------------------+-------+-------+---------------------------------------------------------------------------+

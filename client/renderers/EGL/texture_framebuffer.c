@@ -278,6 +278,9 @@ static EGL_TexStatus egl_texFBProcess(EGL_Texture * texture)
   TextureBuffer * parent = UPCAST(TextureBuffer, texture);
   TexFB         * this   = UPCAST(TexFB        , parent );
 
+  if (egl_texBufferPollSync(parent) == EGL_TEX_STATUS_ERROR)
+    return EGL_TEX_STATUS_ERROR;
+
   LG_LOCK(parent->copyLock);
 
   /* If a prior upload is still in flight, do not issue a new one. Doing so

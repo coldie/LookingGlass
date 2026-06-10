@@ -273,7 +273,7 @@ vec3 mapToSDR(vec3 color, float gain, bool pq, int mode)
 {
   if (pq)
   {
-    color = pq2lin(color.rgb, gain);
+    color = bt2020to709(pq2lin(color.rgb, gain));
   }
 
   // WGC HDR is scRGB-like linear light. Treat 1.0 as SDR reference white and
