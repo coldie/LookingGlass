@@ -137,6 +137,8 @@ static const struct wp_image_description_v1_listener imageDescriptionListener = 
   .ready  = imageDescriptionReady,
 };
 
+static void waylandRebuildPQDescription(void);
+
 static void imageInfoDone(void * data,
     struct wp_image_description_info_v1 * info)
 {
@@ -154,6 +156,19 @@ static void imageInfoDone(void * data,
       (double)state->targetMinLum / 10000.0, state->targetMaxLum,
       state->targetMaxCLL ? "" : "?", state->maxCLL,
       state->targetMaxFALL ? "" : "?", state->maxFALL);
+
+  // persist the compositor-preferred luminances and rebuild the surface
+  // image description if they changed
+  const uint32_t refLum = state->luminances      ? state->referenceLum : 0;
+  const uint32_t maxLum = state->targetLuminance ? state->targetMaxLum : 0;
+  if (refLum != wlWm.colorPreferredRefLum ||
+      maxLum != wlWm.colorPreferredMaxLum)
+  {
+    wlWm.colorPreferredRefLum = refLum;
+    wlWm.colorPreferredMaxLum = maxLum;
+    if (wlWm.colorPQActive)
+      waylandRebuildPQDescription();
+  }
 
   if (state->imageDescription)
     wp_image_description_v1_destroy(state->imageDescription);
@@ -364,15 +379,23 @@ static struct wp_image_description_v1 * waylandCreatePQDescription(void)
   // the content a second time
   const int metadataPeak = option_get_int("egl", "hdrMetadataPeak");
   const int metadataFALL = option_get_int("egl", "hdrMetadataFALL");
-  const uint32_t metadataMax =
+  uint32_t metadataMax =
     metadataPeak > 0 ? (uint32_t)metadataPeak : 10000;
-  DEBUG_INFO("Wayland HDR metadata request: BT.2020/PQ luminance:0.0050/10000/203 nits "
+
+  // prefer the compositor-reported luminances; fall back to the BT.2408
+  // reference white and the full PQ range until they are known
+  const uint32_t referenceLum =
+    wlWm.colorPreferredRefLum > 0 ? wlWm.colorPreferredRefLum : 203;
+  if (wlWm.colorPreferredMaxLum > 0 && metadataMax > wlWm.colorPreferredMaxLum)
+    metadataMax = wlWm.colorPreferredMaxLum;
+
+  DEBUG_INFO("Wayland HDR metadata request: BT.2020/PQ luminance:0.0050/10000/%u nits "
       "mastering:0.0050/%u nits maxCLL:%u nits maxFALL:%d nits",
-      metadataMax, metadataMax, metadataFALL);
+      referenceLum, metadataMax, metadataMax, metadataFALL);
 
   if (wlWm.colorFeatureSetLuminances)
     wp_image_description_creator_params_v1_set_luminances(params,
-        50, 10000, 203);
+        50, 10000, referenceLum);
 
   if (wlWm.colorFeatureSetMastering)
   {
@@ -393,6 +416,42 @@ static struct wp_image_description_v1 * waylandCreatePQDescription(void)
         params, (uint32_t)metadataFALL);
 
   return wp_image_description_creator_params_v1_create(params);
+}
+
+static void rebuiltImageDescriptionReady(void * data,
+    struct wp_image_description_v1 * imageDescription, uint32_t identity)
+{
+  wp_color_management_surface_v1_set_image_description(
+      wlWm.colorSurface, imageDescription,
+      WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
+  wp_image_description_v1_destroy(imageDescription);
+}
+
+static void rebuiltImageDescriptionFailed(void * data,
+    struct wp_image_description_v1 * imageDescription,
+    uint32_t cause, const char * msg)
+{
+  DEBUG_WARN("Wayland rebuilt image description failed (%u): %s",
+      cause, msg ? msg : "");
+  wp_image_description_v1_destroy(imageDescription);
+}
+
+static const struct wp_image_description_v1_listener rebuiltImageListener = {
+  .failed = rebuiltImageDescriptionFailed,
+  .ready  = rebuiltImageDescriptionReady,
+};
+
+// rebuild the PQ description with the latest preferred luminances and apply
+// it once the compositor reports it ready
+static void waylandRebuildPQDescription(void)
+{
+  struct wp_image_description_v1 * imageDescription =
+    waylandCreatePQDescription();
+  if (!imageDescription)
+    return;
+
+  wp_image_description_v1_add_listener(imageDescription,
+      &rebuiltImageListener, NULL);
 }
 
 static bool waylandWindowInitColorManagement(void)
@@ -435,6 +494,12 @@ static bool waylandWindowInitColorManagement(void)
       wlWm.colorSurface, imageDescription,
       WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
   wp_image_description_v1_destroy(imageDescription);
+  wlWm.colorPQActive = true;
+
+  // if the preferred luminances arrived while we were waiting, rebuild with
+  // them now
+  if (wlWm.colorPreferredRefLum || wlWm.colorPreferredMaxLum)
+    waylandRebuildPQDescription();
 
   DEBUG_INFO("Wayland HDR output: BT.2020/PQ via color-management-v1");
   return true;

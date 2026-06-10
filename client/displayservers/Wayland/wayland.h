@@ -120,6 +120,9 @@ struct WaylandDSState
   bool colorFeatureSetMastering;
   bool colorTFPQ;
   bool colorPrimariesBT2020;
+  bool colorPQActive;
+  uint32_t colorPreferredRefLum;
+  uint32_t colorPreferredMaxLum;
 
   struct WaylandScale scale;
   bool fractionalScale;
