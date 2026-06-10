@@ -74,6 +74,10 @@ typedef enum WGCCaptureHDRMode
 }
 WGCCaptureHDRMode;
 
+// hard-coded policy for wgc:encoding=auto
+#define WGC_CAPTURE_AUTO_SDR_ENCODING WGC_CAPTURE_PUBLISH_FORMAT_NV12
+#define WGC_CAPTURE_AUTO_HDR_ENCODING WGC_CAPTURE_PUBLISH_FORMAT_P010
+
 typedef struct FrameDamage
 {
   int             count;
@@ -94,7 +98,6 @@ struct WGCCapture
 
   bool                     debug;
   bool                     trackDamage;
-  bool                     timings;
   bool                     debugStats;
   int                      dirtyFullCopyPercent;
 
@@ -104,8 +107,6 @@ struct WGCCapture
   WGCCapturePublishMode    publishMode;        // resolved at init
   WGCCapturePublishFormat  publishFormat;      // resolved publish encoding
   WGCCapturePublishFormat  requestedEncoding;  // explicit wgc:encoding
-  WGCCapturePublishFormat  sdrEncoding;        // auto policy for SDR sources
-  WGCCapturePublishFormat  hdrEncoding;        // auto policy for HDR sources
   WGCCaptureHDRMode        hdrMode;
   void                   * ivshmemBase;
   HMODULE                  d3d12Module;        // dynamically loaded
@@ -190,32 +191,11 @@ static void wgc_capture_initOptions(void)
     },
     {
       .module         = "wgc",
-      .name           = "publishFormat",
-      .description    = "Deprecated alias for wgc:encoding",
-      .type           = OPTION_TYPE_STRING,
-      .value.x_string = "auto"
-    },
-    {
-      .module         = "wgc",
       .name           = "encoding",
       .description    = "WGC publish encoding: auto|bgra8|rgba16f|nv12|p010. "
-                        "auto uses wgc:sdrEncoding/wgc:hdrEncoding.",
+                        "auto picks nv12 for SDR sources and p010 for HDR.",
       .type           = OPTION_TYPE_STRING,
       .value.x_string = "auto"
-    },
-    {
-      .module         = "wgc",
-      .name           = "sdrEncoding",
-      .description    = "WGC publish encoding used by wgc:encoding=auto for SDR sources: bgra8|rgba16f|nv12|p010",
-      .type           = OPTION_TYPE_STRING,
-      .value.x_string = "nv12"
-    },
-    {
-      .module         = "wgc",
-      .name           = "hdrEncoding",
-      .description    = "WGC publish encoding used by wgc:encoding=auto for HDR sources: bgra8|rgba16f|nv12|p010",
-      .type           = OPTION_TYPE_STRING,
-      .value.x_string = "p010"
     },
     {
       .module         = "wgc",
@@ -254,13 +234,6 @@ static void wgc_capture_initOptions(void)
     },
     {
       .module         = "wgc",
-      .name           = "timings",
-      .description    = "Log WGC capture timing summaries once per second",
-      .type           = OPTION_TYPE_BOOL,
-      .value.x_bool   = false
-    },
-    {
-      .module         = "wgc",
       .name           = "debugStats",
       .description    = "Log lightweight WGC burst/stall/dirty-copy diagnostics",
       .type           = OPTION_TYPE_BOOL,
@@ -282,13 +255,6 @@ static void wgc_capture_initOptions(void)
     },
     {
       .module         = "wgc",
-      .name           = "pollFramePoolMs",
-      .description    = "Frame pool polling wait in milliseconds when wgc:pollFramePool is enabled",
-      .type           = OPTION_TYPE_INT,
-      .value.x_int    = 1
-    },
-    {
-      .module         = "wgc",
       .name           = "includeSecondaryWindows",
       .description    = "Capture secondary windows for the selected WGC item when supported by the OS",
       .type           = OPTION_TYPE_BOOL,
@@ -303,25 +269,11 @@ static void wgc_capture_initOptions(void)
     },
     {
       .module         = "wgc",
-      .name           = "dwmFlushGapMs",
-      .description    = "Minimum WGC callback gap before DwmFlush is used",
-      .type           = OPTION_TYPE_INT,
-      .value.x_int    = 50
-    },
-    {
-      .module         = "wgc",
       .name           = "dirtyFullCopyPercent",
       .description    = "Use a full IVSHMEM write when merged dirty area reaches this frame percentage (0 = never)",
       .type           = OPTION_TYPE_INT,
       .value.x_int    = 65 // 65% is a sweet spot: benefits of dirty copies before the overhead
                             // of many small rects approaches that of a full copy
-    },
-    {
-      .module         = "wgc",
-      .name           = "d3d12CopyQueues",
-      .description    = "Number of D3D12 COPY queues used for full-frame IVSHMEM copies",
-      .type           = OPTION_TYPE_INT,
-      .value.x_int    = 1
     },
     {
       .module         = "wgc",
@@ -444,19 +396,16 @@ static void wgc_capture_resolveEncoding(DXGI_COLOR_SPACE_TYPE colorSpace)
   }
 
   if (!hdrSource || this->hdrMode == WGC_CAPTURE_HDR_MODE_OFF)
-    this->publishFormat = this->sdrEncoding;
+    this->publishFormat = WGC_CAPTURE_AUTO_SDR_ENCODING;
   else if (this->hdrMode == WGC_CAPTURE_HDR_MODE_PRESERVE)
     this->publishFormat = WGC_CAPTURE_PUBLISH_FORMAT_RGBA16F;
   else
-    this->publishFormat = this->hdrEncoding;
+    this->publishFormat = WGC_CAPTURE_AUTO_HDR_ENCODING;
 
-  DEBUG_INFO("WGC encoding: %s (source:%s colorSpace:0x%x hdrMode:%s "
-    "sdrEncoding:%s hdrEncoding:%s)",
+  DEBUG_INFO("WGC encoding: %s (source:%s colorSpace:0x%x hdrMode:%s)",
     wgc_capture_encodingName(this->publishFormat),
     hdrSource ? "HDR" : "SDR", (unsigned)colorSpace,
-    wgc_capture_hdrModeName(this->hdrMode),
-    wgc_capture_encodingName(this->sdrEncoding),
-    wgc_capture_encodingName(this->hdrEncoding));
+    wgc_capture_hdrModeName(this->hdrMode));
 }
 
 static void wgc_capture_forcePublishModeForEncoding(void)
@@ -500,7 +449,7 @@ static bool wgc_capture_damageTooLarge(const FrameDamageRect * rects, int count)
 
 static void wgc_capture_logStats(void)
 {
-  if (!this || (!this->timings && !this->debugStats))
+  if (!this || !this->debugStats)
     return;
 
   const uint64_t now = microtime();
@@ -558,7 +507,6 @@ static bool wgc_capture_create(
   this->frameBufferCount    = frameBuffers;
   this->debug               = option_get_bool("wgc", "debug");
   this->trackDamage         = option_get_bool("wgc", "trackDamage");
-  this->timings             = option_get_bool("wgc", "timings");
   this->debugStats          = option_get_bool("wgc", "debugStats");
   this->dirtyFullCopyPercent =
     option_get_int("wgc", "dirtyFullCopyPercent");
@@ -577,25 +525,11 @@ static bool wgc_capture_create(
     this->publishMode = WGC_CAPTURE_PUBLISH_AUTO;
   }
 
-  // encoding: auto/bgra8/rgba16f/nv12. publishFormat is kept as a deprecated
-  // alias so old launch scripts still resolve to the same format.
-  const char * enc = option_get_string("wgc", "encoding");
-  const char * pf  = option_get_string("wgc", "publishFormat");
-  if ((!enc || strcmp(enc, "auto") == 0) && pf && strcmp(pf, "auto") != 0)
-  {
-    DEBUG_INFO("wgc:publishFormat is deprecated; use wgc:encoding instead");
-    enc = pf;
-  }
-
-  this->requestedEncoding = wgc_capture_parseEncoding(enc,
+  // encoding: auto/bgra8/rgba16f/nv12/p010
+  this->requestedEncoding = wgc_capture_parseEncoding(
+    option_get_string("wgc", "encoding"),
     WGC_CAPTURE_PUBLISH_FORMAT_AUTO, "encoding");
   this->publishFormat = this->requestedEncoding;
-  this->sdrEncoding = wgc_capture_parseEncoding(
-    option_get_string("wgc", "sdrEncoding"),
-    WGC_CAPTURE_PUBLISH_FORMAT_NV12, "sdrEncoding");
-  this->hdrEncoding = wgc_capture_parseEncoding(
-    option_get_string("wgc", "hdrEncoding"),
-    WGC_CAPTURE_PUBLISH_FORMAT_P010, "hdrEncoding");
   this->hdrMode = wgc_capture_parseHDRMode(option_get_string("wgc", "hdrMode"));
 
   wgc_capture_forcePublishModeForEncoding();
@@ -613,8 +547,8 @@ static bool wgc_capture_create(
 
   wgc_setPointerCallbacks(this->wgc, getPointerBufferFn, postPointerBufferFn);
 
-  DEBUG_INFO("WGC (top-level): trackDamage:%d frameBuffers:%u debug:%d timings:%d debugStats:%d dirtyFullCopyPercent:%d",
-    this->trackDamage, frameBuffers, this->debug, this->timings,
+  DEBUG_INFO("WGC (top-level): trackDamage:%d frameBuffers:%u debug:%d debugStats:%d dirtyFullCopyPercent:%d",
+    this->trackDamage, frameBuffers, this->debug,
     this->debugStats, this->dirtyFullCopyPercent);
 
   return true;
@@ -1184,7 +1118,7 @@ static CaptureResult wgc_capture_waitFrame(unsigned frameBufferIndex,
     return CAPTURE_RESULT_TIMEOUT;
 
   const uint64_t readbackUs = microtime() - readbackStart;
-  if (this->timings || this->debugStats)
+  if (this->debugStats)
   {
     this->cpuReadbackTotalUs += readbackUs;
     this->cpuReadbackMaxUs = max(this->cpuReadbackMaxUs, readbackUs);
@@ -1381,11 +1315,11 @@ static CaptureResult wgc_capture_getFrame(unsigned frameBufferIndex,
     for (int i = 0; i < local.count; ++i)
       copyPixels += (uint64_t)local.rects[i].width * local.rects[i].height;
 
-    if (this->timings || this->debugStats)
+    if (this->debugStats)
       this->copyRects += local.count;
   }
   const uint64_t memcpyUs = microtime() - memcpyStart;
-  if (this->timings || this->debugStats)
+  if (this->debugStats)
   {
     this->cpuMemcpyTotalUs += memcpyUs;
     this->cpuMemcpyMaxUs = max(this->cpuMemcpyMaxUs, memcpyUs);

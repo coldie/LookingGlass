@@ -45,6 +45,11 @@
 #define WGC_STATS_SAMPLE_MAX 512
 #define WGC_HDR_STATS_GRID 16
 
+// frame pool polling wait when wgc:pollFramePool is enabled
+#define WGC_POLL_FRAME_POOL_MS 1
+// minimum WGC callback gap before DwmFlush is used (wgc:dwmFlushOnGap)
+#define WGC_DWM_FLUSH_GAP_MS 50
+
 #define WIDL_using_Windows_Foundation
 #define WIDL_using_Windows_Foundation_Collections
 #define WIDL_using_Windows_Graphics
@@ -522,7 +527,6 @@ struct WGCInstance
   volatile LONG asyncNextSlot;
   bool asyncCapture;
   bool pollFramePool;
-  int pollFramePoolMs;
   bool debugStats;
   LONG asyncTimeouts;
   LONG asyncReadyBeforeWait;
@@ -576,7 +580,6 @@ struct WGCInstance
   int maxFPS;
   bool includeSecondaryWindows;
   bool dwmFlushOnGap;
-  int dwmFlushGapMs;
   uint64_t lastDwmFlushUs;
   bool hasLastSystemRelativeTime;
   int64_t lastSystemRelativeTime;
@@ -877,20 +880,17 @@ static bool wgc_init(WGCInstance * this, bool debug,
     option_get_bool("wgc", "d3d12FullCopyAlways");
   this->asyncCapture = option_get_bool("wgc", "asyncCapture");
   this->pollFramePool = option_get_bool("wgc", "pollFramePool");
-  this->pollFramePoolMs = max(0, option_get_int("wgc", "pollFramePoolMs"));
   this->debugStats = option_get_bool("wgc", "debugStats");
   this->includeSecondaryWindows =
     option_get_bool("wgc", "includeSecondaryWindows");
   this->dwmFlushOnGap = option_get_bool("wgc", "dwmFlushOnGap");
-  this->dwmFlushGapMs = max(1, option_get_int("wgc", "dwmFlushGapMs"));
   this->lastDwmFlushUs = 0;
-  DEBUG_INFO("WGC cursor:%s cursorMaxHz:%d maxFPS:%d asyncCapture:%d pollFramePool:%d/%dms includeSecondaryWindows:%d debugStats:%d dwmFlushOnGap:%d/%dms",
+  DEBUG_INFO("WGC cursor:%s cursorMaxHz:%d maxFPS:%d asyncCapture:%d pollFramePool:%d includeSecondaryWindows:%d debugStats:%d dwmFlushOnGap:%d",
     this->cursorMode == WGC_CURSOR_MODE_SEPARATE ? "separate" :
     this->cursorMode == WGC_CURSOR_MODE_EMBEDDED ? "embedded" : "none",
     this->cursorMaxHz, this->maxFPS, this->asyncCapture,
-    this->pollFramePool, this->pollFramePoolMs,
-    this->includeSecondaryWindows, this->debugStats, this->dwmFlushOnGap,
-    this->dwmFlushGapMs);
+    this->pollFramePool,
+    this->includeSecondaryWindows, this->debugStats, this->dwmFlushOnGap);
 
   hr = RoInitialize(RO_INIT_MULTITHREADED);
   if (FAILED(hr) && hr != RPC_E_CHANGED_MODE)
@@ -1083,31 +1083,7 @@ static bool wgc_init(WGCInstance * this, bool debug,
       goto exit;
     }
 
-    int requestedQueues = option_get_int("wgc", "d3d12CopyQueues");
-    if (requestedQueues < 1)
-      requestedQueues = 1;
-    if (requestedQueues > WGC_D3D12_COPY_QUEUE_MAX)
-      requestedQueues = WGC_D3D12_COPY_QUEUE_MAX;
-    this->d3d12CopyQueueCount = (unsigned)requestedQueues;
-
-    for(unsigned i = 1; i < this->d3d12CopyQueueCount; ++i)
-    {
-      D3D12_COMMAND_QUEUE_DESC qDesc =
-      {
-        .Type     = D3D12_COMMAND_LIST_TYPE_COPY,
-        .Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL,
-        .Flags    = D3D12_COMMAND_QUEUE_FLAG_NONE
-      };
-      hr = ID3D12Device3_CreateCommandQueue(*this->d12device, &qDesc,
-        &IID_ID3D12CommandQueue, (void **)&this->d3d12CopyQueues[i]);
-      if (FAILED(hr))
-      {
-        DEBUG_WINERROR("ivshmem-d3d12-copy: CreateCommandQueue failed", hr);
-        goto exit;
-      }
-      wgc_setD3D12ObjectNameI((ID3D12Object *)this->d3d12CopyQueues[i],
-        "WGC IVSHMEM D3D12 copy queue ", i);
-    }
+    this->d3d12CopyQueueCount = 1;
 
     for(unsigned i = 0; i < this->d3d12CopyQueueCount; ++i)
     {
@@ -1776,7 +1752,7 @@ static CaptureResult wgc_capture(WGCInstance * this,
   }
 
   const DWORD wait = WaitForSingleObject(this->frameEvent,
-    this->pollFramePool ? (DWORD)this->pollFramePoolMs : 1000);
+    this->pollFramePool ? WGC_POLL_FRAME_POOL_MS : 1000);
   if (wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT)
   {
     DEBUG_WINERROR("Waiting for a WGC frame failed, reinitializing",
@@ -2022,7 +1998,7 @@ static void wgc_maybeDwmFlushOnGap(WGCInstance * this)
     return;
 
   const uint64_t gapUs = now - (uint64_t)last;
-  const uint64_t thresholdUs = (uint64_t)this->dwmFlushGapMs * 1000;
+  const uint64_t thresholdUs = WGC_DWM_FLUSH_GAP_MS * UINT64_C(1000);
   if (gapUs < thresholdUs || now - this->lastDwmFlushUs < thresholdUs)
     return;
 

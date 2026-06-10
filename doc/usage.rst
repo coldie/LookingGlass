@@ -671,6 +671,9 @@ WGC Configuration Options
 
 * ``output`` - The name of the specific output to capture
 
+* ``cursor`` (default ``separate``) - Cursor mode: ``separate``, ``embedded``,
+  or ``none``.
+
 * ``maxFPS`` (default ``240``) - Maximum capture rate via ``MinUpdateInterval``.
   Set to ``0`` for the OS default (commonly 60 Hz).
 
@@ -682,19 +685,19 @@ WGC Configuration Options
   path available and falls back to cpu-staging.
 
 * ``encoding`` (default ``auto``) - WGC publish encoding:
-  ``auto`` (uses ``sdrEncoding``/``hdrEncoding``), ``bgra8``, ``rgba16f``, ``nv12``,
-  or ``p010``.
-
-* ``sdrEncoding`` (default ``nv12``) - Encoding used by ``encoding=auto`` for
-  SDR sources: ``bgra8``, ``rgba16f``, ``nv12``, or ``p010``.
-
-* ``hdrEncoding`` (default ``p010``) - Encoding used by ``encoding=auto`` for
-  HDR sources: ``bgra8``, ``rgba16f``, ``nv12``, or ``p010``.
+  ``auto`` (picks ``nv12`` for SDR sources and ``p010`` for HDR), ``bgra8``,
+  ``rgba16f``, ``nv12``, or ``p010``.
 
 * ``hdrMode`` (default ``preserve-pq``) - HDR source handling: ``auto``,
   ``off``, ``tonemap``, ``preserve``, or ``preserve-pq``.
 
 * ``trackDamage`` (default ``yes``) - Perform damage-aware copies to save bandwidth.
+
+* ``dirtyFullCopyPercent`` (default ``65``) - Use a full IVSHMEM write when the
+  merged dirty area reaches this percentage of the frame (``0`` = never).
+
+* ``d3d12FullCopyAlways`` (default ``yes``) - Always use full-frame D3D12
+  bridge-to-IVSHMEM copies while preserving client damage rects.
 
 * ``debug`` - Enable debug logging for the WGC capture path.
 
@@ -702,6 +705,12 @@ WGC Configuration Options
 
 * ``asyncCapture`` (default ``no``) - Copy WGC frames in the ``FrameArrived``
   callback.
+
+* ``pollFramePool`` (default ``no``) - Poll the WGC frame pool on short
+  timeouts instead of relying only on ``FrameArrived``.
+
+* ``dwmFlushOnGap`` (default ``no``) - Call ``DwmFlush`` when WGC callback
+  delivery stalls.
 
 * ``includeSecondaryWindows`` (default ``yes``) - Capture secondary windows on
   supported OS versions.
