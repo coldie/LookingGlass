@@ -677,7 +677,7 @@ WGC Configuration Options
 * ``cursorMaxHz`` (default ``120``) - Maximum separate-cursor position update rate.
   Set to ``0`` for unlimited.
 
-* ``publishMode`` (default ``auto``) - Publish path: ``auto``, ``ivshmem-direct``,
+* ``publishMode`` (default ``auto``) - Publish path: ``auto``,
   ``ivshmem-d3d12-copy``, or ``cpu-staging``. ``auto`` selects the best GPU-direct
   path available and falls back to cpu-staging.
 

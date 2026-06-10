@@ -62,7 +62,6 @@ WGCTiledCopyMode;
 
 #include <d3d11.h>
 #include <d3d11_4.h>
-#include <d3d11on12.h>
 #include <dwmapi.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
@@ -422,24 +421,22 @@ typedef struct WGCFrameInfo
   bool                copyFailed;
   uint64_t            callbackTimeUs;
 
-  // IVSHMEM-direct only: the underlying placed D3D12 resource that backs the
-  // D3D11On12-wrapped `texture` above. Stored so we can release it. The
-  // wrapped `texture` is created via D3D11On12 ::CreateWrappedResource and
-  // released through the normal D3D11 path.
+  // IVSHMEM publish only: the placed D3D12 resource that backs this slot in
+  // the IVSHMEM heap. Stored so we can release it.
   ID3D12Resource   ** ivshmemD12Res;
   // Offset within the IVSHMEM heap (bytes) where this slot lives
   uint64_t            ivshmemOffset;
   // True once wgc_setIvshmemSlot has registered an offset for this slot.
-  // wgc_ensureFrameIvshmemDirect refuses to create textures for unregistered
+  // wgc_ensureFrameIvshmem refuses to create textures for unregistered
   // slots — the caller must register them (typically on first iface->capture
   // for that frameBufferIndex) before they can be used.
   bool                ivshmemSlotReady;
-  // Bridge textures for the two-device IVSHMEM_DIRECT path:
+  // Bridge textures for the IVSHMEM D3D12 copy path:
   //   bridgeA — D3D11 texture on the WGC frame pool's device (SHARED +
-  //             SHARED_NTHANDLE). WGC source → bridgeA on WGC context.
-  //   bridgeB — same memory, opened via shared NT handle on the
-  //             D3D11On12-side D3D11 device. bridgeB → wrapped texture
-  //             (IVSHMEM-resident) on D3D11On12-side context.
+  //             SHARED_NTHANDLE), opened as bridge12 on the D3D12 side.
+  //             WGC source → bridgeA on WGC context.
+  //   bridgeB — encode-shader UAV target when packed YUV/RGB10 encoding
+  //             is active.
   ID3D11Texture2D ** bridgeA;
   ID3D11Texture2D ** bridgeB;
   ID3D12Resource  ** bridge12;
@@ -472,33 +469,19 @@ struct WGCInstance
   CapturePostPointerBuffer postPointerBufferFn;
 
   // Loaned devices — set via wgc_setLoanedDevices before wgc_initInstance.
-  // For IVSHMEM_DIRECT mode the loaned D3D11 device is the D3D11On12 side
-  // (used ONLY for wrapping IVSHMEM-resident D3D12 placed resources). WGC's
-  // own frame pool gets a separately-created vanilla D3D11 device on the
-  // same adapter — using a D3D11On12-backed device for the frame pool
-  // causes WGC's compositor capture pipeline to stop after ~1–2 frames.
-  //
-  // For other modes the loaned device (if any) is used directly.
+  // The loaned device (if any) is used directly.
   ID3D11Device        * loanedD11Device;
   ID3D11DeviceContext * loanedD11Context;
   ID3D12Device3       * loanedD12Device;
 
-  // D3D11On12-side D3D11 device & context. In IVSHMEM_DIRECT mode this is
-  // a separate device from `device` (the WGC frame pool's vanilla D3D11).
-  // Resolved at end of wgc_init: alias of `device`/`context` for non-IVSHMEM
-  // modes (where they coincide); a distinct device pair for IVSHMEM_DIRECT.
-  ID3D11Device5         ** on12Device;
-  ID3D11DeviceContext4  ** on12Context;
-
-  // Cross-device sync fence for IVSHMEM_DIRECT (NULL otherwise).
-  //   wgcFence:     created on `device` (WGC frame pool's D3D11) with
-  //                 D3D11_FENCE_FLAG_SHARED. Signaled on WGC context after
-  //                 each bridge copy.
-  //   wgcFenceOn12: same fence, opened on `on12Device` via a shared NT
-  //                 handle. The D3D11On12-side context waits on this fence
-  //                 before reading the bridge.
+  // Cross-API sync fence for IVSHMEM_D3D12_COPY (NULL otherwise).
+  //   wgcFence:      created on `device` (WGC frame pool's D3D11) with
+  //                  D3D11_FENCE_FLAG_SHARED. Signaled on WGC context after
+  //                  each bridge copy.
+  //   wgcD3D12Fence: same fence, opened on the D3D12 device via a shared NT
+  //                  handle. The D3D12 copy queue waits on this fence before
+  //                  reading the bridge.
   ID3D11Fence       ** wgcFence;
-  ID3D11Fence       ** wgcFenceOn12;
   ID3D12Fence       ** wgcD3D12Fence;
   UINT64               wgcFenceValue;
   ID3D11ComputeShader ** nv12Shader;
@@ -510,19 +493,12 @@ struct WGCInstance
   DXGI_FORMAT          nv12ShaderIvshmemFormat;
   ID3D11Texture2D      ** hdrStatsTexture;
 
-  // True iff the two-device bridge path is active (separate WGC + D3D11On12
-  // devices, with the cross-device fence and bridge textures). When false,
-  // `on12Device`/`on12Context` are NULL and call sites fall back to
-  // `device`/`context`.
-  bool                 twoDeviceBridge;
-
-  // IVSHMEM-direct environment — set via wgc_setIvshmemEnv before
-  // wgc_initInstance. Only used when publishMode == WGC_PUBLISH_IVSHMEM_DIRECT.
-  // The heap and D3D11On12 device are owned by the caller; we hold raw
-  // pointers (no AddRef in this file — caller keeps them alive). Per-slot
+  // IVSHMEM publish environment — set via wgc_setIvshmemD3D12CopyEnv before
+  // wgc_initInstance. Only used when publishMode is
+  // WGC_PUBLISH_IVSHMEM_D3D12_COPY. The heap is owned by the caller; we hold
+  // a raw pointer (no AddRef in this file — caller keeps it alive). Per-slot
   // offsets live on each WGCFrameInfo (set via wgc_setIvshmemSlot).
   ID3D12Heap        * ivshmemHeap;
-  ID3D11On12Device  * d11on12Device;
   ID3D12CommandQueue * d3d12CopyQueues[WGC_D3D12_COPY_QUEUE_MAX];
   D12CommandGroup     d3d12CopyCommands[WGC_D3D12_COPY_QUEUE_MAX];
   bool                d3d12CopyCommandReady[WGC_D3D12_COPY_QUEUE_MAX];
@@ -744,8 +720,7 @@ static const ITypedEventHandler_Direct3D11CaptureFramePool_IInspectableVtbl
 
 static bool wgc_isIvshmemPublishMode(WGCPublishMode mode)
 {
-  return mode == WGC_PUBLISH_IVSHMEM_DIRECT ||
-         mode == WGC_PUBLISH_IVSHMEM_D3D12_COPY;
+  return mode == WGC_PUBLISH_IVSHMEM_D3D12_COPY;
 }
 
 static HRESULT STDMETHODCALLTYPE wgc_eventQueryInterface(
@@ -1016,20 +991,13 @@ static bool wgc_init(WGCInstance * this, bool debug,
   comRef_defineLocal(ID3D11Device       , d11device);
   comRef_defineLocal(ID3D11DeviceContext, d11context);
 
-  // IVSHMEM modes MUST NOT drive the WGC frame pool from the loaned
-  // D3D11On12-backed device — empirically that causes the compositor capture
-  // pipeline to stop producing frames after 1–2 callbacks (the pool itself
-  // goes empty, not just FrameArrived). Create a fresh vanilla D3D11 device
-  // on the same adapter for the frame pool, and use the loaned device only
-  // for the IVSHMEM-resident wrapped textures via the bridge texture path.
-  const bool useLoanedForWgc = this->loanedD11Device &&
-    !wgc_isIvshmemPublishMode(this->publishMode);
+  const bool useLoanedForWgc = this->loanedD11Device != NULL;
 
   if (useLoanedForWgc)
   {
-    // Caller supplied a D3D11 device (typically from D3D11On12CreateDevice).
-    // Borrow it — caller retains ownership. We still go through the COM
-    // ref scope so subsequent QueryInterface chains work uniformly.
+    // Caller supplied a D3D11 device. Borrow it — caller retains ownership.
+    // We still go through the COM ref scope so subsequent QueryInterface
+    // chains work uniformly.
     ID3D11Device_AddRef(this->loanedD11Device);
     *d11device = this->loanedD11Device;
     ID3D11DeviceContext_AddRef(this->loanedD11Context);
@@ -1145,8 +1113,8 @@ static bool wgc_init(WGCInstance * this, bool debug,
 
   this->colorSpace = wgc_getOutputColorSpace(this);
 
-  // Use the loaned D12 device if provided (typically the one bound to the
-  // D3D11On12 wrapper).
+  // Use the loaned D12 device if provided (the one that opened the IVSHMEM
+  // heap).
   ID3D12Device3 * effectiveD12 = this->loanedD12Device;
   if (effectiveD12)
   {
@@ -1156,80 +1124,6 @@ static bool wgc_init(WGCInstance * this, bool debug,
   comRef_toGlobal(this->device       , d11device5    );
   comRef_toGlobal(this->context      , d11context4   );
   comRef_toGlobal(this->graphicsDevice, graphicsDevice);
-
-  // Resolve on12Device / on12Context.
-  //
-  // For non-IVSHMEM_DIRECT modes (or when no loaned device was provided),
-  // they alias the WGC frame pool's device — the same context handles
-  // wgc-publishes and any wraps.
-  //
-  // For IVSHMEM_DIRECT with a loaned D3D11On12 device, queryInterface to
-  // the ID3D11Device5 / ID3D11DeviceContext4 forms so the existing call
-  // sites work uniformly.
-  if (this->publishMode == WGC_PUBLISH_IVSHMEM_DIRECT &&
-      this->loanedD11Device && !useLoanedForWgc)
-  {
-    comRef_defineLocal(ID3D11Device5       , on12dev5);
-    comRef_defineLocal(ID3D11DeviceContext4, on12ctx4);
-    hr = ID3D11Device_QueryInterface(this->loanedD11Device,
-      &IID_ID3D11Device5, (void **)on12dev5);
-    if (FAILED(hr))
-    {
-      DEBUG_WINERROR("ivshmem-direct: QI ID3D11Device5 on loaned device failed",
-        hr);
-      goto exit;
-    }
-
-    hr = ID3D11DeviceContext_QueryInterface(this->loanedD11Context,
-      &IID_ID3D11DeviceContext4, (void **)on12ctx4);
-    if (FAILED(hr))
-    {
-      DEBUG_WINERROR("ivshmem-direct: QI ID3D11DeviceContext4 on loaned ctx failed",
-        hr);
-      goto exit;
-    }
-
-    // Cross-device sync fence: signal on WGC's context, wait on
-    // D3D11On12-side context. Create shared on WGC's device, open on the
-    // D3D11On12-side device via shared NT handle. Promote locals to global
-    // AFTER OpenSharedFence — comRef_toGlobal NULLs the source pointer.
-    comRef_defineLocal(ID3D11Fence, fence);
-    hr = ID3D11Device5_CreateFence(*this->device, 0,
-      D3D11_FENCE_FLAG_SHARED, &IID_ID3D11Fence, (void **)fence);
-    if (FAILED(hr))
-    {
-      DEBUG_WINERROR("ivshmem-direct: CreateFence on WGC device failed", hr);
-      goto exit;
-    }
-
-    HANDLE fenceHandle = NULL;
-    hr = ID3D11Fence_CreateSharedHandle(*fence, NULL, GENERIC_ALL, NULL,
-      &fenceHandle);
-    if (FAILED(hr))
-    {
-      DEBUG_WINERROR("ivshmem-direct: ID3D11Fence_CreateSharedHandle failed", hr);
-      goto exit;
-    }
-
-    comRef_defineLocal(ID3D11Fence, fenceOn12);
-    hr = ID3D11Device5_OpenSharedFence(*on12dev5, fenceHandle,
-      &IID_ID3D11Fence, (void **)fenceOn12);
-    CloseHandle(fenceHandle);
-    if (FAILED(hr))
-    {
-      DEBUG_WINERROR("ivshmem-direct: OpenSharedFence on D3D11On12 device failed",
-        hr);
-      goto exit;
-    }
-
-    comRef_toGlobal(this->on12Device  , on12dev5 );
-    comRef_toGlobal(this->on12Context , on12ctx4 );
-    comRef_toGlobal(this->wgcFence    , fence    );
-    comRef_toGlobal(this->wgcFenceOn12, fenceOn12);
-    this->wgcFenceValue    = 0;
-    this->twoDeviceBridge  = true;
-    DEBUG_INFO("ivshmem-direct: two-device path active");
-  }
 
   if (this->publishMode == WGC_PUBLISH_IVSHMEM_D3D12_COPY)
   {
@@ -1729,11 +1623,7 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
         microtime() - profileStart);
 
     profileStart = profile ? microtime() : 0;
-    // Two-device path: bridge-A copy and fence Signal are on this->context;
-    // wrap copy and Release are on this->on12Context. Flush both.
     ID3D11DeviceContext4_Flush(*this->context);
-    if (this->twoDeviceBridge)
-      ID3D11DeviceContext4_Flush(*this->on12Context);
     if (profile)
       wgc_recordProfileStage(this, WGC_PROFILE_FLUSH,
         microtime() - profileStart);
@@ -3650,16 +3540,7 @@ static void wgc_copyFrameTexture(WGCInstance * this, WGCFrameInfo * dst,
     wgc_isIvshmemPublishMode(this->publishMode) &&
     dst != &this->frames[0];
 
-  // Two-device path: WGC source lives on the vanilla D3D11 device; the
-  // IVSHMEM wrap lives on the D3D11On12-backed device. Bridge via a shared
-  // VRAM texture (bridgeA on WGC device, bridgeB on On12 device — same
-  // memory) with a cross-device fence between stages.
-  const bool twoDeviceBridge = directPublish && this->twoDeviceBridge &&
-    dst->bridgeA && dst->bridgeB;
-
-  if (directPublish &&
-      this->publishMode == WGC_PUBLISH_IVSHMEM_D3D12_COPY &&
-      dst->bridgeA && dst->bridge12)
+  if (directPublish && dst->bridgeA && dst->bridge12)
   {
     if (wgc_needsEncodeShader(this))
     {
@@ -3694,74 +3575,14 @@ static void wgc_copyFrameTexture(WGCInstance * this, WGCFrameInfo * dst,
     return;
   }
 
-  if (twoDeviceBridge)
-  {
-    // Stage 1: WGC source → bridgeA on WGC context (VRAM→VRAM, same device).
-    if (wgc_needsEncodeShader(this))
-    {
-      if (!wgc_encodeFrameNV12(this, dst, src))
-      {
-        InterlockedExchange(&this->forceNextFullCopy, 1);
-        dst->copyFailed = true;
-        return;
-      }
-    }
-    else if (dst->fullCopy)
-      ID3D11DeviceContext4_CopyResource(*this->context,
-        (ID3D11Resource *)*dst->bridgeA, (ID3D11Resource *)src);
-    else
-      for(const RECT * rect = dst->dirtyRects;
-          rect < dst->dirtyRects + dst->nbDirtyRects; ++rect)
-        wgc_copyFrameTextureRectCtx(*this->context,
-          (ID3D11Resource *)*dst->bridgeA, (ID3D11Resource *)src, rect);
-
-    // Cross-device sync: WGC signals, D3D11On12 side waits.
-    const UINT64 fenceVal = ++this->wgcFenceValue;
-    ID3D11DeviceContext4_Signal(*this->context, *this->wgcFence, fenceVal);
-    ID3D11DeviceContext4_Wait(*this->on12Context, *this->wgcFenceOn12,
-      fenceVal);
-
-    // Stage 2: bridgeB → IVSHMEM wrap on D3D11On12 context. Acquire/Release
-    // brackets the whole copy batch so the D3D12-side state transitions are
-    // emitted once per frame.
-    ID3D11Resource * acquired[1] = { (ID3D11Resource *)*dst->texture };
-    ID3D11On12Device_AcquireWrappedResources(this->d11on12Device, acquired, 1);
-    if (dst->fullCopy)
-      ID3D11DeviceContext4_CopyResource(*this->on12Context,
-        (ID3D11Resource *)*dst->texture, (ID3D11Resource *)*dst->bridgeB);
-    else
-      for(const RECT * rect = dst->dirtyRects;
-          rect < dst->dirtyRects + dst->nbDirtyRects; ++rect)
-        wgc_copyFrameTextureRectCtx(*this->on12Context,
-          (ID3D11Resource *)*dst->texture,
-          (ID3D11Resource *)*dst->bridgeB, rect);
-    ID3D11On12Device_ReleaseWrappedResources(this->d11on12Device, acquired, 1);
-  }
+  if (dst->fullCopy)
+    ID3D11DeviceContext4_CopyResource(*this->context,
+      (ID3D11Resource *)*dst->texture, (ID3D11Resource *)src);
   else
-  {
-    // Single-device path: dst is reachable from this->context directly. For
-    // a D3D11On12 wrap (IVSHMEM_DIRECT publish with no bridge), the wrap
-    // still needs Acquire/Release.
-    const bool needsAcquire = directPublish && dst->ivshmemD12Res;
-    ID3D11Resource * acquired[1];
-    if (needsAcquire)
-    {
-      acquired[0] = (ID3D11Resource *)*dst->texture;
-      ID3D11On12Device_AcquireWrappedResources(this->d11on12Device, acquired, 1);
-    }
-
-    if (dst->fullCopy)
-      ID3D11DeviceContext4_CopyResource(*this->context,
-        (ID3D11Resource *)*dst->texture, (ID3D11Resource *)src);
-    else
-      for(const RECT * rect = dst->dirtyRects;
-          rect < dst->dirtyRects + dst->nbDirtyRects; ++rect)
-        wgc_copyFrameTextureRectCtx(*this->context,
-          (ID3D11Resource *)*dst->texture, (ID3D11Resource *)src, rect);
-
-    if (needsAcquire)
-      ID3D11On12Device_ReleaseWrappedResources(this->d11on12Device, acquired, 1);
-  }
+    for(const RECT * rect = dst->dirtyRects;
+        rect < dst->dirtyRects + dst->nbDirtyRects; ++rect)
+      wgc_copyFrameTextureRectCtx(*this->context,
+        (ID3D11Resource *)*dst->texture, (ID3D11Resource *)src, rect);
 
   dst->copiedOnce = true;
 }
@@ -4189,8 +4010,6 @@ static void wgc_drainGpuWork(WGCInstance * this)
 
   if (this->context && *this->context)
     ID3D11DeviceContext4_Flush(*this->context);
-  if (this->on12Context && *this->on12Context)
-    ID3D11DeviceContext4_Flush(*this->on12Context);
 }
 
 static uint64_t wgc_copyFramePixels(const WGCFrameInfo * frame)
@@ -4236,20 +4055,19 @@ static void wgc_recordCopyStats(WGCInstance * this, const WGCFrameInfo * frame,
     (LONG64)(fullCopy ? framePixels : pixels));
 }
 
-// IVSHMEM-direct: create a ROW_MAJOR TEXTURE2D placed in the IVSHMEM heap
-// at the slot's offset, then wrap it as a D3D11 texture via D3D11On12 so
-// WGC's D3D11 CopyResource can target it. The wrapped texture is stored on
-// frame->texture; the placed D3D12 resource on frame->ivshmemD12Res so we
-// can release it when the slot is torn down.
-static bool wgc_ensureFrameIvshmemDirect(WGCInstance * this, WGCFrameInfo * frame,
+// IVSHMEM publish: create a ROW_MAJOR TEXTURE2D placed in the IVSHMEM heap
+// at the slot's offset (frame->ivshmemD12Res), plus the shared D3D11 bridge
+// texture WGC copies into and its D3D12 view (bridge12) that the copy queue
+// reads from.
+static bool wgc_ensureFrameIvshmem(WGCInstance * this, WGCFrameInfo * frame,
   const D3D11_TEXTURE2D_DESC * srcDesc)
 {
   const unsigned frameIndex = (unsigned)(frame - this->frames);
 
   if (!this->ivshmemEnvReady)
   {
-    DEBUG_ERROR("wgc_ensureFrameIvshmemDirect called but ivshmem environment "
-      "not set up (call wgc_setIvshmemEnv first)");
+    DEBUG_ERROR("wgc_ensureFrameIvshmem called but ivshmem environment "
+      "not set up (call wgc_setIvshmemD3D12CopyEnv first)");
     return false;
   }
 
@@ -4259,7 +4077,7 @@ static bool wgc_ensureFrameIvshmemDirect(WGCInstance * this, WGCFrameInfo * fram
     // yet. Caller is expected to call wgc_setIvshmemSlot during the first
     // iface->capture(idx, ...) for each frameBufferIndex, before WGC tries
     // to publish into the slot.
-    DEBUG_ERROR("wgc_ensureFrameIvshmemDirect: slot offset not registered");
+    DEBUG_ERROR("wgc_ensureFrameIvshmem: slot offset not registered");
     return false;
   }
 
@@ -4269,7 +4087,7 @@ static bool wgc_ensureFrameIvshmemDirect(WGCInstance * this, WGCFrameInfo * fram
       srcDesc->Height != this->ivshmemHeight ||
       (!packedYuv && !packedRgb10 && srcDesc->Format != this->ivshmemFormat))
   {
-    DEBUG_ERROR("WGC source (%ux%u fmt 0x%x) does not match the IVSHMEM-direct "
+    DEBUG_ERROR("WGC source (%ux%u fmt 0x%x) does not match the IVSHMEM "
       "target (%ux%u fmt 0x%x). Cannot recover without renegotiating the "
       "slot offsets — fall back to a different publishMode for now.",
       srcDesc->Width, srcDesc->Height, srcDesc->Format,
@@ -4277,12 +4095,8 @@ static bool wgc_ensureFrameIvshmemDirect(WGCInstance * this, WGCFrameInfo * fram
     return false;
   }
 
-  const bool d3d12Copy =
-    this->publishMode == WGC_PUBLISH_IVSHMEM_D3D12_COPY;
-
   comRef_scopePush(7);
   comRef_defineLocal(ID3D12Resource , placed );
-  comRef_defineLocal(ID3D11Texture2D, wrapped);
   comRef_defineLocal(ID3D11Texture2D, bridgeA);
   comRef_defineLocal(ID3D11Texture2D, bridgeB);
   comRef_defineLocal(ID3D12Resource , bridge12);
@@ -4316,173 +4130,112 @@ static bool wgc_ensureFrameIvshmemDirect(WGCInstance * this, WGCFrameInfo * fram
     (void **)placed);
   if (FAILED(hr))
   {
-    DEBUG_WINERROR("CreatePlacedResource (ivshmem-direct) failed", hr);
+    DEBUG_WINERROR("CreatePlacedResource (ivshmem) failed", hr);
     comRef_scopePop();
     return false;
   }
   wgc_setD3D12ObjectNameI((ID3D12Object *)*placed,
     "WGC IVSHMEM placed frame slot ", frameIndex);
 
-  if (!d3d12Copy)
+  // Stage the data through a shared bridge texture: WGC source → bridgeA
+  // (D3D11) → fence → bridge12 (the same memory, opened on the D3D12 side)
+  // → placed (IVSHMEM) on the D3D12 copy queue.
+  D3D11_TEXTURE2D_DESC bridgeDesc =
   {
-    D3D11_RESOURCE_FLAGS wrapFlags =
-    {
-      .BindFlags           = D3D11_BIND_SHADER_RESOURCE,
-      .MiscFlags           = 0,
-      .CPUAccessFlags      = 0,
-      .StructureByteStride = 0
-    };
+    .Width          = (UINT)d12Desc.Width,
+    .Height         = d12Desc.Height,
+    .MipLevels      = 1,
+    .ArraySize      = 1,
+    .Format         = d12Desc.Format,
+    .SampleDesc     = { .Count = 1, .Quality = 0 },
+    .Usage          = D3D11_USAGE_DEFAULT,
+    .BindFlags      = D3D11_BIND_SHADER_RESOURCE,
+    .CPUAccessFlags = 0,
+    .MiscFlags      = D3D11_RESOURCE_MISC_SHARED |
+                      D3D11_RESOURCE_MISC_SHARED_NTHANDLE
+  };
 
-    hr = ID3D11On12Device_CreateWrappedResource(
-      this->d11on12Device,
-      (IUnknown *)*placed,
-      &wrapFlags,
-      D3D12_RESOURCE_STATE_COMMON,
-      D3D12_RESOURCE_STATE_COMMON,
-      &IID_ID3D11Texture2D,
-      (void **)wrapped);
+  hr = ID3D11Device5_CreateTexture2D(*this->device, &bridgeDesc, NULL,
+    bridgeA);
+  if (FAILED(hr))
+  {
+    DEBUG_WINERROR("ivshmem-d3d12-copy: CreateTexture2D bridgeA failed", hr);
+    comRef_scopePop();
+    return false;
+  }
+
+  if (wgc_needsEncodeShader(this))
+  {
+    D3D11_TEXTURE2D_DESC encodeDesc = bridgeDesc;
+    encodeDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    encodeDesc.MiscFlags = 0;
+    hr = ID3D11Device5_CreateTexture2D(*this->device, &encodeDesc, NULL,
+      bridgeB);
     if (FAILED(hr))
     {
-      DEBUG_WINERROR("D3D11On12 CreateWrappedResource (ivshmem-direct) failed", hr);
+      DEBUG_WINERROR("ivshmem-d3d12-copy: CreateTexture2D encode "
+        "bridge failed", hr);
+      comRef_scopePop();
+      return false;
+    }
+
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc =
+    {
+      .Format        = this->ivshmemFormat,
+      .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+      .Texture2D     = { .MipSlice = 0 }
+    };
+    hr = ID3D11Device5_CreateUnorderedAccessView(*this->device,
+      (ID3D11Resource *)*bridgeB, &uavDesc, encodeUav);
+    if (FAILED(hr))
+    {
+      DEBUG_WINERROR("ivshmem-d3d12-copy: CreateUnorderedAccessView encode "
+        "bridge failed", hr);
       comRef_scopePop();
       return false;
     }
   }
 
-  // Two-device path: the WGC frame pool's vanilla D3D11 device cannot write
-  // to a D3D11On12-wrapped texture (different device). Stage the data through
-  // a shared bridge texture: WGC source → bridgeA (WGC device) → fence →
-  // bridgeB (D3D11On12 device) → wrapped (IVSHMEM). bridgeA and bridgeB are
-  // two D3D11 handles backed by the same VRAM via a shared NT handle.
-  if (this->twoDeviceBridge || d3d12Copy)
+  comRef_defineLocal(IDXGIResource1, bridgeRes);
+  hr = ID3D11Texture2D_QueryInterface(*bridgeA, &IID_IDXGIResource1,
+    (void **)bridgeRes);
+  if (FAILED(hr))
   {
-    D3D11_TEXTURE2D_DESC bridgeDesc =
-    {
-      .Width          = (UINT)d12Desc.Width,
-      .Height         = d12Desc.Height,
-      .MipLevels      = 1,
-      .ArraySize      = 1,
-      .Format         = d12Desc.Format,
-      .SampleDesc     = { .Count = 1, .Quality = 0 },
-      .Usage          = D3D11_USAGE_DEFAULT,
-      .BindFlags      = D3D11_BIND_SHADER_RESOURCE |
-                        (wgc_needsEncodeShader(this) && !d3d12Copy ?
-                          D3D11_BIND_UNORDERED_ACCESS : 0),
-      .CPUAccessFlags = 0,
-      .MiscFlags      = D3D11_RESOURCE_MISC_SHARED |
-                        D3D11_RESOURCE_MISC_SHARED_NTHANDLE
-    };
-
-    hr = ID3D11Device5_CreateTexture2D(*this->device, &bridgeDesc, NULL,
-      bridgeA);
-    if (FAILED(hr))
-    {
-      DEBUG_WINERROR("ivshmem-direct: CreateTexture2D bridgeA failed", hr);
-      comRef_scopePop();
-      return false;
-    }
-
-    if (wgc_needsEncodeShader(this) && d3d12Copy)
-    {
-      D3D11_TEXTURE2D_DESC encodeDesc = bridgeDesc;
-      encodeDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-      encodeDesc.MiscFlags = 0;
-      hr = ID3D11Device5_CreateTexture2D(*this->device, &encodeDesc, NULL,
-        bridgeB);
-      if (FAILED(hr))
-      {
-        DEBUG_WINERROR("ivshmem-d3d12-copy: CreateTexture2D encode "
-          "bridge failed", hr);
-        comRef_scopePop();
-        return false;
-      }
-    }
-
-    if (wgc_needsEncodeShader(this))
-    {
-      D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc =
-      {
-        .Format        = this->ivshmemFormat,
-        .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
-        .Texture2D     = { .MipSlice = 0 }
-      };
-      ID3D11Texture2D * uavTexture = d3d12Copy ? *bridgeB : *bridgeA;
-      hr = ID3D11Device5_CreateUnorderedAccessView(*this->device,
-        (ID3D11Resource *)uavTexture, &uavDesc, encodeUav);
-      if (FAILED(hr))
-      {
-        DEBUG_WINERROR("ivshmem-d3d12-copy: CreateUnorderedAccessView encode "
-          "bridge failed", hr);
-        comRef_scopePop();
-        return false;
-      }
-    }
-
-    comRef_defineLocal(IDXGIResource1, bridgeRes);
-    hr = ID3D11Texture2D_QueryInterface(*bridgeA, &IID_IDXGIResource1,
-      (void **)bridgeRes);
-    if (FAILED(hr))
-    {
-      DEBUG_WINERROR("ivshmem-direct: bridgeA QI IDXGIResource1 failed", hr);
-      comRef_scopePop();
-      return false;
-    }
-
-    HANDLE bridgeHandle = NULL;
-    hr = IDXGIResource1_CreateSharedHandle(*bridgeRes, NULL, GENERIC_ALL, NULL,
-      &bridgeHandle);
-    if (FAILED(hr))
-    {
-      DEBUG_WINERROR("ivshmem-direct: bridgeA CreateSharedHandle failed", hr);
-      comRef_scopePop();
-      return false;
-    }
-
-    if (d3d12Copy)
-    {
-      hr = ID3D12Device3_OpenSharedHandle(*this->d12device, bridgeHandle,
-        &IID_ID3D12Resource, (void **)bridge12);
-      CloseHandle(bridgeHandle);
-      if (FAILED(hr))
-      {
-        DEBUG_WINERROR("ivshmem-d3d12-copy: OpenSharedHandle bridge failed", hr);
-        comRef_scopePop();
-        return false;
-      }
-      wgc_setD3D12ObjectNameI((ID3D12Object *)*bridge12,
-        "WGC shared bridge texture ", frameIndex);
-    }
-    else
-    {
-      hr = ID3D11Device5_OpenSharedResource1(*this->on12Device, bridgeHandle,
-        &IID_ID3D11Texture2D, (void **)bridgeB);
-      CloseHandle(bridgeHandle);
-      if (FAILED(hr))
-      {
-        DEBUG_WINERROR("ivshmem-direct: OpenSharedResource1 bridgeB failed", hr);
-        comRef_scopePop();
-        return false;
-      }
-    }
+    DEBUG_WINERROR("ivshmem-d3d12-copy: bridgeA QI IDXGIResource1 failed", hr);
+    comRef_scopePop();
+    return false;
   }
+
+  HANDLE bridgeHandle = NULL;
+  hr = IDXGIResource1_CreateSharedHandle(*bridgeRes, NULL, GENERIC_ALL, NULL,
+    &bridgeHandle);
+  if (FAILED(hr))
+  {
+    DEBUG_WINERROR("ivshmem-d3d12-copy: bridgeA CreateSharedHandle failed", hr);
+    comRef_scopePop();
+    return false;
+  }
+
+  hr = ID3D12Device3_OpenSharedHandle(*this->d12device, bridgeHandle,
+    &IID_ID3D12Resource, (void **)bridge12);
+  CloseHandle(bridgeHandle);
+  if (FAILED(hr))
+  {
+    DEBUG_WINERROR("ivshmem-d3d12-copy: OpenSharedHandle bridge failed", hr);
+    comRef_scopePop();
+    return false;
+  }
+  wgc_setD3D12ObjectNameI((ID3D12Object *)*bridge12,
+    "WGC shared bridge texture ", frameIndex);
 
   comRef_toGlobal(frame->ivshmemD12Res, placed );
-  if (!d3d12Copy)
-    comRef_toGlobal(frame->texture, wrapped);
-  if (this->twoDeviceBridge)
-  {
-    comRef_toGlobal(frame->bridgeA, bridgeA);
-    comRef_toGlobal(frame->bridgeB, bridgeB);
-  }
+  comRef_toGlobal(frame->bridgeA , bridgeA );
   if (wgc_needsEncodeShader(this))
-    comRef_toGlobal(frame->encodeUav, encodeUav);
-  if (d3d12Copy)
   {
-    comRef_toGlobal(frame->bridgeA , bridgeA );
-    if (wgc_needsEncodeShader(this))
-      comRef_toGlobal(frame->bridgeB , bridgeB );
-    comRef_toGlobal(frame->bridge12, bridge12);
+    comRef_toGlobal(frame->bridgeB  , bridgeB  );
+    comRef_toGlobal(frame->encodeUav, encodeUav);
   }
+  comRef_toGlobal(frame->bridge12, bridge12);
   memcpy(&frame->format, srcDesc, sizeof(frame->format));
   if (packedYuv)
   {
@@ -4502,12 +4255,12 @@ static bool wgc_ensureFrame(WGCInstance * this, WGCFrameInfo * frame,
 {
   D3D11_TEXTURE2D_DESC srcDesc;
   ID3D11Texture2D_GetDesc(src, &srcDesc);
-  const bool ivshmemDirectSlot =
+  const bool ivshmemSlot =
     wgc_isIvshmemPublishMode(this->publishMode) &&
     frame != &this->frames[0];
-  const bool packedYuvSlot = ivshmemDirectSlot &&
+  const bool packedYuvSlot = ivshmemSlot &&
     wgc_isPackedYuvIvshmem(this);
-  const bool packedRgb10Slot = ivshmemDirectSlot &&
+  const bool packedRgb10Slot = ivshmemSlot &&
     wgc_isRGBA10PQIvshmem(this);
 
   if (frame->ready && (
@@ -4530,10 +4283,10 @@ static bool wgc_ensureFrame(WGCInstance * this, WGCFrameInfo * frame,
   if (wgc_frameHasResources(frame))
     wgc_releaseFrameResources(frame);
 
-  // IVSHMEM-direct path: only publish slots (not the accumulator) live in
+  // IVSHMEM path: only publish slots (not the accumulator) live in
   // IVSHMEM. Accumulator stays VRAM-local in this mode.
-  if (ivshmemDirectSlot)
-    return wgc_ensureFrameIvshmemDirect(this, frame, &srcDesc);
+  if (ivshmemSlot)
+    return wgc_ensureFrameIvshmem(this, frame, &srcDesc);
 
   D3D11_TEXTURE2D_DESC dstDesc =
   {
@@ -5009,32 +4762,6 @@ void wgc_setCaptureFormatHint(WGCInstance * this, unsigned format)
   this->captureFormatHint = (DXGI_FORMAT)format;
 }
 
-bool wgc_setIvshmemEnv(WGCInstance * this,
-  IUnknown * ivshmemHeap,
-  IUnknown * d11on12Device,
-  unsigned   width,
-  unsigned   height,
-  unsigned   format)
-{
-  if (!this || !ivshmemHeap || !d11on12Device)
-    return false;
-
-  const DXGI_FORMAT oldFormat = this->ivshmemFormat;
-  this->ivshmemHeap      = (ID3D12Heap *)ivshmemHeap;
-  this->d11on12Device    = (ID3D11On12Device *)d11on12Device;
-  this->ivshmemWidth     = width;
-  this->ivshmemHeight    = height;
-  this->ivshmemFormat    = (DXGI_FORMAT)format;
-  this->ivshmemEnvReady  = true;
-  this->publishMode      = WGC_PUBLISH_IVSHMEM_DIRECT;
-
-  DEBUG_INFO("wgc_setIvshmemEnv: %ux%u, format 0x%x", width, height,
-    (unsigned)this->ivshmemFormat);
-  if (oldFormat != this->ivshmemFormat)
-    wgc_invalidateNV12Shader(this);
-  return true;
-}
-
 bool wgc_setIvshmemD3D12CopyEnv(WGCInstance * this,
   IUnknown * ivshmemHeap,
   IUnknown * d3d12Queue,
@@ -5078,7 +4805,7 @@ bool wgc_setIvshmemSlot(WGCInstance * this,
   WGCFrameInfo * frame = &this->frames[slotIndex + 1];
   if (frame->ivshmemSlotReady && frame->ivshmemOffset != offset)
   {
-    // Offset changed for an already-ready slot. Drop the wrapped texture +
+    // Offset changed for an already-ready slot. Drop the placed resource +
     // bridges so wgc_ensureFrame recreates them at the new offset.
     if (wgc_frameHasResources(frame))
       wgc_releaseFrameResources(frame);
@@ -5183,21 +4910,14 @@ void wgc_releaseCpu(WGCInstance * this, void * token)
   wgc_releaseSlot(this, token);
 }
 
-// IVSHMEM-direct: WGC has already written pixels to IVSHMEM via the
-// D3D11On12-wrapped texture. The consumer doesn't need to map anything —
-// it just needs the metadata (dirty rects, dimensions) and to know which
-// IVSHMEM slot was written.
+// IVSHMEM GPU-publish: WGC has already written pixels to IVSHMEM via the
+// D3D12 copy queue. The consumer doesn't need to map anything — it just
+// needs the metadata (dirty rects, dimensions) and to know which IVSHMEM
+// slot was written.
 //
 // Returns the slot's ivshmem offset via *ivshmemOffset on success. width,
 // height, pitch describe the dimensions and row stride. The state machine
 // transitions are identical to wgc_fetchCpu — no Map/Unmap involved.
-//
-// Note: D3D11 CopyResource into a wrapped resource is queued on the D3D11
-// immediate context; it executes asynchronously on the GPU. Before the
-// CPU consumer reads the IVSHMEM bytes, we need a barrier. The
-// Acquire/Release in wgc_copyFrameTexture (publish path) inserts that
-// state transition; the GPU writes are visible after the
-// ReleaseWrappedResources + a Flush. For correctness we Flush here too.
 bool wgc_fetchIvshmemDirect(WGCInstance * this, unsigned frameBufferIndex,
   WGCFrameDesc * desc, uint64_t * ivshmemOffset,
   unsigned * pitch, unsigned * width, unsigned * height)
@@ -5221,14 +4941,10 @@ bool wgc_fetchIvshmemDirect(WGCInstance * this, unsigned frameBufferIndex,
   if (state == WGC_FRAME_READY && this->asyncCapture && this->handler)
     InterlockedIncrement(&this->handler->framesConsumed);
 
-  if (this->publishMode == WGC_PUBLISH_IVSHMEM_D3D12_COPY)
-    wgc_waitFrameD3D12Copy(this, frame);
+  wgc_waitFrameD3D12Copy(this, frame);
 
-  // Force any pending GPU writes from the D3D11On12 wrapped resource to
-  // commit. The Release in wgc_copyFrameTexture queued a state transition
-  // back to D3D12 ownership; the Flush guarantees the GPU executes it
-  // (and the prior CopyResource) before we tell the consumer the slot is
-  // ready.
+  // Force any pending GPU writes to commit before we tell the consumer the
+  // slot is ready.
   ID3D11DeviceContext4_Flush(*this->context);
 
   *ivshmemOffset = frame->ivshmemOffset;

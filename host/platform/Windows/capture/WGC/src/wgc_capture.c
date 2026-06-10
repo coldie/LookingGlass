@@ -32,7 +32,6 @@
 #include "d12.h"  // for D12 device helpers and shared D12 frame descriptors
 
 #include <d3d11.h>
-#include <d3d11on12.h>
 #include <d3d12.h>
 #include <dxgi1_2.h>
 #include <dxgi1_6.h>
@@ -52,7 +51,6 @@ typedef enum WGCCapturePublishMode
 {
   WGC_CAPTURE_PUBLISH_AUTO,
   WGC_CAPTURE_PUBLISH_CPU_STAGING,
-  WGC_CAPTURE_PUBLISH_IVSHMEM_DIRECT,
   WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY
 }
 WGCCapturePublishMode;
@@ -102,8 +100,8 @@ struct WGCCapture
   bool                     debugStats;
   int                      dirtyFullCopyPercent;
 
-  // IVSHMEM-direct mode state. Populated by wgc_capture_init when the user
-  // requests publishMode=ivshmem-direct (or auto, when supported on this
+  // IVSHMEM GPU-publish state. Populated by wgc_capture_init when the user
+  // requests publishMode=ivshmem-d3d12-copy (or auto, when supported on this
   // hardware). All NULL/zero in cpu-staging mode.
   WGCCapturePublishMode    publishMode;        // resolved at init
   WGCCapturePublishFormat  publishFormat;      // resolved publish encoding
@@ -116,9 +114,6 @@ struct WGCCapture
   ID3D12Device3          * d3d12Device;
   ID3D12CommandQueue     * d3d12Queue;
   ID3D12Heap             * ivshmemHeap;
-  ID3D11On12Device       * d11on12Device;
-  ID3D11Device           * d11Device;          // returned by D3D11On12CreateDevice
-  ID3D11DeviceContext    * d11Context;
   bool                     ivshmemSlotRegistered[LGMP_Q_FRAME_LEN];
 
   // resolved at first successful fetch
@@ -193,8 +188,8 @@ static void wgc_capture_initOptions(void)
     {
       .module         = "wgc",
       .name           = "publishMode",
-      .description    = "Publish path: auto|ivshmem-direct|ivshmem-d3d12-copy|cpu-staging "
-                        "(auto picks ivshmem-direct when supported)",
+      .description    = "Publish path: auto|ivshmem-d3d12-copy|cpu-staging "
+                        "(auto picks ivshmem-d3d12-copy when supported)",
       .type           = OPTION_TYPE_STRING,
       .value.x_string = "auto"
     },
@@ -580,30 +575,30 @@ static void wgc_capture_resolveEncoding(DXGI_COLOR_SPACE_TYPE colorSpace)
 
 static void wgc_capture_forcePublishModeForEncoding(void)
 {
-  if (this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ &&
-      this->publishMode != WGC_CAPTURE_PUBLISH_IVSHMEM_DIRECT &&
+  if ((this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ ||
+       this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_NV12 ||
+       this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_P010) &&
       this->publishMode != WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY)
   {
-    DEBUG_WARN("WGC RGBA10/PQ encoding currently requires "
-      "GPU IVSHMEM publish; forcing wgc:publishMode=ivshmem-d3d12-copy");
+    DEBUG_WARN("WGC %s encoding currently requires "
+      "GPU IVSHMEM publish; forcing wgc:publishMode=ivshmem-d3d12-copy",
+      wgc_capture_encodingName(this->publishFormat));
     this->publishMode = WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY;
   }
+}
 
-  if (this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_NV12 &&
-      this->publishMode != WGC_CAPTURE_PUBLISH_IVSHMEM_DIRECT &&
-      this->publishMode != WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY)
+// cpu-staging cannot transport the packed YUV / RGB10 encodings; downgrade
+// the publish format to BGRA8 when falling back to it.
+static void wgc_capture_fallbackToCpuStaging(void)
+{
+  this->publishMode = WGC_CAPTURE_PUBLISH_CPU_STAGING;
+  if (this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_NV12 ||
+      this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ ||
+      this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_P010)
   {
-    DEBUG_WARN("WGC NV12 encoding currently requires "
-      "GPU IVSHMEM publish; forcing wgc:publishMode=ivshmem-direct");
-    this->publishMode = WGC_CAPTURE_PUBLISH_IVSHMEM_DIRECT;
-  }
-  if (this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_P010 &&
-      this->publishMode != WGC_CAPTURE_PUBLISH_IVSHMEM_DIRECT &&
-      this->publishMode != WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY)
-  {
-    DEBUG_WARN("WGC P010 encoding currently requires "
-      "GPU IVSHMEM publish; forcing wgc:publishMode=ivshmem-d3d12-copy");
-    this->publishMode = WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY;
+    DEBUG_WARN("cpu-staging does not support packed YUV transport; "
+      "falling back to BGRA8");
+    this->publishFormat = WGC_CAPTURE_PUBLISH_FORMAT_BGRA8;
   }
 }
 
@@ -685,11 +680,9 @@ static bool wgc_capture_create(
     option_get_int("wgc", "dirtyFullCopyPercent");
   this->statsIntervalStart  = microtime();
 
-  // publishMode: auto / ivshmem-direct / ivshmem-d3d12-copy / cpu-staging
+  // publishMode: auto / ivshmem-d3d12-copy / cpu-staging
   const char * pm = option_get_string("wgc", "publishMode");
-  if      (pm && strcmp(pm, "ivshmem-direct") == 0)
-    this->publishMode = WGC_CAPTURE_PUBLISH_IVSHMEM_DIRECT;
-  else if (pm && strcmp(pm, "ivshmem-d3d12-copy") == 0)
+  if      (pm && strcmp(pm, "ivshmem-d3d12-copy") == 0)
     this->publishMode = WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY;
   else if (pm && strcmp(pm, "cpu-staging"   ) == 0)
     this->publishMode = WGC_CAPTURE_PUBLISH_CPU_STAGING;
@@ -1002,126 +995,15 @@ static bool ivshmemHeapTestTexture(ID3D12Device3 * device, ID3D12Heap * heap,
   return ID3D12Device3_GetDeviceRemovedReason(device) == S_OK;
 }
 
-// Set up the IVSHMEM-direct publish path: D3D12 device + queue, IVSHMEM
-// heap, format probe, D3D11On12 device, then wire wgc_setLoanedDevices +
-// wgc_setIvshmemEnv on the WGC backend.
+// Set up the IVSHMEM D3D12 copy publish path: D3D12 device + copy queue,
+// IVSHMEM heap, format probe, then wire wgc_setLoanedDevices +
+// wgc_setIvshmemD3D12CopyEnv on the WGC backend.
 //
-// Returns true on success (publishMode now committed to ivshmem-direct).
+// Returns true on success (publishMode now committed to ivshmem-d3d12-copy).
 // Returns false on any failure (caller falls back to cpu-staging).
 //
 // On failure the partial state is cleaned up so the cpu-staging fallback
 // has a clean slate.
-static bool setupIvshmemDirect(IDXGIAdapter1 * adapter,
-  unsigned width, unsigned height)
-{
-  if (!this->ivshmemBase)
-  {
-    DEBUG_WARN("ivshmem-direct: no ivshmem base address (init() called "
-      "with NULL?)");
-    return false;
-  }
-
-  if (!ensureDX12Loaded(this))
-    return false;
-
-  HRESULT hr = DX12.D3D12CreateDevice(
-    (IUnknown *)adapter,
-    D3D_FEATURE_LEVEL_12_0,
-    &IID_ID3D12Device3,
-    (void **)&this->d3d12Device);
-  if (FAILED(hr))
-  {
-    DEBUG_WINERROR("ivshmem-direct: D3D12CreateDevice failed", hr);
-    return false;
-  }
-
-  D3D12_COMMAND_QUEUE_DESC qDesc =
-  {
-    .Type     = D3D12_COMMAND_LIST_TYPE_DIRECT,
-    .Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH,
-    .Flags    = D3D12_COMMAND_QUEUE_FLAG_NONE
-  };
-  hr = ID3D12Device3_CreateCommandQueue(this->d3d12Device, &qDesc,
-    &IID_ID3D12CommandQueue, (void **)&this->d3d12Queue);
-  if (FAILED(hr))
-  {
-    DEBUG_WINERROR("ivshmem-direct: CreateCommandQueue failed", hr);
-    return false;
-  }
-
-  hr = ID3D12Device3_OpenExistingHeapFromAddress(this->d3d12Device,
-    this->ivshmemBase, &IID_ID3D12Heap, (void **)&this->ivshmemHeap);
-  if (FAILED(hr))
-  {
-    DEBUG_WARN("ivshmem-direct: OpenExistingHeapFromAddress failed (hr=0x%08lx)",
-      (unsigned long)hr);
-    return false;
-  }
-
-  const DXGI_FORMAT chosenFormat =
-    this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA16F
-      ? DXGI_FORMAT_R16G16B16A16_FLOAT
-    : this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ
-      ? DXGI_FORMAT_R8G8B8A8_UNORM
-      : this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_NV12
-      ? DXGI_FORMAT_R8G8B8A8_UNORM
-      : this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_P010
-      ? DXGI_FORMAT_R16G16B16A16_UINT
-      : DXGI_FORMAT_B8G8R8A8_UNORM;
-
-  if (!ivshmemHeapTestTexture(this->d3d12Device, this->ivshmemHeap, chosenFormat))
-  {
-    DEBUG_WARN("ivshmem-direct: ROW_MAJOR TEXTURE2D + format 0x%x not "
-      "supported in IVSHMEM heap", (unsigned)chosenFormat);
-    return false;
-  }
-
-  // D3D11On12 device — gives us a D3D11 device + context bound to the
-  // D3D12 device. WGC backend uses this loaned D3D11 (instead of creating
-  // its own) so the wrapped textures are usable from its context.
-  IUnknown * queues[] = { (IUnknown *)this->d3d12Queue };
-  D3D_FEATURE_LEVEL fl;
-  hr = D3D11On12CreateDevice(
-    (IUnknown *)this->d3d12Device,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT |
-      (this->debug ? D3D11_CREATE_DEVICE_DEBUG : 0),
-    NULL, 0,
-    queues, 1,
-    0,
-    &this->d11Device, &this->d11Context, &fl);
-  if (FAILED(hr))
-  {
-    DEBUG_WINERROR("ivshmem-direct: D3D11On12CreateDevice failed", hr);
-    return false;
-  }
-  hr = ID3D11Device_QueryInterface(this->d11Device,
-    &IID_ID3D11On12Device, (void **)&this->d11on12Device);
-  if (FAILED(hr))
-  {
-    DEBUG_WINERROR("ivshmem-direct: QueryInterface ID3D11On12Device failed", hr);
-    return false;
-  }
-
-  wgc_setLoanedDevices(this->wgc,
-    (IUnknown *)this->d11Device,
-    (IUnknown *)this->d11Context,
-    (IUnknown *)this->d3d12Device);
-
-  if (!wgc_setIvshmemEnv(this->wgc,
-        (IUnknown *)this->ivshmemHeap,
-        (IUnknown *)this->d11on12Device,
-        width, height,
-        (unsigned)chosenFormat))
-  {
-    DEBUG_ERROR("ivshmem-direct: wgc_setIvshmemEnv failed");
-    return false;
-  }
-
-  DEBUG_INFO("ivshmem-direct: ready (%ux%u, format 0x%x)",
-    width, height, (unsigned)chosenFormat);
-  return true;
-}
-
 static bool setupIvshmemD3D12Copy(IDXGIAdapter1 * adapter,
   unsigned width, unsigned height)
 {
@@ -1204,13 +1086,10 @@ static bool setupIvshmemD3D12Copy(IDXGIAdapter1 * adapter,
   return true;
 }
 
-// Tear down whatever setupIvshmemDirect created. Safe to call even on
+// Tear down whatever setupIvshmemD3D12Copy created. Safe to call even on
 // partial setup (NULL-checks each pointer).
-static void teardownIvshmemDirect(void)
+static void teardownIvshmemD3D12Copy(void)
 {
-  if (this->d11on12Device) { ID3D11On12Device_Release(this->d11on12Device); this->d11on12Device = NULL; }
-  if (this->d11Context   ) { ID3D11DeviceContext_Release(this->d11Context  ); this->d11Context    = NULL; }
-  if (this->d11Device    ) { ID3D11Device_Release(this->d11Device    );       this->d11Device     = NULL; }
   if (this->ivshmemHeap  ) { ID3D12Heap_Release(this->ivshmemHeap   );        this->ivshmemHeap   = NULL; }
   if (this->d3d12Queue   ) { ID3D12CommandQueue_Release(this->d3d12Queue   ); this->d3d12Queue    = NULL; }
   if (this->d3d12Device  ) { ID3D12Device3_Release(this->d3d12Device  );      this->d3d12Device   = NULL; }
@@ -1224,7 +1103,7 @@ static bool wgc_capture_init(void * ivshmemBase, unsigned * alignSize)
   if (!wgc_capture_ensureInstance())
     return false;
 
-  // Stash for setupIvshmemDirect to use later
+  // Stash for setupIvshmemD3D12Copy to use later
   this->ivshmemBase = ivshmemBase;
 
   IDXGIFactory2 * factory = NULL;
@@ -1259,9 +1138,8 @@ static bool wgc_capture_init(void * ivshmemBase, unsigned * alignSize)
       (unsigned)DXGI_FORMAT_R16G16B16A16_FLOAT);
 
   // Try GPU-to-IVSHMEM setup if the user requested it (or auto). On failure
-  // we fall back to the next publish path.
+  // we fall back to cpu-staging.
   if (this->publishMode == WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY ||
-      this->publishMode == WGC_CAPTURE_PUBLISH_IVSHMEM_DIRECT ||
       this->publishMode == WGC_CAPTURE_PUBLISH_AUTO)
   {
     DXGI_OUTPUT_DESC outputDesc;
@@ -1270,89 +1148,27 @@ static bool wgc_capture_init(void * ivshmemBase, unsigned * alignSize)
       const RECT r = outputDesc.DesktopCoordinates;
       const unsigned w = (unsigned)(r.right  - r.left);
       const unsigned h = (unsigned)(r.bottom - r.top );
-      if ((this->publishMode == WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY ||
-           this->publishMode == WGC_CAPTURE_PUBLISH_AUTO) &&
-          setupIvshmemD3D12Copy(adapter, w, h))
+      if (setupIvshmemD3D12Copy(adapter, w, h))
       {
         this->publishMode = WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY;
-        D3D12_HEAP_DESC hd = ID3D12Heap_GetDesc(this->ivshmemHeap);
-        if (hd.Alignment > *alignSize)
-          *alignSize = (unsigned)hd.Alignment;
-      }
-      else
-      {
-        const bool explicitD3D12Copy =
-          this->publishMode == WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY;
-        teardownIvshmemDirect();
-        if (explicitD3D12Copy)
-        {
-          DEBUG_WARN("ivshmem-d3d12-copy: setup failed, falling back to cpu-staging");
-          this->publishMode = WGC_CAPTURE_PUBLISH_CPU_STAGING;
-          if (this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_NV12 ||
-              this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ ||
-              this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_P010)
-          {
-            DEBUG_WARN("cpu-staging does not support packed YUV transport; "
-              "falling back to BGRA8");
-            this->publishFormat = WGC_CAPTURE_PUBLISH_FORMAT_BGRA8;
-          }
-        }
-      }
-
-      if (this->publishMode != WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY &&
-          (this->publishMode == WGC_CAPTURE_PUBLISH_IVSHMEM_DIRECT ||
-           this->publishMode == WGC_CAPTURE_PUBLISH_AUTO) &&
-          setupIvshmemDirect(adapter, w, h))
-      {
-        // ivshmem-direct committed
-        this->publishMode = WGC_CAPTURE_PUBLISH_IVSHMEM_DIRECT;
         // align IVSHMEM allocations to D3D12 placed-resource alignment so
         // each FrameBuffer.data lands at an offset suitable for placement
         D3D12_HEAP_DESC hd = ID3D12Heap_GetDesc(this->ivshmemHeap);
         if (hd.Alignment > *alignSize)
           *alignSize = (unsigned)hd.Alignment;
       }
-      else if (this->publishMode != WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY &&
-               this->publishMode != WGC_CAPTURE_PUBLISH_IVSHMEM_DIRECT)
+      else
       {
-        teardownIvshmemDirect();
-        this->publishMode = WGC_CAPTURE_PUBLISH_CPU_STAGING;
-        if (this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_NV12 ||
-            this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ ||
-            this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_P010)
-        {
-          DEBUG_WARN("cpu-staging does not support packed YUV transport; "
-            "falling back to BGRA8");
-          this->publishFormat = WGC_CAPTURE_PUBLISH_FORMAT_BGRA8;
-        }
-      }
-      else if (this->publishMode == WGC_CAPTURE_PUBLISH_IVSHMEM_DIRECT)
-      {
-        teardownIvshmemDirect();
-        DEBUG_WARN("ivshmem-direct: setup failed, falling back to cpu-staging");
-        this->publishMode = WGC_CAPTURE_PUBLISH_CPU_STAGING;
-        if (this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_NV12 ||
-            this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ ||
-            this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_P010)
-        {
-          DEBUG_WARN("cpu-staging does not support packed YUV transport; "
-            "falling back to BGRA8");
-          this->publishFormat = WGC_CAPTURE_PUBLISH_FORMAT_BGRA8;
-        }
+        teardownIvshmemD3D12Copy();
+        DEBUG_WARN("ivshmem-d3d12-copy: setup failed, falling back to "
+          "cpu-staging");
+        wgc_capture_fallbackToCpuStaging();
       }
     }
     else
     {
       DEBUG_WARN("Could not query output desc; falling back to cpu-staging");
-      this->publishMode = WGC_CAPTURE_PUBLISH_CPU_STAGING;
-      if (this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_NV12 ||
-          this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ ||
-          this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_P010)
-      {
-        DEBUG_WARN("cpu-staging does not support packed YUV transport; "
-          "falling back to BGRA8");
-        this->publishFormat = WGC_CAPTURE_PUBLISH_FORMAT_BGRA8;
-      }
+      wgc_capture_fallbackToCpuStaging();
     }
   }
 
@@ -1386,11 +1202,11 @@ static bool wgc_capture_deinit(void)
   this->mapped      = NULL;
   this->frameMapped = false;
 
-  // Tear down ivshmem-direct state BEFORE the WGC instance is freed —
+  // Tear down the IVSHMEM publish state BEFORE the WGC instance is freed —
   // wgc_freeInstance happens in wgc_capture_free, but the loaned devices
   // we hand the WGC backend are owned here and the backend stops touching
   // them after wgc_deinitInstance returns.
-  teardownIvshmemDirect();
+  teardownIvshmemD3D12Copy();
 
   if (this->output  && *this->output ) { IDXGIOutput_Release  (*this->output ); *this->output  = NULL; }
   if (this->adapter && *this->adapter) { IDXGIAdapter1_Release(*this->adapter); *this->adapter = NULL; }
@@ -1430,11 +1246,10 @@ static void wgc_capture_free(void)
 static CaptureResult wgc_capture_capture(unsigned frameBufferIndex,
   FrameBuffer * frame)
 {
-  // In IVSHMEM GPU-publish modes, register this frameBuffer's IVSHMEM offset on
+  // In IVSHMEM GPU-publish mode, register this frameBuffer's IVSHMEM offset on
   // first capture for this index. After that, WGC writes pixel data
   // directly into IVSHMEM at this offset.
-  if ((this->publishMode == WGC_CAPTURE_PUBLISH_IVSHMEM_DIRECT ||
-       this->publishMode == WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY) &&
+  if (this->publishMode == WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY &&
       frameBufferIndex < LGMP_Q_FRAME_LEN &&
       !this->ivshmemSlotRegistered[frameBufferIndex] &&
       frame)
@@ -1476,7 +1291,6 @@ static CaptureResult wgc_capture_waitFrame(unsigned frameBufferIndex,
   const uint64_t readbackStart = microtime();
 
   const bool gpuPublish =
-    this->publishMode == WGC_CAPTURE_PUBLISH_IVSHMEM_DIRECT ||
     this->publishMode == WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY;
   bool fetched;
   if (gpuPublish)
@@ -1628,8 +1442,7 @@ static CaptureResult wgc_capture_getFrame(unsigned frameBufferIndex,
   // slot's offset (and Flush in wgc_fetchIvshmemDirect committed the GPU
   // work). All we need to do is signal write-pointer completion and
   // release the slot back to the WGC backend.
-  if (this->publishMode == WGC_CAPTURE_PUBLISH_IVSHMEM_DIRECT ||
-      this->publishMode == WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY)
+  if (this->publishMode == WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY)
   {
     framebuffer_set_write_ptr(frame, (uint32_t)((size_t)this->pitch * this->dataHeight));
     wgc_releaseIvshmemDirect(this->wgc, this->desc.backendToken);

@@ -35,18 +35,10 @@ typedef enum WGCPublishMode
   // memcpy directly into IVSHMEM.
   WGC_PUBLISH_CPU_STAGING,
 
-  // Publish slot is a ROW_MAJOR TEXTURE2D placed in the IVSHMEM heap,
-  // wrapped as an ID3D11Texture2D via D3D11On12. WGC's D3D11 CopyResource
-  // writes directly into IVSHMEM. The consumer reads from the same memory
-  // (no map, no second copy). Requires the host to have set up the IVSHMEM
-  // heap and a D3D11On12 device via wgc_setIvshmemTarget before
-  // wgc_initInstance.
-  WGC_PUBLISH_IVSHMEM_DIRECT,
-
   // Publish slot is a ROW_MAJOR TEXTURE2D placed in the IVSHMEM heap.
   // WGC first copies into a shared D3D11 bridge texture; that same bridge is
   // opened as an ID3D12Resource and copied into IVSHMEM by a native D3D12
-  // copy queue. This avoids the D3D11On12 bridge->IVSHMEM CopyResource path.
+  // copy queue.
   WGC_PUBLISH_IVSHMEM_D3D12_COPY
 }
 WGCPublishMode;
@@ -85,9 +77,8 @@ void wgc_setPointerCallbacks(WGCInstance * this,
   CapturePostPointerBuffer postFn);
 
 // Provide loaned D3D11 / D3D12 devices for the WGC backend to use instead
-// of creating its own. Required for WGC_PUBLISH_IVSHMEM_DIRECT (the
-// D3D11On12 device is the only D3D11 device whose context can write to
-// wrapped resources).
+// of creating its own. Required for WGC_PUBLISH_IVSHMEM_D3D12_COPY (the
+// D3D12 device must match the one that opened the IVSHMEM heap).
 //
 // Caller retains ownership and must keep the devices alive for the WGC
 // instance's lifetime. Must be called BEFORE wgc_initInstance.
@@ -103,23 +94,16 @@ void wgc_setLoanedDevices(WGCInstance * this,
 // them before publishing.
 void wgc_setCaptureFormatHint(WGCInstance * this, unsigned format);
 
-// Configure the IVSHMEM-direct publish environment. Must be called BEFORE
-// wgc_initInstance when publishMode is WGC_PUBLISH_IVSHMEM_DIRECT.
+// Configure the IVSHMEM publish environment. Must be called BEFORE
+// wgc_initInstance when publishMode is WGC_PUBLISH_IVSHMEM_D3D12_COPY.
 //
 // Per-slot IVSHMEM offsets are registered lazily via wgc_setIvshmemSlot —
 // the caller typically learns them on first iface->capture() after app.c
 // has allocated its FrameBuffer regions. wgc_ensureFrame fails for any
 // publish slot whose offset has not been registered yet.
 //
-// Caller retains ownership of `ivshmemHeap` and `d11on12Device`; they must
-// outlive the WGCInstance.
-bool wgc_setIvshmemEnv(WGCInstance * this,
-  IUnknown * ivshmemHeap,    // ID3D12Heap*
-  IUnknown * d11on12Device,  // ID3D11On12Device*
-  unsigned   width,
-  unsigned   height,
-  unsigned   format);        // DXGI_FORMAT value
-
+// Caller retains ownership of `ivshmemHeap`; it must outlive the
+// WGCInstance.
 bool wgc_setIvshmemD3D12CopyEnv(WGCInstance * this,
   IUnknown * ivshmemHeap,    // ID3D12Heap*
   IUnknown * d3d12Queue,     // ID3D12CommandQueue*
@@ -153,8 +137,8 @@ bool wgc_fetchCpu(WGCInstance * this, unsigned frameBufferIndex,
 
 void wgc_releaseCpu(WGCInstance * this, void * token);
 
-// IVSHMEM-direct consumer side. WGC has written the frame bytes directly
-// into IVSHMEM at *ivshmemOffset; no map needed. Issues a Flush to make
+// IVSHMEM GPU-publish consumer side. WGC has written the frame bytes
+// directly into IVSHMEM at *ivshmemOffset; no map needed. Issues a Flush to make
 // sure the GPU writes have committed before the caller signals the
 // consumer. desc->backendToken must be passed back to wgc_releaseIvshmemDirect.
 bool wgc_fetchIvshmemDirect(WGCInstance * this, unsigned frameBufferIndex,
