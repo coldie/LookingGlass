@@ -322,13 +322,6 @@ static struct Option egl_options[] =
     .type         = OPTION_TYPE_BOOL,
     .value.x_bool = false,
   },
-  {
-    .module       = "egl",
-    .name         = "debugRGBA10",
-    .description  = "Log raw RGBA10 frame samples for HDR diagnostics",
-    .type         = OPTION_TYPE_BOOL,
-    .value.x_bool = false,
-  },
 #endif
 
   {0}

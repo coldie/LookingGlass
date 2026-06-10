@@ -160,7 +160,6 @@ struct EGL_Desktop
   int   hdrViewMode;
 #ifdef ENABLE_HDR_DIAGNOSTICS
   bool  debugP010;
-  bool  debugRGBA10;
   bool  p010ScreenshotDone;
   int   p010ScreenshotDelay;
   bool  desktopScreenshotDone;
@@ -325,7 +324,6 @@ bool egl_desktopInit(EGL * egl, EGL_Desktop ** desktop_, EGLDisplay * display,
     egl_parseHDRViewMode(option_get_string("egl", "hdrView"));
 #ifdef ENABLE_HDR_DIAGNOSTICS
   desktop->debugP010    = option_get_bool("egl", "debugP010");
-  desktop->debugRGBA10  = option_get_bool("egl", "debugRGBA10");
   desktop->p010ScreenshotDelay = option_get_int("egl", "p010ScreenshotDelay");
   desktop->p010ScreenshotDone = false;
   desktop->desktopScreenshotDelay =
@@ -501,102 +499,6 @@ static void egl_desktopLogP010Samples(
     len += snprintf(msg + len, sizeof(msg) - (size_t)len,
       " UV[%u,%u]=%u/%u", x, uvY,
       egl_p010ReadSample(frame, uOff), egl_p010ReadSample(frame, vOff));
-  }
-
-  DEBUG_INFO("%s", msg);
-}
-
-static uint32_t egl_rgba10ReadSample(const FrameBuffer * frame, size_t offset)
-{
-  uint32_t value = 0;
-  if (!framebuffer_wait(frame, offset + sizeof(value)))
-    return 0;
-  memcpy(&value, framebuffer_get_buffer(frame) + offset, sizeof(value));
-  return value;
-}
-
-static void egl_desktopLogRGBA10Samples(
-  const EGL_Desktop * desktop, const FrameBuffer * frame)
-{
-  static uint64_t lastLog = 0;
-  const uint64_t now = microtime();
-  if (now - lastLog < 1000 * 1000)
-    return;
-  lastLog = now;
-
-  const size_t pitch = desktop->format.pitch;
-  const unsigned width = desktop->format.frameWidth;
-  const unsigned height = desktop->format.frameHeight;
-  const unsigned xs[5] = {
-    0,
-    width / 4,
-    width / 2,
-    (width * 3) / 4,
-    width ? width - 1 : 0
-  };
-  const unsigned ys[3] = {
-    0,
-    height / 2,
-    height ? height - 1 : 0
-  };
-
-  uint32_t minR = UINT32_MAX, minG = UINT32_MAX, minB = UINT32_MAX;
-  uint32_t maxR = 0, maxG = 0, maxB = 0;
-  uint64_t sumR = 0, sumG = 0, sumB = 0;
-  unsigned samples = 0;
-  unsigned nonzero = 0;
-
-  for(unsigned y = 0; y < height; y += max(1u, height / 36))
-  {
-    for(unsigned x = 0; x < width; x += max(1u, width / 64))
-    {
-      const uint32_t px = egl_rgba10ReadSample(frame,
-        (size_t)y * pitch + (size_t)x * 4);
-      const uint32_t r =  px        & 0x3ffu;
-      const uint32_t g = (px >> 10) & 0x3ffu;
-      const uint32_t b = (px >> 20) & 0x3ffu;
-
-      minR = min(minR, r);
-      minG = min(minG, g);
-      minB = min(minB, b);
-      maxR = max(maxR, r);
-      maxG = max(maxG, g);
-      maxB = max(maxB, b);
-      sumR += r;
-      sumG += g;
-      sumB += b;
-      nonzero += (r | g | b) != 0;
-      ++samples;
-    }
-  }
-
-  char msg[768];
-  int len = snprintf(msg, sizeof(msg),
-    "RGBA10 raw samples pitch:%zu stride:%u size:%ux%u "
-    "R:%u/%" PRIu64 "/%u G:%u/%" PRIu64 "/%u B:%u/%" PRIu64 "/%u "
-    "nonzero:%u/%u",
-    pitch, desktop->format.stride, width, height,
-    minR == UINT32_MAX ? 0 : minR, samples ? sumR / samples : 0, maxR,
-    minG == UINT32_MAX ? 0 : minG, samples ? sumG / samples : 0, maxG,
-    minB == UINT32_MAX ? 0 : minB, samples ? sumB / samples : 0, maxB,
-    nonzero, samples);
-
-  for(unsigned yi = 0; yi < ARRAY_LENGTH(ys) && len < (int)sizeof(msg); ++yi)
-  {
-    const unsigned y = ys[yi];
-    for(unsigned xi = 0; xi < ARRAY_LENGTH(xs) && len < (int)sizeof(msg); ++xi)
-    {
-      const unsigned x = xs[xi];
-      const uint32_t px = egl_rgba10ReadSample(frame,
-        (size_t)y * pitch + (size_t)x * 4);
-      len += snprintf(msg + len, sizeof(msg) - (size_t)len,
-        " P[%u,%u]=0x%08" PRIx32 "(%u,%u,%u,%u)",
-        x, y, px,
-        px & 0x3ffu,
-        (px >> 10) & 0x3ffu,
-        (px >> 20) & 0x3ffu,
-        (px >> 30) & 0x3u);
-    }
   }
 
   DEBUG_INFO("%s", msg);
@@ -1025,11 +927,6 @@ bool egl_desktopUpdate(EGL_Desktop * desktop, const FrameBuffer * frame, int dma
     desktop->format.type == FRAME_TYPE_P010 ||
     desktop->format.type == FRAME_TYPE_YUY2 ||
     desktop->format.type == FRAME_TYPE_UYVY;
-
-#ifdef ENABLE_HDR_DIAGNOSTICS
-  if (desktop->debugRGBA10 && desktop->format.type == FRAME_TYPE_RGBA10)
-    egl_desktopLogRGBA10Samples(desktop, frame);
-#endif
 
   if (likely(desktop->useDMA && dmaFd >= 0 && !yuvFrame))
   {

@@ -507,7 +507,6 @@ struct WGCInstance
   unsigned            ivshmemWidth;
   unsigned            ivshmemHeight;
   DXGI_FORMAT         ivshmemFormat;
-  DXGI_FORMAT         captureFormatHint;
   uint64_t            ivshmemSlotSize;
   bool                ivshmemEnvReady;
 
@@ -705,7 +704,6 @@ static void wgc_waitCallbacks(WGCFrameEventHandler * handler);
 static bool wgc_isIvshmemPublishMode(WGCPublishMode mode);
 static bool wgc_isNV12PackedIvshmem(const WGCInstance * this);
 static bool wgc_isP010PackedIvshmem(const WGCInstance * this);
-static bool wgc_isRGBA10PQIvshmem(const WGCInstance * this);
 static bool wgc_isPackedYuvIvshmem(const WGCInstance * this);
 static bool wgc_needsEncodeShader(const WGCInstance * this);
 static bool wgc_colorSpaceIsHDR(DXGI_COLOR_SPACE_TYPE colorSpace);
@@ -2170,8 +2168,6 @@ static bool wgc_createFramePool(WGCInstance * this)
   const bool hdrSource = wgc_colorSpaceIsHDR(this->colorSpace);
   const bool hdrCapablePublish =
     this->ivshmemFormat == DXGI_FORMAT_R16G16B16A16_FLOAT ||
-    wgc_isRGBA10PQIvshmem(this) ||
-    this->captureFormatHint == DXGI_FORMAT_R16G16B16A16_FLOAT ||
     wgc_isPackedYuvIvshmem(this);
   const DirectXPixelFormat poolFormat =
     (hdrSource && hdrCapablePublish) ?
@@ -2817,19 +2813,12 @@ static void wgc_copyFrameTextureRectCtx(ID3D11DeviceContext4 * ctx,
 
 static bool wgc_isNV12PackedIvshmem(const WGCInstance * this)
 {
-  return this->ivshmemFormat == DXGI_FORMAT_R8G8B8A8_UNORM &&
-    !wgc_isRGBA10PQIvshmem(this);
+  return this->ivshmemFormat == DXGI_FORMAT_R8G8B8A8_UNORM;
 }
 
 static bool wgc_isP010PackedIvshmem(const WGCInstance * this)
 {
   return this->ivshmemFormat == DXGI_FORMAT_R16G16B16A16_UINT;
-}
-
-static bool wgc_isRGBA10PQIvshmem(const WGCInstance * this)
-{
-  return this->ivshmemFormat == DXGI_FORMAT_R8G8B8A8_UNORM &&
-    this->captureFormatHint == DXGI_FORMAT_R16G16B16A16_FLOAT;
 }
 
 static bool wgc_isPackedYuvIvshmem(const WGCInstance * this)
@@ -2839,7 +2828,7 @@ static bool wgc_isPackedYuvIvshmem(const WGCInstance * this)
 
 static bool wgc_needsEncodeShader(const WGCInstance * this)
 {
-  return wgc_isPackedYuvIvshmem(this) || wgc_isRGBA10PQIvshmem(this);
+  return wgc_isPackedYuvIvshmem(this);
 }
 
 typedef struct WGCEncodeShaderConsts
@@ -2892,7 +2881,6 @@ static DXGI_FORMAT wgc_expectedSourceFormat(WGCInstance * this)
   const bool hdrSource = wgc_colorSpaceIsHDR(this->colorSpace);
   const bool hdrCapablePublish =
     this->ivshmemFormat == DXGI_FORMAT_R16G16B16A16_FLOAT ||
-    this->captureFormatHint == DXGI_FORMAT_R16G16B16A16_FLOAT ||
     wgc_isPackedYuvIvshmem(this);
 
   return (hdrSource && hdrCapablePublish) ?
@@ -2913,7 +2901,6 @@ static unsigned wgc_nv12EncodedWidth(unsigned width)
 static bool wgc_ensureNV12Shader(WGCInstance * this)
 {
   const bool pqPreserve = wgc_isP010PackedIvshmem(this);
-  const bool rgb10PQ = wgc_isRGBA10PQIvshmem(this);
   const bool hdrToneMap = !pqPreserve && wgc_colorSpaceIsHDR(this->colorSpace);
 
   if (this->nv12Shader && this->nv12ShaderStateValid &&
@@ -2957,19 +2944,6 @@ static bool wgc_ensureNV12Shader(WGCInstance * this)
     "  return (uint)floor(saturate(v) * 65535.0 + 0.5);\n"
     "}\n"
     "\n"
-    "uint pack10(float v)\n"
-    "{\n"
-    "  return (uint)floor(saturate(v) * 1023.0 + 0.5);\n"
-    "}\n"
-    "\n"
-    "float4 packRGBA10Bytes(float3 rgb)\n"
-    "{\n"
-    "  uint packed = pack10(rgb.r) | (pack10(rgb.g) << 10) |\n"
-    "    (pack10(rgb.b) << 20) | (3u << 30);\n"
-    "  return float4(packed & 255u, (packed >> 8) & 255u,\n"
-    "    (packed >> 16) & 255u, (packed >> 24) & 255u) / 255.0;\n"
-    "}\n"
-    "\n"
     "void writePacked(uint2 p, float4 v)\n"
     "{\n"
     "#if WGC_HDR_PQ_PRESERVE\n"
@@ -2986,7 +2960,7 @@ static bool wgc_ensureNV12Shader(WGCInstance * this)
     "\n"
     "float3 prepareRgb(float3 rgb)\n"
     "{\n"
-    "#if WGC_HDR_PQ_PRESERVE || WGC_HDR_RGB10PQ\n"
+    "#if WGC_HDR_PQ_PRESERVE\n"
     "  float3 linear2020;\n"
     "  linear2020.r = dot(rgb, float3(0.6274039, 0.3292829, 0.0433131));\n"
     "  linear2020.g = dot(rgb, float3(0.0690973, 0.9195404, 0.0113622));\n"
@@ -3029,13 +3003,6 @@ static bool wgc_ensureNV12Shader(WGCInstance * this)
     "{\n"
     "  uint srcW, srcH;\n"
     "  srcTex.GetDimensions(srcW, srcH);\n"
-    "#if WGC_HDR_RGB10PQ\n"
-    "  uint2 p = dt.xy + origin;\n"
-    "  if (p.x >= srcW || p.y >= srcH)\n"
-    "    return;\n"
-    "  dstTex[p] = packRGBA10Bytes(prepareRgb(bgraToRgb(srcTex[p])));\n"
-    "  return;\n"
-    "#endif\n"
     "  uint2 p0 = uint2(dt.x * 4, dt.y * 2) + origin;\n"
     "  if (p0.x >= srcW || p0.y >= srcH)\n"
     "    return;\n"
@@ -3102,7 +3069,6 @@ static bool wgc_ensureNV12Shader(WGCInstance * this)
   {
     { "WGC_HDR_TONEMAP", hdrToneMap ? "1" : "0" },
     { "WGC_HDR_PQ_PRESERVE", pqPreserve ? "1" : "0" },
-    { "WGC_HDR_RGB10PQ", rgb10PQ ? "1" : "0" },
     { NULL, NULL }
   };
   hr = D3DCompile(shaderCode, strlen(shaderCode),
@@ -3146,112 +3112,14 @@ static bool wgc_ensureNV12Shader(WGCInstance * this)
   this->nv12ShaderColorSpace    = this->colorSpace;
   this->nv12ShaderIvshmemFormat = this->ivshmemFormat;
   DEBUG_INFO("WGC encode shader ready "
-    "(hdrToneMap:%d pqPreserve:%d rgb10PQ:%d colorSpace:0x%x format:0x%x)",
-    hdrToneMap, pqPreserve, rgb10PQ, (unsigned)this->colorSpace,
+    "(hdrToneMap:%d pqPreserve:%d colorSpace:0x%x format:0x%x)",
+    hdrToneMap, pqPreserve, (unsigned)this->colorSpace,
     (unsigned)this->ivshmemFormat);
   result = true;
 
 exit:
   comRef_scopePop();
   return result;
-}
-
-static void wgc_logRGBA10PQTextureSample(WGCInstance * this,
-  ID3D11Texture2D * texture, const char * label)
-{
-  D3D11_TEXTURE2D_DESC desc;
-  ID3D11Texture2D_GetDesc(texture, &desc);
-  desc.BindFlags      = 0;
-  desc.MiscFlags      = 0;
-  desc.Usage          = D3D11_USAGE_STAGING;
-  desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-
-  ID3D11Texture2D * staging = NULL;
-  HRESULT hr = ID3D11Device5_CreateTexture2D(*this->device, &desc, NULL,
-    &staging);
-  if (FAILED(hr))
-  {
-    DEBUG_WINERROR("Create WGC RGBA10PQ staging failed", hr);
-    return;
-  }
-
-  ID3D11DeviceContext4_CopyResource(*this->context,
-    (ID3D11Resource *)staging, (ID3D11Resource *)texture);
-
-  D3D11_MAPPED_SUBRESOURCE mapped;
-  hr = ID3D11DeviceContext4_Map(*this->context,
-    (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &mapped);
-  if (FAILED(hr))
-  {
-    DEBUG_WINERROR("Map WGC RGBA10PQ staging failed", hr);
-    ID3D11Texture2D_Release(staging);
-    return;
-  }
-
-  uint16_t minR = UINT16_MAX, minG = UINT16_MAX, minB = UINT16_MAX;
-  uint16_t maxR = 0, maxG = 0, maxB = 0;
-  uint64_t sumR = 0, sumG = 0, sumB = 0;
-  uint32_t firstPacked = 0, centerPacked = 0, maxPacked = 0;
-  unsigned nonzero = 0;
-  unsigned samples = 0;
-
-  const unsigned stepY = max(1u, desc.Height / 36);
-  const unsigned stepX = max(1u, desc.Width  / 64);
-  for(unsigned y = 0; y < desc.Height; y += stepY)
-  {
-    const uint8_t * row = (const uint8_t *)mapped.pData +
-      (size_t)y * mapped.RowPitch;
-    for(unsigned x = 0; x < desc.Width; x += stepX)
-    {
-      const uint8_t * px = row + (size_t)x * 4;
-      const uint32_t packed =
-        (uint32_t)px[0] |
-        ((uint32_t)px[1] << 8) |
-        ((uint32_t)px[2] << 16) |
-        ((uint32_t)px[3] << 24);
-      const uint16_t r =  packed        & 0x3ffu;
-      const uint16_t g = (packed >> 10) & 0x3ffu;
-      const uint16_t b = (packed >> 20) & 0x3ffu;
-      if (!samples)
-        firstPacked = packed;
-      if (r || g || b)
-      {
-        ++nonzero;
-        maxPacked = packed;
-      }
-      minR = min(minR, r); minG = min(minG, g); minB = min(minB, b);
-      maxR = max(maxR, r); maxG = max(maxG, g); maxB = max(maxB, b);
-      sumR += r; sumG += g; sumB += b;
-      ++samples;
-    }
-  }
-
-  if (desc.Width && desc.Height)
-  {
-    const uint8_t * row = (const uint8_t *)mapped.pData +
-      (size_t)(desc.Height / 2) * mapped.RowPitch;
-    const uint8_t * px = row + (size_t)(desc.Width / 2) * 4;
-    centerPacked =
-      (uint32_t)px[0] |
-      ((uint32_t)px[1] << 8) |
-      ((uint32_t)px[2] << 16) |
-      ((uint32_t)px[3] << 24);
-  }
-
-  DEBUG_INFO("WGC RGBA10PQ %s samples rowPitch:%u size:%ux%u "
-    "R:min/avg/max:%u/%" PRIu64 "/%u "
-    "G:min/avg/max:%u/%" PRIu64 "/%u "
-    "B:min/avg/max:%u/%" PRIu64 "/%u nonzero:%u/%u "
-    "first:0x%08x center:0x%08x lastNonzero:0x%08x",
-    label, mapped.RowPitch, desc.Width, desc.Height,
-    minR == UINT16_MAX ? 0 : minR, samples ? sumR / samples : 0, maxR,
-    minG == UINT16_MAX ? 0 : minG, samples ? sumG / samples : 0, maxG,
-    minB == UINT16_MAX ? 0 : minB, samples ? sumB / samples : 0, maxB,
-    nonzero, samples, firstPacked, centerPacked, maxPacked);
-
-  ID3D11DeviceContext4_Unmap(*this->context,
-    (ID3D11Resource *)staging, 0);
-  ID3D11Texture2D_Release(staging);
 }
 
 static void wgc_setEncodeOrigin(WGCInstance * this, UINT originX, UINT originY)
@@ -3271,16 +3139,10 @@ static void wgc_dispatchEncodeFull(WGCInstance * this,
 {
   wgc_setEncodeOrigin(this, 0, 0);
 
-  if (wgc_isRGBA10PQIvshmem(this))
-    ID3D11DeviceContext4_Dispatch(*this->context,
-      (srcDesc->Width  + 15) / 16,
-      (srcDesc->Height + 15) / 16,
-      1);
-  else
-    ID3D11DeviceContext4_Dispatch(*this->context,
-      (srcDesc->Width  + 31) / 32,
-      (srcDesc->Height + 31) / 32,
-      1);
+  ID3D11DeviceContext4_Dispatch(*this->context,
+    (srcDesc->Width  + 31) / 32,
+    (srcDesc->Height + 31) / 32,
+    1);
 }
 
 static bool wgc_dispatchEncodeDirtyPackedYuv(WGCInstance * this,
@@ -3372,8 +3234,7 @@ static bool wgc_encodeFrameNV12(WGCInstance * this, WGCFrameInfo * dst,
   ID3D11DeviceContext4_CSSetShader(*this->context, NULL, NULL, 0);
 
   bool doEncodeBridgeLog = false;
-  if (this->debugStats &&
-      (wgc_isP010PackedIvshmem(this) || wgc_isRGBA10PQIvshmem(this)))
+  if (this->debugStats && wgc_isP010PackedIvshmem(this))
   {
     static uint64_t lastEncodeBridgeLog = 0;
     const uint64_t now = microtime();
@@ -3383,9 +3244,6 @@ static bool wgc_encodeFrameNV12(WGCInstance * this, WGCFrameInfo * dst,
       doEncodeBridgeLog = true;
     }
   }
-
-  if (doEncodeBridgeLog && wgc_isRGBA10PQIvshmem(this) && dst->bridgeB)
-    wgc_logRGBA10PQTextureSample(this, *dst->bridgeB, "encode UAV");
 
   if (doEncodeBridgeLog && wgc_isP010PackedIvshmem(this) && dst->bridgeB)
   {
@@ -3457,9 +3315,6 @@ static bool wgc_encodeFrameNV12(WGCInstance * this, WGCFrameInfo * dst,
       (ID3D11Resource *)*dst->bridgeA, (ID3D11Resource *)*dst->bridgeB);
   }
 
-  if (doEncodeBridgeLog && wgc_isRGBA10PQIvshmem(this))
-    wgc_logRGBA10PQTextureSample(this, *dst->bridgeA, "shared bridge");
-
   if (doEncodeBridgeLog && wgc_isP010PackedIvshmem(this))
   {
       D3D11_TEXTURE2D_DESC bridgeDesc;
@@ -3520,11 +3375,10 @@ static bool wgc_encodeFrameNV12(WGCInstance * this, WGCFrameInfo * dst,
         DEBUG_WINERROR("Create WGC P010 bridge staging failed", hr);
   }
 
-  // Packed RGB10/PQ has the same dimensions as the source frame. Packed
-  // YUV/P010 does not, but the D3D12 IVSHMEM copy path remaps source dirty
-  // rects into packed-buffer rects before publishing.
-  if (!wgc_isRGBA10PQIvshmem(this) &&
-      !(wgc_isPackedYuvIvshmem(this) &&
+  // Packed YUV/P010 does not share the source frame's dimensions, but the
+  // D3D12 IVSHMEM copy path remaps source dirty rects into packed-buffer
+  // rects before publishing.
+  if (!(wgc_isPackedYuvIvshmem(this) &&
         this->publishMode == WGC_PUBLISH_IVSHMEM_D3D12_COPY))
     dst->fullCopy = true;
   result = true;
@@ -4086,10 +3940,9 @@ static bool wgc_ensureFrameIvshmem(WGCInstance * this, WGCFrameInfo * frame,
   }
 
   const bool packedYuv = wgc_isPackedYuvIvshmem(this);
-  const bool packedRgb10 = wgc_isRGBA10PQIvshmem(this);
   if (srcDesc->Width  != this->ivshmemWidth ||
       srcDesc->Height != this->ivshmemHeight ||
-      (!packedYuv && !packedRgb10 && srcDesc->Format != this->ivshmemFormat))
+      (!packedYuv && srcDesc->Format != this->ivshmemFormat))
   {
     DEBUG_ERROR("WGC source (%ux%u fmt 0x%x) does not match the IVSHMEM "
       "target (%ux%u fmt 0x%x). Cannot recover without renegotiating the "
@@ -4116,8 +3969,7 @@ static bool wgc_ensureFrameIvshmem(WGCInstance * this, WGCFrameInfo * frame,
       wgc_nv12StorageHeight(this->ivshmemHeight) : this->ivshmemHeight,
     .DepthOrArraySize   = 1,
     .MipLevels          = 1,
-    .Format             = (packedYuv || packedRgb10) ? this->ivshmemFormat :
-      srcDesc->Format,
+    .Format             = packedYuv ? this->ivshmemFormat : srcDesc->Format,
     .SampleDesc         = { .Count = 1, .Quality = 0 },
     .Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
     .Flags              = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER
@@ -4269,8 +4121,6 @@ static bool wgc_ensureFrameIvshmem(WGCInstance * this, WGCFrameInfo * frame,
     frame->format.Height = wgc_nv12StorageHeight(this->ivshmemHeight);
     frame->format.Format = this->ivshmemFormat;
   }
-  else if (packedRgb10)
-    frame->format.Format = this->ivshmemFormat;
   frame->ready = true;
   comRef_scopePop();
   return true;
@@ -4286,21 +4136,15 @@ static bool wgc_ensureFrame(WGCInstance * this, WGCFrameInfo * frame,
     frame != &this->frames[0];
   const bool packedYuvSlot = ivshmemSlot &&
     wgc_isPackedYuvIvshmem(this);
-  const bool packedRgb10Slot = ivshmemSlot &&
-    wgc_isRGBA10PQIvshmem(this);
 
   if (frame->ready && (
-      (!packedYuvSlot && !packedRgb10Slot &&
+      (!packedYuvSlot &&
        frame->format.Width  == srcDesc.Width  &&
        frame->format.Height == srcDesc.Height &&
        frame->format.Format == srcDesc.Format) ||
       (packedYuvSlot &&
        frame->format.Width  == wgc_nv12EncodedWidth(this->ivshmemWidth) &&
        frame->format.Height == wgc_nv12StorageHeight(this->ivshmemHeight) &&
-       frame->format.Format == this->ivshmemFormat) ||
-      (packedRgb10Slot &&
-       frame->format.Width  == this->ivshmemWidth &&
-       frame->format.Height == this->ivshmemHeight &&
        frame->format.Format == this->ivshmemFormat)))
     return true;
 
@@ -4779,13 +4623,6 @@ void wgc_setLoanedDevices(WGCInstance * this,
   this->loanedD11Device  = (ID3D11Device        *)d11Device;
   this->loanedD11Context = (ID3D11DeviceContext *)d11Context;
   this->loanedD12Device  = (ID3D12Device3       *)d12Device;
-}
-
-void wgc_setCaptureFormatHint(WGCInstance * this, unsigned format)
-{
-  if (!this)
-    return;
-  this->captureFormatHint = (DXGI_FORMAT)format;
 }
 
 bool wgc_setIvshmemD3D12CopyEnv(WGCInstance * this,

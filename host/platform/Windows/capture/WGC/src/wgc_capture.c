@@ -35,7 +35,6 @@
 #include <d3d12.h>
 #include <dxgi1_2.h>
 #include <dxgi1_6.h>
-#include <math.h>
 #include <inttypes.h>
 #include <roapi.h>
 #include <stdio.h>
@@ -61,8 +60,7 @@ typedef enum WGCCapturePublishFormat
   WGC_CAPTURE_PUBLISH_FORMAT_BGRA8,
   WGC_CAPTURE_PUBLISH_FORMAT_RGBA16F,
   WGC_CAPTURE_PUBLISH_FORMAT_NV12,
-  WGC_CAPTURE_PUBLISH_FORMAT_P010,
-  WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ
+  WGC_CAPTURE_PUBLISH_FORMAT_P010
 }
 WGCCapturePublishFormat;
 
@@ -120,14 +118,11 @@ struct WGCCapture
   unsigned                 width;
   unsigned                 height;
   unsigned                 pitch;     // output bytes per row
-  unsigned                 mappedPitch; // bytes per row from staging Map
   unsigned                 stride;    // pixels per row
   unsigned                 dataHeight;
   unsigned                 formatVer;
   WGCCapturePublishMode    publishedMode;   // mode/format as last published
   WGCCapturePublishFormat  publishedFormat;
-  uint8_t                * encodeBuffer;
-  size_t                   encodeBufferSize;
 
   // current frame state between waitFrame() and getFrame()
   bool                     frameMapped;
@@ -385,8 +380,6 @@ static WGCCapturePublishFormat wgc_capture_parseEncoding(
     return WGC_CAPTURE_PUBLISH_FORMAT_NV12;
   if (strcmp(value, "p010") == 0)
     return WGC_CAPTURE_PUBLISH_FORMAT_P010;
-  if (strcmp(value, "rgba10pq") == 0 || strcmp(value, "rgb10pq") == 0)
-    return WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ;
 
   DEBUG_WARN("Unknown wgc:%s \"%s\", using fallback", optionName, value);
   return fallback;
@@ -400,7 +393,6 @@ static const char * wgc_capture_encodingName(WGCCapturePublishFormat format)
     case WGC_CAPTURE_PUBLISH_FORMAT_RGBA16F: return "rgba16f";
     case WGC_CAPTURE_PUBLISH_FORMAT_NV12   : return "nv12";
     case WGC_CAPTURE_PUBLISH_FORMAT_P010   : return "p010";
-    case WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ: return "rgba10pq";
     case WGC_CAPTURE_PUBLISH_FORMAT_AUTO   : return "auto";
   }
   return "unknown";
@@ -441,91 +433,6 @@ static bool wgc_capture_colorSpaceIsHDR(DXGI_COLOR_SPACE_TYPE colorSpace)
   return colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
          colorSpace == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020 ||
          colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
-}
-
-static float wgc_capture_halfToFloat(uint16_t h)
-{
-  const uint16_t sign = h >> 15;
-  const uint16_t exp  = (h >> 10) & 0x1f;
-  const uint16_t mant = h & 0x03ff;
-  float value;
-
-  if (exp == 0)
-    value = mant ? ldexpf((float)mant / 1024.0f, -14) : 0.0f;
-  else if (exp == 31)
-    value = mant ? 0.0f : 65504.0f;
-  else
-    value = ldexpf(1.0f + (float)mant / 1024.0f, (int)exp - 15);
-
-  return sign ? -value : value;
-}
-
-static float wgc_capture_pqOETF(float nits)
-{
-  const float m1 = 2610.0f / 16384.0f;
-  const float m2 = 2523.0f / 32.0f;
-  const float c1 = 3424.0f / 4096.0f;
-  const float c2 = 2413.0f / 128.0f;
-  const float c3 = 2392.0f / 128.0f;
-  const float n = min(max(nits / 10000.0f, 0.0f), 1.0f);
-  const float p = powf(n, m1);
-  return powf((c1 + c2 * p) / (1.0f + c3 * p), m2);
-}
-
-static uint32_t wgc_capture_packRGBA10PQ(float r709, float g709, float b709)
-{
-  const float r2020 = max(0.0f,
-    r709 * 0.6274039f +
-    g709 * 0.3292829f +
-    b709 * 0.0433131f);
-  const float g2020 = max(0.0f,
-    r709 * 0.0690973f +
-    g709 * 0.9195404f +
-    b709 * 0.0113622f);
-  const float b2020 = max(0.0f,
-    r709 * 0.0163914f +
-    g709 * 0.0880133f +
-    b709 * 0.8955953f);
-
-  const uint32_t r = (uint32_t)(wgc_capture_pqOETF(r2020 * 80.0f) * 1023.0f + 0.5f);
-  const uint32_t g = (uint32_t)(wgc_capture_pqOETF(g2020 * 80.0f) * 1023.0f + 0.5f);
-  const uint32_t b = (uint32_t)(wgc_capture_pqOETF(b2020 * 80.0f) * 1023.0f + 0.5f);
-  return min(r, 1023u) | (min(g, 1023u) << 10) |
-    (min(b, 1023u) << 20) | (3u << 30);
-}
-
-static bool wgc_capture_encodeRGBA10PQ(void)
-{
-  const size_t needed = (size_t)this->pitch * this->height;
-  if (this->encodeBufferSize < needed)
-  {
-    uint8_t * newBuffer = realloc(this->encodeBuffer, needed);
-    if (!newBuffer)
-    {
-      DEBUG_ERROR("Failed to allocate WGC rgba10pq encode buffer");
-      return false;
-    }
-    this->encodeBuffer = newBuffer;
-    this->encodeBufferSize = needed;
-  }
-
-  for(unsigned y = 0; y < this->height; ++y)
-  {
-    const uint8_t * src = (const uint8_t *)this->mapped +
-      (size_t)y * this->mappedPitch;
-    uint32_t * dst = (uint32_t *)(this->encodeBuffer +
-      (size_t)y * this->pitch);
-    for(unsigned x = 0; x < this->width; ++x)
-    {
-      const uint16_t * px = (const uint16_t *)src + (size_t)x * 4;
-      dst[x] = wgc_capture_packRGBA10PQ(
-        wgc_capture_halfToFloat(px[0]),
-        wgc_capture_halfToFloat(px[1]),
-        wgc_capture_halfToFloat(px[2]));
-    }
-  }
-
-  return true;
 }
 
 static DXGI_COLOR_SPACE_TYPE wgc_capture_getOutputColorSpace(IDXGIOutput * output)
@@ -575,8 +482,7 @@ static void wgc_capture_resolveEncoding(DXGI_COLOR_SPACE_TYPE colorSpace)
 
 static void wgc_capture_forcePublishModeForEncoding(void)
 {
-  if ((this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ ||
-       this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_NV12 ||
+  if ((this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_NV12 ||
        this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_P010) &&
       this->publishMode != WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY)
   {
@@ -587,13 +493,12 @@ static void wgc_capture_forcePublishModeForEncoding(void)
   }
 }
 
-// cpu-staging cannot transport the packed YUV / RGB10 encodings; downgrade
+// cpu-staging cannot transport the packed YUV encodings; downgrade
 // the publish format to BGRA8 when falling back to it.
 static void wgc_capture_fallbackToCpuStaging(void)
 {
   this->publishMode = WGC_CAPTURE_PUBLISH_CPU_STAGING;
   if (this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_NV12 ||
-      this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ ||
       this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_P010)
   {
     DEBUG_WARN("cpu-staging does not support packed YUV transport; "
@@ -728,9 +633,6 @@ static bool wgc_capture_create(
   }
 
   wgc_setPointerCallbacks(this->wgc, getPointerBufferFn, postPointerBufferFn);
-  if (this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ)
-    wgc_setCaptureFormatHint(this->wgc,
-      (unsigned)DXGI_FORMAT_R16G16B16A16_FLOAT);
 
   DEBUG_INFO("WGC (top-level): trackDamage:%d frameBuffers:%u debug:%d timings:%d debugStats:%d dirtyFullCopyPercent:%d",
     this->trackDamage, frameBuffers, this->debug, this->timings,
@@ -753,9 +655,6 @@ static bool wgc_capture_ensureInstance(void)
 
   wgc_setPointerCallbacks(this->wgc,
     this->getPointerBufferFn, this->postPointerBufferFn);
-  if (this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ)
-    wgc_setCaptureFormatHint(this->wgc,
-      (unsigned)DXGI_FORMAT_R16G16B16A16_FLOAT);
 
   return true;
 }
@@ -1053,8 +952,6 @@ static bool setupIvshmemD3D12Copy(IDXGIAdapter1 * adapter,
   const DXGI_FORMAT chosenFormat =
     this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA16F
       ? DXGI_FORMAT_R16G16B16A16_FLOAT
-    : this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ
-      ? DXGI_FORMAT_R8G8B8A8_UNORM
       : this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_NV12
       ? DXGI_FORMAT_R8G8B8A8_UNORM
       : this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_P010
@@ -1133,9 +1030,6 @@ static bool wgc_capture_init(void * ivshmemBase, unsigned * alignSize)
     wgc_capture_getOutputColorSpace(output);
   wgc_capture_resolveEncoding(colorSpace);
   wgc_capture_forcePublishModeForEncoding();
-  if (this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ)
-    wgc_setCaptureFormatHint(this->wgc,
-      (unsigned)DXGI_FORMAT_R16G16B16A16_FLOAT);
 
   // Try GPU-to-IVSHMEM setup if the user requested it (or auto). On failure
   // we fall back to cpu-staging.
@@ -1238,7 +1132,6 @@ static void wgc_capture_free(void)
   if (this->wgc)
     wgc_freeInstance(&this->wgc);
 
-  free(this->encodeBuffer);
   free(this);
   this = NULL;
 }
@@ -1322,28 +1215,12 @@ static CaptureResult wgc_capture_waitFrame(unsigned frameBufferIndex,
   const bool rgba16f = this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA16F;
   const bool nv12    = this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_NV12;
   const bool p010    = this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_P010;
-  const bool rgba10pq =
-    this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ;
   const bool packedYuv = nv12 || p010;
   const unsigned bpp = (rgba16f || p010) ? 8 : 4;
-  const unsigned outputPitch = rgba10pq ? width * 4 : pitch;
 
   // Reject formats we don't handle in this wrapper. Today WGC delivers BGRA8
   // by default; explicit RGBA16F publish mode writes half-float pixels.
-  if (rgba10pq && !gpuPublish && pitch < width * 8)
-  {
-    DEBUG_ERROR("WGC rgba10pq requires RGBA16F source pitch, got %u for width %u",
-      pitch, width);
-    wgc_releaseCpu(this->wgc, this->desc.backendToken);
-    return CAPTURE_RESULT_ERROR;
-  }
-  if (rgba10pq && gpuPublish && pitch < outputPitch)
-  {
-    DEBUG_ERROR("WGC rgba10pq GPU publish produced an unexpected pitch %u "
-      "for width %u", pitch, width);
-    return CAPTURE_RESULT_ERROR;
-  }
-  if (!rgba10pq && !packedYuv && pitch < width * bpp)
+  if (!packedYuv && pitch < width * bpp)
   {
     DEBUG_ERROR("WGC produced an unexpected pitch %u for width %u",
       pitch, width);
@@ -1355,23 +1232,22 @@ static CaptureResult wgc_capture_waitFrame(unsigned frameBufferIndex,
 
   // bump formatVer if the published format changed
   if (this->width != width || this->height != height ||
-      this->pitch != outputPitch || this->mappedPitch != pitch ||
+      this->pitch != pitch ||
       this->publishedMode   != this->publishMode ||
       this->publishedFormat != this->publishFormat)
     ++this->formatVer;
 
   this->width           = width;
   this->height          = height;
-  this->mappedPitch     = pitch;
-  this->pitch           = outputPitch;
-  this->stride          = outputPitch / bpp;
+  this->pitch           = pitch;
+  this->stride          = pitch / bpp;
   this->dataHeight      = dataHeight;
   this->mapped          = map;
   this->frameMapped     = true;
   this->publishedMode   = this->publishMode;
   this->publishedFormat = this->publishFormat;
 
-  const unsigned maxRows = (unsigned)(maxFrameSize / outputPitch);
+  const unsigned maxRows = (unsigned)(maxFrameSize / pitch);
   const unsigned outRows = (maxRows < dataHeight) ? maxRows : dataHeight;
 
   frame->formatVer        = this->formatVer;
@@ -1382,14 +1258,13 @@ static CaptureResult wgc_capture_waitFrame(unsigned frameBufferIndex,
   frame->frameWidth       = width;
   frame->frameHeight      = height;
   frame->truncated        = outRows < dataHeight;
-  frame->pitch            = outputPitch;
+  frame->pitch            = pitch;
   frame->stride           = this->stride;
   frame->format           = rgba16f ? CAPTURE_FMT_RGBA16F :
-                            rgba10pq ? CAPTURE_FMT_RGBA10 :
                             nv12    ? CAPTURE_FMT_NV12 :
                             p010    ? CAPTURE_FMT_P010 : CAPTURE_FMT_BGRA;
-  frame->hdr              = rgba16f || p010 || rgba10pq;
-  frame->hdrPQ            = p010 || rgba10pq;
+  frame->hdr              = rgba16f || p010;
+  frame->hdrPQ            = p010;
   frame->rotation         = CAPTURE_ROT_0;
 
   // Publish the dirty rects as client render damage. The pixel transport may
@@ -1485,16 +1360,12 @@ static CaptureResult wgc_capture_getFrame(unsigned frameBufferIndex,
 
   FrameDamage * damage = &this->frameDamage[frameBufferIndex];
   const unsigned bpp = 4;
-  const bool rgba10pq =
-    this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_RGBA10PQ;
 
   // Build the damage list to copy for THIS framebuffer:
   //   - if damage->count < 0 (first use, or overflow): full copy
   //   - else: prior accumulated rects + this frame's new dirty rects
   bool fullCopy = damage->count < 0 || this->desc.nbDirtyRects == 0 ||
     (unsigned)damage->count + this->desc.nbDirtyRects > KVMFR_MAX_DAMAGE_RECTS;
-  if (rgba10pq)
-    fullCopy = true;
   FrameDamage local = { 0 };
 
   if (!fullCopy)
@@ -1520,20 +1391,8 @@ static CaptureResult wgc_capture_getFrame(unsigned frameBufferIndex,
   const uint64_t memcpyStart = microtime();
   if (fullCopy)
   {
-    const void * src = this->mapped;
-    if (rgba10pq)
-    {
-      if (!wgc_capture_encodeRGBA10PQ())
-      {
-        wgc_releaseCpu(this->wgc, this->desc.backendToken);
-        this->frameMapped = false;
-        this->mapped      = NULL;
-        this->desc.backendToken = NULL;
-        return CAPTURE_RESULT_ERROR;
-      }
-      src = this->encodeBuffer;
-    }
-    framebuffer_write(frame, src, (size_t)this->pitch * this->dataHeight);
+    framebuffer_write(frame, this->mapped,
+      (size_t)this->pitch * this->dataHeight);
     copyPixels = (uint64_t)this->width * this->dataHeight;
   }
   else

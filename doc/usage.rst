@@ -683,7 +683,7 @@ WGC Configuration Options
 
 * ``encoding`` (default ``auto``) - WGC publish encoding:
   ``auto`` (uses ``sdrEncoding``/``hdrEncoding``), ``bgra8``, ``rgba16f``, ``nv12``,
-  ``p010``, or ``rgba10pq``.
+  or ``p010``.
 
 * ``sdrEncoding`` (default ``nv12``) - Encoding used by ``encoding=auto`` for
   SDR sources: ``bgra8``, ``rgba16f``, ``nv12``, or ``p010``.
