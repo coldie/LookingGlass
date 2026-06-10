@@ -330,27 +330,6 @@ static void wgc_capture_initOptions(void)
       .type           = OPTION_TYPE_BOOL,
       .value.x_bool   = true
     },
-    {
-      .module         = "wgc",
-      .name           = "tiled",
-      .description    = "Tile dirty D3D12 bridge-to-IVSHMEM copies: none|dirty",
-      .type           = OPTION_TYPE_STRING,
-      .value.x_string = "none"
-    },
-    {
-      .module         = "wgc",
-      .name           = "tileSize",
-      .description    = "Tile size for wgc:tiled=dirty, formatted WIDTHxHEIGHT",
-      .type           = OPTION_TYPE_STRING,
-      .value.x_string = "256x64"
-    },
-    {
-      .module         = "wgc",
-      .name           = "dirtyMaxTiles",
-      .description    = "Maximum tile spans before falling back to full D3D12 copy",
-      .type           = OPTION_TYPE_INT,
-      .value.x_int    = 128 // 128 tiles ~= 2 MiB of copy commands; beyond this a full copy is cheaper
-    },
     {0}
   };
 

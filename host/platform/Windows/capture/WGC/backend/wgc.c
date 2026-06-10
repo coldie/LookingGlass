@@ -42,16 +42,8 @@
 #include <d3dcompiler.h>
 
 #define WGC_D3D12_COPY_QUEUE_MAX 8
-#define WGC_D3D12_TILE_SPAN_MAX 1024
 #define WGC_STATS_SAMPLE_MAX 512
 #define WGC_HDR_STATS_GRID 16
-
-typedef enum WGCTiledCopyMode
-{
-  WGC_TILED_COPY_NONE,
-  WGC_TILED_COPY_DIRTY
-}
-WGCTiledCopyMode;
 
 #define WIDL_using_Windows_Foundation
 #define WIDL_using_Windows_Foundation_Collections
@@ -591,19 +583,12 @@ struct WGCInstance
   volatile LONG64 systemRelativeGapTotalUs;
   volatile LONG64 systemRelativeGapMaxUs;
   volatile LONG64 systemRelativeGapCount;
-  RECT previousDirtyRects[D12_MAX_DIRTY_RECTS];
-  unsigned nbPreviousDirtyRects;
-
   bool mouseHookCreated;
   CRITICAL_SECTION cursorLock;
   bool cursorLockCreated;
   int cursorMaxHz;
   int dirtyFullCopyPercent;
   bool d3d12FullCopyAlways;
-  WGCTiledCopyMode tiledCopyMode;
-  unsigned tileWidth;
-  unsigned tileHeight;
-  unsigned dirtyMaxTiles;
   uint64_t cursorLastPostUs;
   volatile LONG64 cursorPendingPos;
   HCURSOR lastCursor;
@@ -673,8 +658,6 @@ static bool wgc_ensureFrame(WGCInstance * this, WGCFrameInfo * frame,
 static void wgc_releaseFrameInfo(WGCFrameInfo * frame);
 static void wgc_updateDamage(WGCInstance * this, WGCFrameInfo * info,
   IDirect3D11CaptureFrame * frame);
-static void wgc_extendDamageWithPrevious(WGCInstance * this,
-  WGCFrameInfo * info);
 static bool wgc_shouldForceFullCopyAfterGap(WGCInstance * this,
   WGCFrameInfo * frame);
 static void wgc_maybeLogDebugStats(WGCInstance * this);
@@ -843,24 +826,6 @@ static void wgc_boostCallbackThreadPriority(void)
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 }
 
-static void wgc_parseTileSize(const char * value,
-  unsigned * width, unsigned * height)
-{
-  unsigned w = 0;
-  unsigned h = 0;
-  if (value)
-    sscanf(value, "%ux%u", &w, &h);
-
-  if (w == 0 || h == 0)
-  {
-    w = 256;
-    h = 64;
-  }
-
-  *width  = max(16, min(w, 1024));
-  *height = max(16, min(h, 1024));
-}
-
 static void wgc_waitCallbacks(WGCFrameEventHandler * handler)
 {
   for(unsigned i = 0; i < 5000 &&
@@ -910,18 +875,6 @@ static bool wgc_init(WGCInstance * this, bool debug,
   this->dirtyFullCopyPercent = option_get_int("wgc", "dirtyFullCopyPercent");
   this->d3d12FullCopyAlways =
     option_get_bool("wgc", "d3d12FullCopyAlways");
-  const char * tiled = option_get_string("wgc", "tiled");
-  if (tiled && strcmp(tiled, "dirty") == 0)
-    this->tiledCopyMode = WGC_TILED_COPY_DIRTY;
-  else
-  {
-    if (tiled && strcmp(tiled, "none") != 0)
-      DEBUG_WARN("Unknown wgc:tiled \"%s\", defaulting to none", tiled);
-    this->tiledCopyMode = WGC_TILED_COPY_NONE;
-  }
-  wgc_parseTileSize(option_get_string("wgc", "tileSize"),
-    &this->tileWidth, &this->tileHeight);
-  this->dirtyMaxTiles = max(1, option_get_int("wgc", "dirtyMaxTiles"));
   this->asyncCapture = option_get_bool("wgc", "asyncCapture");
   this->pollFramePool = option_get_bool("wgc", "pollFramePool");
   this->pollFramePoolMs = max(0, option_get_int("wgc", "pollFramePoolMs"));
@@ -931,15 +884,13 @@ static bool wgc_init(WGCInstance * this, bool debug,
   this->dwmFlushOnGap = option_get_bool("wgc", "dwmFlushOnGap");
   this->dwmFlushGapMs = max(1, option_get_int("wgc", "dwmFlushGapMs"));
   this->lastDwmFlushUs = 0;
-  DEBUG_INFO("WGC cursor:%s cursorMaxHz:%d maxFPS:%d asyncCapture:%d pollFramePool:%d/%dms includeSecondaryWindows:%d debugStats:%d dwmFlushOnGap:%d/%dms tiled:%s tileSize:%ux%u dirtyMaxTiles:%u",
+  DEBUG_INFO("WGC cursor:%s cursorMaxHz:%d maxFPS:%d asyncCapture:%d pollFramePool:%d/%dms includeSecondaryWindows:%d debugStats:%d dwmFlushOnGap:%d/%dms",
     this->cursorMode == WGC_CURSOR_MODE_SEPARATE ? "separate" :
     this->cursorMode == WGC_CURSOR_MODE_EMBEDDED ? "embedded" : "none",
     this->cursorMaxHz, this->maxFPS, this->asyncCapture,
     this->pollFramePool, this->pollFramePoolMs,
     this->includeSecondaryWindows, this->debugStats, this->dwmFlushOnGap,
-    this->dwmFlushGapMs,
-    this->tiledCopyMode == WGC_TILED_COPY_DIRTY ? "dirty" : "none",
-    this->tileWidth, this->tileHeight, this->dirtyMaxTiles);
+    this->dwmFlushGapMs);
 
   hr = RoInitialize(RO_INIT_MULTITHREADED);
   if (FAILED(hr) && hr != RPC_E_CHANGED_MODE)
@@ -1567,7 +1518,6 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
 
     profileStart = profile ? microtime() : 0;
     wgc_updateDamage(this, dst, frame);
-    wgc_extendDamageWithPrevious(this, dst);
     const bool forceFullCopyAfterGap =
       wgc_shouldForceFullCopyAfterGap(this, dst);
     const bool forceNextFullCopy =
@@ -1671,7 +1621,6 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
 
   profileStart = profile ? microtime() : 0;
   wgc_updateDamage(this, accum, frame);
-  wgc_extendDamageWithPrevious(this, accum);
   const bool forceFullCopyAfterGap =
     wgc_shouldForceFullCopyAfterGap(this, accum);
   const bool forceNextFullCopy =
@@ -2330,41 +2279,6 @@ static void wgc_updateDamage(WGCInstance * this, WGCFrameInfo * info,
 
 exit:
   comRef_scopePop();
-}
-
-static void wgc_extendDamageWithPrevious(WGCInstance * this, WGCFrameInfo * info)
-{
-  if (!this->trackDamage)
-    return;
-
-  const unsigned currentCount = info->nbDirtyRects;
-  RECT current[D12_MAX_DIRTY_RECTS];
-  if (currentCount > 0)
-    memcpy(current, info->dirtyRects, currentCount * sizeof(*current));
-
-  if (currentCount > 0 && this->nbPreviousDirtyRects > 0)
-  {
-    const unsigned available = D12_MAX_DIRTY_RECTS - info->nbDirtyRects;
-    if (this->nbPreviousDirtyRects <= available)
-    {
-      memcpy(info->dirtyRects + info->nbDirtyRects, this->previousDirtyRects,
-        this->nbPreviousDirtyRects * sizeof(*info->dirtyRects));
-      info->nbDirtyRects += this->nbPreviousDirtyRects;
-    }
-    else
-    {
-      // Too many regions to preserve correctness cheaply; force full copy.
-      info->nbDirtyRects = 0;
-    }
-  }
-
-  if (currentCount > 0)
-  {
-    memcpy(this->previousDirtyRects, current, currentCount * sizeof(*current));
-    this->nbPreviousDirtyRects = currentCount;
-  }
-  else
-    this->nbPreviousDirtyRects = 0;
 }
 
 static bool wgc_shouldForceFullCopyAfterGap(WGCInstance * this,
@@ -3445,87 +3359,6 @@ static void wgc_copyFrameTexture(WGCInstance * this, WGCFrameInfo * dst,
   dst->copiedOnce = true;
 }
 
-static bool wgc_buildTileSpans(WGCInstance * this, const WGCFrameInfo * frame,
-  RECT * spans, unsigned spanCapacity, unsigned * spanCount,
-  uint64_t * spanPixels)
-{
-  *spanCount  = 0;
-  *spanPixels = 0;
-
-  if (this->tiledCopyMode != WGC_TILED_COPY_DIRTY ||
-      this->tileWidth == 0 || this->tileHeight == 0 ||
-      frame->nbDirtyRects == 0)
-    return false;
-
-  const unsigned width  = frame->format.Width;
-  const unsigned height = frame->format.Height;
-  const unsigned tilesX = (width  + this->tileWidth  - 1) / this->tileWidth;
-  const unsigned tilesY = (height + this->tileHeight - 1) / this->tileHeight;
-  const size_t tileCount = (size_t)tilesX * tilesY;
-  if (tilesX == 0 || tilesY == 0 || tileCount > 65536)
-    return false;
-
-  uint8_t * mask = calloc(tileCount, 1);
-  if (!mask)
-    return false;
-
-  for(const RECT * rect = frame->dirtyRects;
-      rect < frame->dirtyRects + frame->nbDirtyRects; ++rect)
-  {
-    const LONG left   = max(0, min(rect->left,   (LONG)width));
-    const LONG top    = max(0, min(rect->top,    (LONG)height));
-    const LONG right  = max(0, min(rect->right,  (LONG)width));
-    const LONG bottom = max(0, min(rect->bottom, (LONG)height));
-    if (right <= left || bottom <= top)
-      continue;
-
-    const unsigned tx0 = (unsigned)left / this->tileWidth;
-    const unsigned ty0 = (unsigned)top  / this->tileHeight;
-    const unsigned tx1 = ((unsigned)right  + this->tileWidth  - 1) /
-      this->tileWidth;
-    const unsigned ty1 = ((unsigned)bottom + this->tileHeight - 1) /
-      this->tileHeight;
-
-    for(unsigned ty = ty0; ty < ty1 && ty < tilesY; ++ty)
-      for(unsigned tx = tx0; tx < tx1 && tx < tilesX; ++tx)
-        mask[(size_t)ty * tilesX + tx] = 1;
-  }
-
-  bool ok = true;
-  for(unsigned ty = 0; ty < tilesY && ok; ++ty)
-  {
-    unsigned tx = 0;
-    while (tx < tilesX)
-    {
-      while (tx < tilesX && !mask[(size_t)ty * tilesX + tx])
-        ++tx;
-      if (tx >= tilesX)
-        break;
-
-      const unsigned startX = tx;
-      while (tx < tilesX && mask[(size_t)ty * tilesX + tx])
-        ++tx;
-
-      if (*spanCount >= spanCapacity || *spanCount >= this->dirtyMaxTiles)
-      {
-        ok = false;
-        break;
-      }
-
-      RECT * span = &spans[(*spanCount)++];
-      span->left   = (LONG)(startX * this->tileWidth);
-      span->top    = (LONG)(ty * this->tileHeight);
-      span->right  = (LONG)min(tx * this->tileWidth, width);
-      span->bottom = (LONG)min((ty + 1) * this->tileHeight, height);
-      *spanPixels += (uint64_t)(span->right - span->left) *
-        (uint64_t)(span->bottom - span->top);
-    }
-  }
-
-  free(mask);
-  return ok && *spanCount > 0;
-}
-
 static bool wgc_mapPackedYuvCopyRects(WGCInstance * this,
   const RECT * srcRects, unsigned srcCount,
   RECT * dstRects, unsigned dstCapacity, unsigned * dstCount)
@@ -3598,24 +3431,8 @@ static bool wgc_copyFrameTextureD3D12(WGCInstance * this, WGCFrameInfo * dst)
     (this->dirtyFullCopyPercent > 0 && dst->nbDirtyRects > 0 &&
      dirtyPixels * 100 >= framePixels *
        (uint64_t)this->dirtyFullCopyPercent);
-  RECT tileSpans[WGC_D3D12_TILE_SPAN_MAX];
-  unsigned tileSpanCount = 0;
-  uint64_t tilePixels = 0;
   const RECT * copyRects = dst->dirtyRects;
   unsigned copyRectCount = dst->nbDirtyRects;
-
-  if (!copyFull && !wgc_isPackedYuvIvshmem(this) &&
-      this->tiledCopyMode == WGC_TILED_COPY_DIRTY)
-  {
-    if (wgc_buildTileSpans(this, dst, tileSpans,
-        WGC_D3D12_TILE_SPAN_MAX, &tileSpanCount, &tilePixels))
-    {
-      copyRects = tileSpans;
-      copyRectCount = tileSpanCount;
-    }
-    else
-      copyFull = true;
-  }
 
   RECT packedYuvRects[D12_MAX_DIRTY_RECTS * 2];
   unsigned packedYuvRectCount = 0;
