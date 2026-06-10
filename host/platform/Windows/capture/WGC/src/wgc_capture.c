@@ -1064,20 +1064,31 @@ static CaptureResult wgc_capture_waitFrame(unsigned frameBufferIndex,
 
   const bool gpuPublish =
     this->publishMode == WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY;
-  bool fetched;
-  if (gpuPublish)
+
+  // The capture thread runs asynchronously (Capture_WGC.asyncCapture); block
+  // here until it publishes a frame so the frame thread doesn't spin. The
+  // event may already be signaled from a prior publish, hence the fetch
+  // before the first wait.
+  bool fetched = false;
+  for(unsigned attempt = 0; attempt < 2 && !fetched; ++attempt)
   {
-    // No mapping — WGC has already written directly into IVSHMEM at the
-    // slot's offset. We just need the metadata (dimensions, dirty rects)
-    // and the slot state transition.
-    uint64_t off;
-    fetched = wgc_fetchIvshmemDirect(this->wgc, frameBufferIndex,
-      &this->desc, &off, &pitch, &width, &height);
-  }
-  else
-  {
-    fetched = wgc_fetchCpu(this->wgc, frameBufferIndex, &this->desc,
-      &map, &pitch, &width, &height);
+    if (attempt && !wgc_waitPublish(this->wgc, 100))
+      break;
+
+    if (gpuPublish)
+    {
+      // No mapping — WGC has already written directly into IVSHMEM at the
+      // slot's offset. We just need the metadata (dimensions, dirty rects)
+      // and the slot state transition.
+      uint64_t off;
+      fetched = wgc_fetchIvshmemDirect(this->wgc, frameBufferIndex,
+        &this->desc, &off, &pitch, &width, &height);
+    }
+    else
+    {
+      fetched = wgc_fetchCpu(this->wgc, frameBufferIndex, &this->desc,
+        &map, &pitch, &width, &height);
+    }
   }
 
   if (!fetched)
@@ -1181,20 +1192,19 @@ static CaptureResult wgc_capture_getFrame(unsigned frameBufferIndex,
   if (!this->frameMapped)
     return CAPTURE_RESULT_ERROR;
 
-  // IVSHMEM GPU-publish: WGC already wrote pixels directly into IVSHMEM at the
-  // slot's offset (and Flush in wgc_fetchIvshmemDirect committed the GPU
-  // work). All we need to do is signal write-pointer completion and
-  // release the slot back to the WGC backend.
+  // IVSHMEM GPU-publish: WGC already wrote pixels directly into IVSHMEM at
+  // the slot's offset (the copy fence wait in wgc_fetchIvshmemDirect
+  // committed the GPU work). All we need to do is signal write-pointer
+  // completion and release the slot back to the WGC backend.
   if (this->publishMode == WGC_CAPTURE_PUBLISH_IVSHMEM_D3D12_COPY)
   {
     framebuffer_set_write_ptr(frame, (uint32_t)((size_t)this->pitch * this->dataHeight));
-    wgc_releaseIvshmemDirect(this->wgc, this->desc.backendToken);
-    this->frameMapped = false;
-    this->mapped      = NULL;
-    this->desc.backendToken = NULL;
 
     // Update damage accumulator the same way the cpu-staging path does
-    // (clears the just-published fb, accumulates rects into the others)
+    // (clears the just-published fb, accumulates rects into the others).
+    // This reads desc.dirtyRects which point into the backend slot, so it
+    // must happen BEFORE the slot is released — the capture thread may
+    // reclaim the slot and rewrite its rects the moment it is freed.
     for (unsigned i = 0; i < LGMP_Q_FRAME_LEN; ++i)
     {
       FrameDamage * d = &this->frameDamage[i];
@@ -1224,6 +1234,11 @@ static CaptureResult wgc_capture_getFrame(unsigned frameBufferIndex,
           d->count = -1;
       }
     }
+
+    wgc_releaseIvshmemDirect(this->wgc, this->desc.backendToken);
+    this->frameMapped = false;
+    this->mapped      = NULL;
+    this->desc.backendToken = NULL;
     return CAPTURE_RESULT_OK;
   }
 
@@ -1350,7 +1365,10 @@ static CaptureResult wgc_capture_getFrame(unsigned frameBufferIndex,
 struct CaptureInterface Capture_WGC =
 {
   .shortName       = "WGC",
-  .asyncCapture    = false,
+  // capture() runs on the capture thread while waitFrame()/getFrame() run on
+  // the frame thread, overlapping the WGC wait + copy/encode of frame N+1
+  // with the fence wait + LGMP publish of frame N
+  .asyncCapture    = true,
   // GPU publish modes write directly into the IVSHMEM frame slot in capture()
   .writesFrameOnCapture = true,
   .getName         = wgc_capture_getName,

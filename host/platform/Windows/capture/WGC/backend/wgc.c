@@ -42,6 +42,10 @@
 
 #define WGC_D3D12_COPY_QUEUE_MAX 8
 
+// command groups per copy queue, so a new frame can record while the
+// previous frame's GPU copy is still in flight
+#define WGC_D3D12_COPY_GROUPS 2
+
 // frame pool polling wait when wgc:pollFramePool is enabled
 #define WGC_POLL_FRAME_POOL_MS 1
 // minimum WGC callback gap before DwmFlush is used (wgc:dwmFlushOnGap)
@@ -438,6 +442,13 @@ typedef struct WGCFrameInfo
   ID3D11UnorderedAccessView ** encodeUav;
   UINT64             d3d12CopyFenceValue[WGC_D3D12_COPY_QUEUE_MAX];
   unsigned           d3d12CopyQueueCount;
+  // which command group recorded this frame's copies
+  unsigned           d3d12CopyGroup;
+  // Per-frame fence wait event. The capture and frame threads may wait on
+  // the copy fences concurrently (slot reclaim vs consume); sharing one
+  // auto-reset event between threads can lose a wakeup, so each frame owns
+  // its own event and only the slot's current owner waits on it.
+  HANDLE             d3d12CopyEvent;
 }
 WGCFrameInfo;
 
@@ -481,9 +492,11 @@ struct WGCInstance
   // offsets live on each WGCFrameInfo (set via wgc_setIvshmemSlot).
   ID3D12Heap        * ivshmemHeap;
   ID3D12CommandQueue * d3d12CopyQueues[WGC_D3D12_COPY_QUEUE_MAX];
-  D12CommandGroup     d3d12CopyCommands[WGC_D3D12_COPY_QUEUE_MAX];
+  D12CommandGroup     d3d12CopyCommands[WGC_D3D12_COPY_QUEUE_MAX]
+                                       [WGC_D3D12_COPY_GROUPS];
   bool                d3d12CopyCommandReady[WGC_D3D12_COPY_QUEUE_MAX];
   unsigned            d3d12CopyQueueCount;
+  unsigned            d3d12CopyGroupIndex; // capture thread only
   unsigned            ivshmemWidth;
   unsigned            ivshmemHeight;
   DXGI_FORMAT         ivshmemFormat;
@@ -501,6 +514,9 @@ struct WGCInstance
   WGCFrameEventHandler * handler;
   EventRegistrationToken frameArrivedToken;
   HANDLE frameEvent;
+  // signaled whenever a frame is published; the frame thread waits on it in
+  // wgc_waitPublish
+  HANDLE publishEvent;
   IDirect3D11CaptureFrame * pendingFrame;
 
   WGCFrameInfo * frames;
@@ -939,6 +955,19 @@ static bool wgc_init(WGCInstance * this, bool debug,
     goto exit;
   }
 
+  // With Capture_WGC.asyncCapture the frame thread maps/unmaps the CPU
+  // staging texture on this context while the capture thread records copies;
+  // multithread protection serializes those calls. The IVSHMEM publish path
+  // never touches the context from the frame thread.
+  comRef_defineLocal(ID3D11Multithread, d11mt);
+  hr = ID3D11DeviceContext_QueryInterface(
+    *d11context, &IID_ID3D11Multithread, (void **)d11mt);
+  if (SUCCEEDED(hr))
+    ID3D11Multithread_SetMultithreadProtected(*d11mt, TRUE);
+  else
+    DEBUG_WARN("ID3D11Multithread not available, CPU staging mode is not "
+      "thread safe");
+
   comRef_defineLocal(ID3D11Device5, d11device5);
   hr = ID3D11Device_QueryInterface(
     *d11device, &IID_ID3D11Device5, (void **)d11device5);
@@ -1040,22 +1069,36 @@ static bool wgc_init(WGCInstance * this, bool debug,
     {
       wgc_setD3D12ObjectNameI((ID3D12Object *)this->d3d12CopyQueues[i],
         "WGC IVSHMEM D3D12 copy queue ", i);
-      if (!d12_commandGroupCreate(*this->d12device,
-          D3D12_COMMAND_LIST_TYPE_COPY, &this->d3d12CopyCommands[i],
-          L"WGC IVSHMEM D3D12 copy"))
+      for(unsigned g = 0; g < WGC_D3D12_COPY_GROUPS; ++g)
       {
-        DEBUG_ERROR("ivshmem-d3d12-copy: failed to create copy command group");
-        goto exit;
-      }
-      hr = ID3D12GraphicsCommandList_Close(
-        *this->d3d12CopyCommands[i].gfxList);
-      if (FAILED(hr))
-      {
-        DEBUG_WINERROR("ivshmem-d3d12-copy: failed to close initial command list",
-          hr);
-        goto exit;
+        if (!d12_commandGroupCreate(*this->d12device,
+            D3D12_COMMAND_LIST_TYPE_COPY, &this->d3d12CopyCommands[i][g],
+            L"WGC IVSHMEM D3D12 copy"))
+        {
+          DEBUG_ERROR("ivshmem-d3d12-copy: failed to create copy command group");
+          goto exit;
+        }
+        hr = ID3D12GraphicsCommandList_Close(
+          *this->d3d12CopyCommands[i][g].gfxList);
+        if (FAILED(hr))
+        {
+          DEBUG_WINERROR("ivshmem-d3d12-copy: failed to close initial command list",
+            hr);
+          goto exit;
+        }
       }
       this->d3d12CopyCommandReady[i] = true;
+    }
+
+    for(unsigned i = 0; i < this->frameCount; ++i)
+    {
+      this->frames[i].d3d12CopyEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+      if (!this->frames[i].d3d12CopyEvent)
+      {
+        DEBUG_WINERROR("ivshmem-d3d12-copy: CreateEvent failed",
+          GetLastError());
+        goto exit;
+      }
     }
 
     comRef_defineLocal(ID3D11Fence, fence);
@@ -1097,6 +1140,13 @@ static bool wgc_init(WGCInstance * this, bool debug,
 
   this->frameEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
   if (!this->frameEvent)
+  {
+    DEBUG_WINERROR("CreateEvent failed", GetLastError());
+    goto exit;
+  }
+
+  this->publishEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+  if (!this->publishEvent)
   {
     DEBUG_WINERROR("CreateEvent failed", GetLastError());
     goto exit;
@@ -1158,7 +1208,8 @@ static bool wgc_deinit(WGCInstance * this)
 
   for(unsigned i = 0; i < WGC_D3D12_COPY_QUEUE_MAX; ++i)
   {
-    d12_commandGroupFree(&this->d3d12CopyCommands[i]);
+    for(unsigned g = 0; g < WGC_D3D12_COPY_GROUPS; ++g)
+      d12_commandGroupFree(&this->d3d12CopyCommands[i][g]);
     this->d3d12CopyCommandReady[i] = false;
     if (this->d3d12CopyQueues[i])
     {
@@ -1167,6 +1218,7 @@ static bool wgc_deinit(WGCInstance * this)
     }
   }
   this->d3d12CopyQueueCount = 0;
+  this->d3d12CopyGroupIndex = 0;
 
   if (this->mouseHookCreated)
   {
@@ -1204,6 +1256,12 @@ static bool wgc_deinit(WGCInstance * this)
   {
     CloseHandle(this->frameEvent);
     this->frameEvent = NULL;
+  }
+
+  if (this->publishEvent)
+  {
+    CloseHandle(this->publishEvent);
+    this->publishEvent = NULL;
   }
 
   if (this->handler)
@@ -1512,6 +1570,7 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
     if (old && old != dst)
       InterlockedCompareExchange(&old->state,
         WGC_FRAME_FREE, WGC_FRAME_READY);
+    SetEvent(this->publishEvent);
     result = CAPTURE_RESULT_OK;
     goto exit;
   }
@@ -1674,6 +1733,7 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
   if (old && old != dst)
     InterlockedCompareExchange(&old->state,
       WGC_FRAME_FREE, WGC_FRAME_READY);
+  SetEvent(this->publishEvent);
 
   result = CAPTURE_RESULT_OK;
 
@@ -2325,6 +2385,8 @@ static void wgc_releaseFrameResources(WGCFrameInfo * frame)
 static void wgc_releaseFrameInfo(WGCFrameInfo * frame)
 {
   wgc_releaseFrameResources(frame);
+  if (frame->d3d12CopyEvent)
+    CloseHandle(frame->d3d12CopyEvent);
   memset(frame, 0, sizeof(*frame));
 }
 
@@ -2941,12 +3003,17 @@ static bool wgc_copyFrameTextureD3D12(WGCInstance * this, WGCFrameInfo * dst)
   if (needsEncode)
     activeQueues = 1;
 
+  // alternate between the per-queue command groups so this frame can record
+  // while the previous frame's copy is still executing on the GPU
+  this->d3d12CopyGroupIndex ^= 1;
+  const unsigned group = this->d3d12CopyGroupIndex;
+
   for(unsigned i = 0; i < activeQueues; ++i)
   {
     if (!this->d3d12CopyCommandReady[i] || !this->d3d12CopyQueues[i])
       return false;
 
-    D12CommandGroup * cmd = &this->d3d12CopyCommands[i];
+    D12CommandGroup * cmd = &this->d3d12CopyCommands[i][group];
     d12_commandGroupWait(cmd);
     if (!d12_commandGroupReset(cmd))
       return false;
@@ -2977,7 +3044,7 @@ static bool wgc_copyFrameTextureD3D12(WGCInstance * this, WGCFrameInfo * dst)
 
   for(unsigned i = 0; i < activeQueues; ++i)
   {
-    D12CommandGroup * cmd = &this->d3d12CopyCommands[i];
+    D12CommandGroup * cmd = &this->d3d12CopyCommands[i][group];
 
     if (needsEncode)
     {
@@ -3092,8 +3159,8 @@ static bool wgc_copyFrameTextureD3D12(WGCInstance * this, WGCFrameInfo * dst)
   for(unsigned i = 0; i < activeQueues; ++i)
   {
     executed &= d12_commandGroupExecute(this->d3d12CopyQueues[i],
-      &this->d3d12CopyCommands[i]);
-    dst->d3d12CopyFenceValue[i] = this->d3d12CopyCommands[i].fenceValue;
+      &this->d3d12CopyCommands[i][group]);
+    dst->d3d12CopyFenceValue[i] = this->d3d12CopyCommands[i][group].fenceValue;
   }
   const uint64_t d3d12SubmitUs = microtime() - d3d12SubmitStartUs;
   wgcStats_recordD3D12CopySubmit(&this->stats, d3d12SubmitUs);
@@ -3105,6 +3172,7 @@ static bool wgc_copyFrameTextureD3D12(WGCInstance * this, WGCFrameInfo * dst)
   }
 
   dst->d3d12CopyQueueCount = activeQueues;
+  dst->d3d12CopyGroup      = group;
   return true;
 }
 
@@ -3115,6 +3183,7 @@ static void wgc_waitFrameD3D12Copy(WGCInstance * this, WGCFrameInfo * frame)
   if (!count)
     return;
 
+  const unsigned group = frame->d3d12CopyGroup % WGC_D3D12_COPY_GROUPS;
   const uint64_t fenceWaitStartUs = microtime();
   for(unsigned i = 0; i < count; ++i)
   {
@@ -3122,12 +3191,18 @@ static void wgc_waitFrameD3D12Copy(WGCInstance * this, WGCFrameInfo * frame)
     if (!fenceValue || !this->d3d12CopyCommandReady[i])
       continue;
 
-    D12CommandGroup * cmd = &this->d3d12CopyCommands[i];
+    D12CommandGroup * cmd = &this->d3d12CopyCommands[i][group];
     if (ID3D12Fence_GetCompletedValue(*cmd->fence) >= fenceValue)
       continue;
 
-    ID3D12Fence_SetEventOnCompletion(*cmd->fence, fenceValue, cmd->event);
-    WaitForSingleObject(cmd->event, INFINITE);
+    // wait on the frame's own event, NOT cmd->event: the producer may be in
+    // d12_commandGroupWait on this group's fence at the same time and an
+    // auto-reset event shared between two waiters can lose a wakeup.
+    // SetEventOnCompletion with a NULL event blocks until completion.
+    ID3D12Fence_SetEventOnCompletion(*cmd->fence, fenceValue,
+      frame->d3d12CopyEvent);
+    if (frame->d3d12CopyEvent)
+      WaitForSingleObject(frame->d3d12CopyEvent, INFINITE);
   }
   const uint64_t fenceWaitUs = microtime() - fenceWaitStartUs;
   wgcStats_recordD3D12FenceWait(&this->stats, fenceWaitUs);
@@ -3144,7 +3219,8 @@ static void wgc_drainGpuWork(WGCInstance * this)
 
   for(unsigned i = 0; i < WGC_D3D12_COPY_QUEUE_MAX; ++i)
     if (this->d3d12CopyCommandReady[i])
-      d12_commandGroupWait(&this->d3d12CopyCommands[i]);
+      for(unsigned g = 0; g < WGC_D3D12_COPY_GROUPS; ++g)
+        d12_commandGroupWait(&this->d3d12CopyCommands[i][g]);
 
   if (this->context && *this->context)
     ID3D11DeviceContext4_Flush(*this->context);
@@ -3959,6 +4035,13 @@ CaptureResult wgc_pollFrame(WGCInstance * this, unsigned frameBufferIndex)
   return wgc_capture(this, frameBufferIndex);
 }
 
+bool wgc_waitPublish(WGCInstance * this, unsigned timeoutMs)
+{
+  if (!this || !this->publishEvent)
+    return false;
+  return WaitForSingleObject(this->publishEvent, timeoutMs) == WAIT_OBJECT_0;
+}
+
 bool wgc_fetchCpu(WGCInstance * this, unsigned frameBufferIndex,
   WGCFrameDesc * desc, void ** map, unsigned * pitch,
   unsigned * width, unsigned * height)
@@ -4064,11 +4147,11 @@ bool wgc_fetchIvshmemDirect(WGCInstance * this, unsigned frameBufferIndex,
   if (state == WGC_FRAME_READY && this->asyncCapture && this->handler)
     InterlockedIncrement(&this->handler->framesConsumed);
 
+  // The producer already signaled and flushed the D3D11 bridge copy before
+  // submitting the D3D12 copy; once the copy-queue fence has signaled the
+  // IVSHMEM bytes are committed, so no D3D11 Flush is needed here (and the
+  // frame thread must not touch the D3D11 context).
   wgc_waitFrameD3D12Copy(this, frame);
-
-  // Force any pending GPU writes to commit before we tell the consumer the
-  // slot is ready.
-  ID3D11DeviceContext4_Flush(*this->context);
 
   *ivshmemOffset = frame->ivshmemOffset;
   // For row_major TEXTURE2D placed resources, the natural pitch is

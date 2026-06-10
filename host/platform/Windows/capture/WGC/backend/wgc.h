@@ -122,6 +122,11 @@ void wgc_freeInstance(WGCInstance ** this);
 
 CaptureResult wgc_pollFrame(WGCInstance * this, unsigned frameBufferIndex);
 
+// Block until the backend publishes a new frame or timeoutMs elapses.
+// Returns false on timeout. Used by the frame thread to pace waitFrame when
+// the host runs the capture and frame threads asynchronously.
+bool wgc_waitPublish(WGCInstance * this, unsigned timeoutMs);
+
 // CPU-staging consumer side. Returns false if no frame is currently ready.
 // On success, *map points into the mapped staging texture (valid until
 // wgc_releaseCpu is called) and *pitch / *width / *height describe it.
@@ -133,8 +138,8 @@ bool wgc_fetchCpu(WGCInstance * this, unsigned frameBufferIndex,
 void wgc_releaseCpu(WGCInstance * this, void * token);
 
 // IVSHMEM GPU-publish consumer side. WGC has written the frame bytes
-// directly into IVSHMEM at *ivshmemOffset; no map needed. Issues a Flush to make
-// sure the GPU writes have committed before the caller signals the
+// directly into IVSHMEM at *ivshmemOffset; no map needed. Waits on the copy
+// queue fence so the GPU writes have committed before the caller signals the
 // consumer. desc->backendToken must be passed back to wgc_releaseIvshmemDirect.
 bool wgc_fetchIvshmemDirect(WGCInstance * this, unsigned frameBufferIndex,
   WGCFrameDesc * desc, uint64_t * ivshmemOffset,
