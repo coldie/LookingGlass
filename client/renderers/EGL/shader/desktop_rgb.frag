@@ -10,9 +10,7 @@ precision highp int;
 #define EGL_SCALE_MAX     3
 
 #define FRAME_TYPE_NV12 7
-#define FRAME_TYPE_YUY2 8
-#define FRAME_TYPE_UYVY 9
-#define FRAME_TYPE_P010 10
+#define FRAME_TYPE_P010 8
 
 #include "color_blind.h"
 #include "hdr.h"
@@ -115,24 +113,6 @@ float sampleP010Y(vec2 pos)
          pixel.x % 4 == 2 ? yv.b : yv.a;
 }
 
-vec4 sampleYUY2(vec2 pos)
-{
-  ivec2 pixel = ivec2(clamp(pos * desktopSize,
-    vec2(0.0), max(desktopSize - vec2(1.0), vec2(0.0))));
-  vec4 p = texelFetch(sampler1, ivec2(pixel.x / 2, pixel.y), 0);
-  float y = (pixel.x & 1) == 0 ? p.r : p.b;
-  return vec4(clamp(yuvToRgb(y, p.g, p.a), 0.0, 1.0), 1.0);
-}
-
-vec4 sampleUYVY(vec2 pos)
-{
-  ivec2 pixel = ivec2(clamp(pos * desktopSize,
-    vec2(0.0), max(desktopSize - vec2(1.0), vec2(0.0))));
-  vec4 p = texelFetch(sampler1, ivec2(pixel.x / 2, pixel.y), 0);
-  float y = (pixel.x & 1) == 0 ? p.g : p.a;
-  return vec4(clamp(yuvToRgb(y, p.r, p.b), 0.0, 1.0), 1.0);
-}
-
 void main()
 {
   vec3 hdrSource = vec3(0.0);
@@ -141,10 +121,6 @@ void main()
     color = sampleNV12(uv);
   else if (frameType == FRAME_TYPE_P010)
     color = sampleP010(uv);
-  else if (frameType == FRAME_TYPE_YUY2)
-    color = sampleYUY2(uv);
-  else if (frameType == FRAME_TYPE_UYVY)
-    color = sampleUYVY(uv);
   else switch (scaleAlgo)
   {
     case EGL_SCALE_NEAREST:
@@ -168,7 +144,7 @@ void main()
   {
     float lum = frameType == FRAME_TYPE_P010 ?
       hdrPQLuminance(sampleP010Y(uv)) :
-      hdrLuminance(hdrSource, mapHDRGain, mapHDRPQ);
+      hdrLuminance(hdrSource, mapHDRPQ);
     color.rgb = falseColorHDR(lum);
     color.a = 1.0;
     return;

@@ -125,15 +125,6 @@ struct Inst
 
   bool showSpice;
   int  spiceWidth, spiceHeight;
-
-#ifdef ENABLE_HDR_DIAGNOSTICS
-  bool hdrScreenshotDone;
-  GLuint hdrScreenshotFBO;
-  GLuint hdrScreenshotTex;
-  int hdrScreenshotWidth;
-  int hdrScreenshotHeight;
-  int hdrScreenshotDelay;
-#endif
 };
 
 static struct Option egl_options[] =
@@ -268,61 +259,10 @@ static struct Option egl_options[] =
   {
     .module         = "egl",
     .name           = "hdrOutput",
-    .description    = "HDR presentation mode: sdr|pq|scrgb",
+    .description    = "HDR presentation mode: sdr|pq",
     .type           = OPTION_TYPE_STRING,
     .value.x_string = "sdr",
   },
-#ifdef ENABLE_HDR_DIAGNOSTICS
-  {
-    .module         = "egl",
-    .name           = "hdrScreenshot",
-    .description    = "Dump one rendered frame before swap as RGB float PFM",
-    .type           = OPTION_TYPE_STRING,
-    .value.x_string = "",
-  },
-  {
-    .module        = "egl",
-    .name          = "hdrScreenshotDelay",
-    .description   = "Number of rendered frames to skip before dumping hdrScreenshot",
-    .type          = OPTION_TYPE_INT,
-    .value.x_int   = 0,
-  },
-  {
-    .module         = "egl",
-    .name           = "p010Screenshot",
-    .description    = "Dump one decoded P010 frame as RGB float PFM",
-    .type           = OPTION_TYPE_STRING,
-    .value.x_string = "",
-  },
-  {
-    .module        = "egl",
-    .name          = "p010ScreenshotDelay",
-    .description   = "Number of P010 frames to skip before dumping p010Screenshot",
-    .type          = OPTION_TYPE_INT,
-    .value.x_int   = 0,
-  },
-  {
-    .module         = "egl",
-    .name           = "desktopScreenshot",
-    .description    = "Dump one desktop shader output frame as RGB float PFM",
-    .type           = OPTION_TYPE_STRING,
-    .value.x_string = "",
-  },
-  {
-    .module        = "egl",
-    .name          = "desktopScreenshotDelay",
-    .description   = "Number of rendered desktop frames to skip before dumping desktopScreenshot",
-    .type          = OPTION_TYPE_INT,
-    .value.x_int   = 0,
-  },
-  {
-    .module       = "egl",
-    .name         = "debugP010",
-    .description  = "Log raw P010 frame samples for HDR diagnostics",
-    .type         = OPTION_TYPE_BOOL,
-    .value.x_bool = false,
-  },
-#endif
 
   {0}
 };
@@ -377,9 +317,6 @@ static bool egl_create(LG_Renderer ** renderer, const LG_RendererParams params,
   this->importTimings = ringbuffer_new(256, sizeof(float));
   this->importGraph   = app_registerGraph("IMPORT", this->importTimings,
       0.0f, 5.0f, NULL);
-#ifdef ENABLE_HDR_DIAGNOSTICS
-  this->hdrScreenshotDelay = option_get_int("egl", "hdrScreenshotDelay");
-#endif
 
   *needsOpenGL = false;
   return true;
@@ -404,13 +341,6 @@ static void egl_deinitialize(LG_Renderer * renderer)
   egl_desktopFree(&this->desktop);
   egl_cursorFree (&this->cursor);
   egl_damageFree (&this->damage);
-
-#ifdef ENABLE_HDR_DIAGNOSTICS
-  if (this->hdrScreenshotTex)
-    glDeleteTextures(1, &this->hdrScreenshotTex);
-  if (this->hdrScreenshotFBO)
-    glDeleteFramebuffers(1, &this->hdrScreenshotFBO);
-#endif
 
   LG_LOCK_FREE(this->lock);
   LG_LOCK_FREE(this->desktopDamageLock);
@@ -890,10 +820,8 @@ static bool egl_renderStartup(LG_Renderer * renderer, bool useDMA)
     }
   }
 
-  const char * hdrOutput = option_get_string("egl", "hdrOutput");
-  const bool hdrOutputPQ = strcmp(hdrOutput, "pq") == 0;
-  const bool hdrOutputScRGB =
-    strcmp(hdrOutput, "scrgb") == 0 || strcmp(hdrOutput, "scRGB") == 0;
+  const bool hdrOutputPQ =
+    strcmp(option_get_string("egl", "hdrOutput"), "pq") == 0;
 
   EGLint attrHDR[] =
   {
@@ -949,30 +877,11 @@ static bool egl_renderStartup(LG_Renderer * renderer, bool useDMA)
     return false;
   }
 
-  const bool hasBT2020PQ =
-    util_hasGLExt(client_exts, "EGL_EXT_gl_colorspace_bt2020_pq");
-  const bool hasScRGBLinear =
-    util_hasGLExt(client_exts, "EGL_EXT_gl_colorspace_scrgb_linear");
-
-  EGLint surfattr[5];
-  int surfidx = 0;
-  surfattr[surfidx++] = EGL_RENDER_BUFFER;
-  surfattr[surfidx++] = this->opt.doubleBuffer ? EGL_BACK_BUFFER : EGL_SINGLE_BUFFER;
-  if (hdrOutputPQ && hasBT2020PQ)
+  const EGLint surfattr[] =
   {
-    surfattr[surfidx++] = EGL_GL_COLORSPACE_KHR;
-    surfattr[surfidx++] = EGL_GL_COLORSPACE_BT2020_PQ_EXT;
-  }
-  else if (hdrOutputScRGB && hasScRGBLinear)
-  {
-    surfattr[surfidx++] = EGL_GL_COLORSPACE_KHR;
-    surfattr[surfidx++] = EGL_GL_COLORSPACE_SCRGB_LINEAR_EXT;
-  }
-  else if (hdrOutputPQ)
-    DEBUG_WARN("egl:hdrOutput=pq requested, but EGL_EXT_gl_colorspace_bt2020_pq is unavailable");
-  else if (hdrOutputScRGB)
-    DEBUG_WARN("egl:hdrOutput=scrgb requested, but EGL_EXT_gl_colorspace_scrgb_linear is unavailable");
-  surfattr[surfidx++] = EGL_NONE;
+    EGL_RENDER_BUFFER, this->opt.doubleBuffer ? EGL_BACK_BUFFER : EGL_SINGLE_BUFFER,
+    EGL_NONE
+  };
 
   this->surface = eglCreateWindowSurface(this->display, this->configs, this->nativeWind, surfattr);
   if (this->surface == EGL_NO_SURFACE)
@@ -989,10 +898,6 @@ static bool egl_renderStartup(LG_Renderer * renderer, bool useDMA)
       DEBUG_WARN("EGL surface creation with EGL_RENDER_BUFFER failed, "
         "egl:doubleBuffer setting may not be respected");
   }
-  else if (hdrOutputPQ && hasBT2020PQ)
-    DEBUG_INFO("EGL HDR output colorspace: BT.2020/PQ");
-  else if (hdrOutputScRGB && hasScRGBLinear)
-    DEBUG_INFO("EGL HDR output colorspace: scRGB linear");
 
   bool debug = option_get_bool("egl", "debug");
   EGLint ctxattr[5];
@@ -1183,229 +1088,6 @@ inline static EGLint egl_bufferAge(struct Inst * this)
   return result;
 }
 
-#ifdef ENABLE_HDR_DIAGNOSTICS
-static bool egl_hdrScreenshotEnabled(struct Inst * this)
-{
-  if (this->hdrScreenshotDone)
-    return false;
-  if (!this->formatValid)
-    return false;
-
-  const char * path = option_get_string("egl", "hdrScreenshot");
-  return path && path[0];
-}
-
-static float egl_halfToFloat(uint16_t h)
-{
-  const uint32_t s = (uint32_t)(h & 0x8000) << 16;
-  uint32_t e = (h >> 10) & 0x1f;
-  uint32_t m = h & 0x03ff;
-
-  uint32_t f;
-  if (e == 0)
-  {
-    if (m == 0)
-      f = s;
-    else
-    {
-      e = 1;
-      while ((m & 0x0400) == 0)
-      {
-        m <<= 1;
-        --e;
-      }
-      m &= 0x03ff;
-      f = s | ((e + 127 - 15) << 23) | (m << 13);
-    }
-  }
-  else if (e == 31)
-    f = s | 0x7f800000 | (m << 13);
-  else
-    f = s | ((e + 127 - 15) << 23) | (m << 13);
-
-  float out;
-  memcpy(&out, &f, sizeof(out));
-  return out;
-}
-
-static void egl_hdrScreenshot(struct Inst * this)
-{
-  if (!egl_hdrScreenshotEnabled(this))
-    return;
-
-  const char * path = option_get_string("egl", "hdrScreenshot");
-  if (this->hdrScreenshotDelay > 0)
-  {
-    --this->hdrScreenshotDelay;
-    return;
-  }
-
-  glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-
-  GLint readFormat = 0;
-  GLint readType   = 0;
-  glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_FORMAT, &readFormat);
-  glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_TYPE  , &readType  );
-
-  const size_t pixels = (size_t)this->width * (size_t)this->height;
-  float * data = malloc(pixels * 4 * sizeof(*data));
-  if (!data)
-  {
-    DEBUG_ERROR("Failed to allocate HDR screenshot buffer");
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    this->hdrScreenshotDone = true;
-    return;
-  }
-
-  size_t pixelBytes = 0;
-  const bool readRGB  = readFormat == GL_RGB;
-  const bool readRGBA = readFormat == GL_RGBA;
-  if (!readRGB && !readRGBA)
-  {
-    DEBUG_ERROR("HDR screenshot unsupported read format: 0x%x", readFormat);
-    free(data);
-    this->hdrScreenshotDone = true;
-    return;
-  }
-
-  const int channels = readRGBA ? 4 : 3;
-  switch(readType)
-  {
-    case GL_UNSIGNED_BYTE:
-      pixelBytes = (size_t)channels;
-      break;
-    case GL_UNSIGNED_SHORT:
-    case GL_HALF_FLOAT:
-      pixelBytes = (size_t)channels * sizeof(uint16_t);
-      break;
-    case GL_FLOAT:
-      pixelBytes = (size_t)channels * sizeof(float);
-      break;
-    case GL_UNSIGNED_INT_2_10_10_10_REV:
-      if (!readRGBA)
-      {
-        DEBUG_ERROR("HDR screenshot packed RGB10 read returned non-RGBA "
-          "format: 0x%x", readFormat);
-        free(data);
-        this->hdrScreenshotDone = true;
-        return;
-      }
-      pixelBytes = sizeof(uint32_t);
-      break;
-    default:
-      DEBUG_ERROR("HDR screenshot unsupported read type: 0x%x", readType);
-      free(data);
-      this->hdrScreenshotDone = true;
-      return;
-  }
-
-  uint8_t * raw = malloc(pixels * pixelBytes);
-  if (!raw)
-  {
-    DEBUG_ERROR("Failed to allocate HDR screenshot raw buffer");
-    free(data);
-    this->hdrScreenshotDone = true;
-    return;
-  }
-
-  glPixelStorei(GL_PACK_ALIGNMENT, 1);
-  glReadPixels(0, 0, this->width, this->height,
-    (GLenum)readFormat, (GLenum)readType, raw);
-  GLenum err = glGetError();
-  if (err != GL_NO_ERROR)
-  {
-    DEBUG_ERROR("HDR screenshot glReadPixels failed: 0x%x "
-      "(format:0x%x type:0x%x)", err, readFormat, readType);
-    free(raw);
-    free(data);
-    this->hdrScreenshotDone = true;
-    return;
-  }
-
-  DEBUG_INFO("HDR screenshot readback format:0x%x type:0x%x",
-    readFormat, readType);
-  for (size_t i = 0; i < pixels; ++i)
-  {
-    float rgba[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    const uint8_t * px = raw + i * pixelBytes;
-    switch(readType)
-    {
-      case GL_UNSIGNED_BYTE:
-        for (int c = 0; c < channels; ++c)
-          rgba[c] = (float)px[c] / 255.0f;
-        break;
-
-      case GL_UNSIGNED_SHORT:
-      {
-        const uint16_t * v = (const uint16_t *)px;
-        for (int c = 0; c < channels; ++c)
-          rgba[c] = (float)v[c] / 65535.0f;
-        break;
-      }
-
-      case GL_HALF_FLOAT:
-      {
-        const uint16_t * v = (const uint16_t *)px;
-        for (int c = 0; c < channels; ++c)
-          rgba[c] = egl_halfToFloat(v[c]);
-        break;
-      }
-
-      case GL_FLOAT:
-      {
-        const float * v = (const float *)px;
-        for (int c = 0; c < channels; ++c)
-          rgba[c] = v[c];
-        break;
-      }
-
-      case GL_UNSIGNED_INT_2_10_10_10_REV:
-      {
-        uint32_t v;
-        memcpy(&v, px, sizeof(v));
-        rgba[0] = (float)( v        & 0x3ffu) / 1023.0f;
-        rgba[1] = (float)((v >> 10) & 0x3ffu) / 1023.0f;
-        rgba[2] = (float)((v >> 20) & 0x3ffu) / 1023.0f;
-        rgba[3] = (float)((v >> 30) & 0x003u) / 3.0f;
-        break;
-      }
-    }
-
-    data[i * 4 + 0] = rgba[0];
-    data[i * 4 + 1] = rgba[1];
-    data[i * 4 + 2] = rgba[2];
-    data[i * 4 + 3] = rgba[3];
-  }
-  free(raw);
-
-  FILE * f = fopen(path, "wb");
-  if (!f)
-  {
-    DEBUG_ERROR("Failed to open HDR screenshot path: %s", path);
-    free(data);
-    this->hdrScreenshotDone = true;
-    return;
-  }
-
-  fprintf(f, "PF\n%d %d\n-1.0\n", this->width, this->height);
-  for (int y = this->height - 1; y >= 0; --y)
-  {
-    const float * src = data + (size_t)y * (size_t)this->width * 4;
-    for (int x = 0; x < this->width; ++x)
-      fwrite(src + (size_t)x * 4, sizeof(*data), 3, f);
-  }
-
-  if (fclose(f) != 0)
-    DEBUG_ERROR("Failed to finish HDR screenshot write: %s", path);
-  else
-    DEBUG_INFO("Wrote HDR screenshot: %s (%dx%d RGB float PFM)",
-        path, this->width, this->height);
-
-  free(data);
-  this->hdrScreenshotDone = true;
-}
-#endif
-
 inline static void renderLetterBox(struct Inst * this)
 {
   bool hLB = this->destRect.x > 0;
@@ -1453,11 +1135,7 @@ static bool egl_render(LG_Renderer * renderer, LG_RendererRotate rotate,
   EGLint bufferAge   = egl_bufferAge(this);
   bool renderAll     = invalidateWindow || this->hadOverlay ||
                        bufferAge <= 0 || bufferAge > MAX_BUFFER_AGE ||
-                       this->showSpice
-#ifdef ENABLE_HDR_DIAGNOSTICS
-                       || egl_hdrScreenshotEnabled(this)
-#endif
-                       ;
+                       this->showSpice;
 
   bool hasOverlay = false;
   struct CursorState cursorState = { .visible = false };
@@ -1550,9 +1228,6 @@ static bool egl_render(LG_Renderer * renderer, LG_RendererRotate rotate,
   }
 
   renderLetterBox(this);
-#ifdef ENABLE_HDR_DIAGNOSTICS
-  egl_hdrScreenshot(this);
-#endif
 
   hasOverlay |=
     egl_damageRender(this->damage, rotate, newFrame ? desktopDamage : NULL) |

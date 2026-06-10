@@ -395,19 +395,7 @@ static struct wp_image_description_v1 * waylandCreatePQDescription(void)
   return wp_image_description_creator_params_v1_create(params);
 }
 
-static struct wp_image_description_v1 * waylandCreateScRGBDescription(void)
-{
-  if (!wlWm.colorFeatureWindowsScRGB)
-  {
-    DEBUG_WARN("Wayland color-management Windows-scRGB output unavailable");
-    return NULL;
-  }
-
-  return wp_color_manager_v1_create_windows_scrgb(wlWm.colorManager);
-}
-
-static bool waylandWindowInitColorManagement(
-    bool pqOutput, bool scRGBOutput)
+static bool waylandWindowInitColorManagement(void)
 {
   if (!wlWm.colorManager || !wlWm.colorManagerDone)
     return false;
@@ -433,7 +421,7 @@ static bool waylandWindowInitColorManagement(
   }
 
   struct wp_image_description_v1 * imageDescription =
-    pqOutput ? waylandCreatePQDescription() : waylandCreateScRGBDescription();
+    waylandCreatePQDescription();
   if (!imageDescription)
     return false;
 
@@ -448,71 +436,19 @@ static bool waylandWindowInitColorManagement(
       WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
   wp_image_description_v1_destroy(imageDescription);
 
-  DEBUG_INFO("Wayland HDR output: %s via color-management-v1",
-    pqOutput ? "BT.2020/PQ" : "Windows-scRGB");
-  return true;
-}
-
-static bool waylandWindowInitFrogColor(
-    bool pqOutput, bool scRGBOutput, const char * hdrOutput)
-{
-  if (!pqOutput && !scRGBOutput)
-    return true;
-
-  if (!wlWm.frogColorManagement)
-  {
-    DEBUG_WARN("egl:hdrOutput=%s requested, but frog color management is unavailable",
-      hdrOutput);
-    return false;
-  }
-
-  wlWm.frogColorSurface =
-    frog_color_management_factory_v1_get_color_managed_surface(
-        wlWm.frogColorManagement, wlWm.surface);
-  if (!wlWm.frogColorSurface)
-  {
-    DEBUG_WARN("Failed to create frog color managed surface");
-    return false;
-  }
-
-  frog_color_managed_surface_set_known_transfer_function(
-      wlWm.frogColorSurface,
-      pqOutput ?
-        FROG_COLOR_MANAGED_SURFACE_TRANSFER_FUNCTION_ST2084_PQ :
-        FROG_COLOR_MANAGED_SURFACE_TRANSFER_FUNCTION_SCRGB_LINEAR);
-  frog_color_managed_surface_set_known_container_color_volume(
-      wlWm.frogColorSurface,
-      pqOutput ?
-        FROG_COLOR_MANAGED_SURFACE_PRIMARIES_REC2020 :
-        FROG_COLOR_MANAGED_SURFACE_PRIMARIES_REC709);
-  frog_color_managed_surface_set_render_intent(
-      wlWm.frogColorSurface,
-      FROG_COLOR_MANAGED_SURFACE_RENDER_INTENT_PERCEPTUAL);
-
-  if (pqOutput)
-    frog_color_managed_surface_set_hdr_metadata(
-        wlWm.frogColorSurface,
-        34000, 16000, 13250, 34500, 7500, 3000, 15635, 16450,
-        10000, 1, 10000, 400);
-
-  DEBUG_INFO("Wayland HDR output: %s via frog color management",
-    pqOutput ? "BT.2020/PQ" : "scRGB linear");
+  DEBUG_INFO("Wayland HDR output: BT.2020/PQ via color-management-v1");
   return true;
 }
 
 static void waylandWindowInitHDR(void)
 {
   const char * hdrOutput = option_get_string("egl", "hdrOutput");
-  const bool pqOutput = hdrOutput && strcmp(hdrOutput, "pq") == 0;
-  const bool scRGBOutput = hdrOutput &&
-    (strcmp(hdrOutput, "scrgb") == 0 || strcmp(hdrOutput, "scRGB") == 0);
-  if (!pqOutput && !scRGBOutput)
+  if (!hdrOutput || strcmp(hdrOutput, "pq") != 0)
     return;
 
-  if (waylandWindowInitColorManagement(pqOutput, scRGBOutput))
-    return;
-
-  waylandWindowInitFrogColor(pqOutput, scRGBOutput, hdrOutput);
+  if (!waylandWindowInitColorManagement())
+    DEBUG_WARN("egl:hdrOutput=pq requested, but color-management-v1 is "
+        "unavailable");
 }
 
 bool waylandWindowInit(const char * title, const char * appId, bool fullscreen, bool maximize, bool borderless, bool resizable)
@@ -557,8 +493,6 @@ void waylandWindowFree(void)
     wp_color_management_surface_feedback_v1_destroy(wlWm.colorFeedback);
   if (wlWm.colorSurface)
     wp_color_management_surface_v1_destroy(wlWm.colorSurface);
-  if (wlWm.frogColorSurface)
-    frog_color_managed_surface_destroy(wlWm.frogColorSurface);
   wl_surface_destroy(wlWm.surface);
   lgFreeEvent(wlWm.frameEvent);
 }

@@ -45,41 +45,6 @@
 #include "postprocess.h"
 #include "filters.h"
 
-#ifdef ENABLE_HDR_DIAGNOSTICS
-static float egl_desktopHalfToFloat(uint16_t h)
-{
-  const uint32_t s = (uint32_t)(h & 0x8000) << 16;
-  uint32_t e = (h >> 10) & 0x1f;
-  uint32_t m = h & 0x03ff;
-
-  uint32_t f;
-  if (e == 0)
-  {
-    if (m == 0)
-      f = s;
-    else
-    {
-      e = 1;
-      while ((m & 0x0400) == 0)
-      {
-        m <<= 1;
-        --e;
-      }
-      m &= 0x03ff;
-      f = s | ((e + 127 - 15) << 23) | (m << 13);
-    }
-  }
-  else if (e == 31)
-    f = s | 0x7f800000 | (m << 13);
-  else
-    f = s | ((e + 127 - 15) << 23) | (m << 13);
-
-  float out;
-  memcpy(&out, &f, sizeof(out));
-  return out;
-}
-#endif
-
 struct DesktopShader
 {
   EGL_Shader * shader;
@@ -158,17 +123,6 @@ struct EGL_Desktop
   int   maxCLL;
   int   hdrMappingMode;
   int   hdrViewMode;
-#ifdef ENABLE_HDR_DIAGNOSTICS
-  bool  debugP010;
-  bool  p010ScreenshotDone;
-  int   p010ScreenshotDelay;
-  bool  desktopScreenshotDone;
-  int   desktopScreenshotDelay;
-  GLuint desktopScreenshotFBO;
-  GLuint desktopScreenshotTex;
-  int   desktopScreenshotWidth;
-  int   desktopScreenshotHeight;
-#endif
 
   EGL_PostProcess * pp;
   _Atomic(bool) processFrame;
@@ -322,14 +276,6 @@ bool egl_desktopInit(EGL * egl, EGL_Desktop ** desktop_, EGLDisplay * display,
       desktop->hdrOutputPQ);
   desktop->hdrViewMode =
     egl_parseHDRViewMode(option_get_string("egl", "hdrView"));
-#ifdef ENABLE_HDR_DIAGNOSTICS
-  desktop->debugP010    = option_get_bool("egl", "debugP010");
-  desktop->p010ScreenshotDelay = option_get_int("egl", "p010ScreenshotDelay");
-  desktop->p010ScreenshotDone = false;
-  desktop->desktopScreenshotDelay =
-    option_get_int("egl", "desktopScreenshotDelay");
-  desktop->desktopScreenshotDone = false;
-#endif
 
   if (!egl_postProcessInit(&desktop->pp))
   {
@@ -379,12 +325,6 @@ void egl_desktopFree(EGL_Desktop ** desktop)
   egl_shaderFree     (&(*desktop)->dmaShader.shader);
   egl_desktopRectsFree(&(*desktop)->mesh           );
   countedBufferRelease(&(*desktop)->matrix         );
-#ifdef ENABLE_HDR_DIAGNOSTICS
-  if ((*desktop)->desktopScreenshotTex)
-    glDeleteTextures(1, &(*desktop)->desktopScreenshotTex);
-  if ((*desktop)->desktopScreenshotFBO)
-    glDeleteFramebuffers(1, &(*desktop)->desktopScreenshotFBO);
-#endif
 
   egl_postProcessFree(&(*desktop)->pp);
 
@@ -410,328 +350,6 @@ static const char * hdrViewNames[EGL_HDR_VIEW_MAX] = {
   [EGL_HDR_VIEW_NORMAL]      = "Normal",
   [EGL_HDR_VIEW_FALSE_COLOR] = "False color"
 };
-
-#ifdef ENABLE_HDR_DIAGNOSTICS
-static uint16_t egl_p010ReadSample(const FrameBuffer * frame, size_t offset)
-{
-  uint16_t value = 0;
-  if (!framebuffer_wait(frame, offset + sizeof(value)))
-    return 0;
-  memcpy(&value, framebuffer_get_buffer(frame) + offset, sizeof(value));
-  return value;
-}
-
-static void egl_desktopLogP010Samples(
-  const EGL_Desktop * desktop, const FrameBuffer * frame)
-{
-  static uint64_t lastLog = 0;
-  const uint64_t now = microtime();
-  if (now - lastLog < 1000 * 1000)
-    return;
-  lastLog = now;
-
-  const size_t pitch = desktop->format.pitch;
-  const unsigned width = desktop->format.frameWidth;
-  const unsigned height = desktop->format.frameHeight;
-  const unsigned xs[5] = {
-    0,
-    width / 4,
-    width / 2,
-    (width * 3) / 4,
-    width ? width - 1 : 0
-  };
-  const unsigned ys[3] = {
-    0,
-    height / 2,
-    height ? height - 1 : 0
-  };
-
-  char msg[512];
-  uint16_t minY = UINT16_MAX;
-  uint16_t maxY = 0;
-  uint64_t sumY = 0;
-  unsigned nonzeroY = 0;
-  unsigned samplesY = 0;
-
-  for(unsigned y = 0; y < height; y += max(1u, height / 36))
-  {
-    for(unsigned x = 0; x < width; x += max(1u, width / 64))
-    {
-      const size_t off = (size_t)y * pitch + (size_t)(x / 4) * 8 +
-        (size_t)(x % 4) * 2;
-      const uint16_t value = egl_p010ReadSample(frame, off);
-      minY = min(minY, value);
-      maxY = max(maxY, value);
-      sumY += value;
-      nonzeroY += value != 0;
-      ++samplesY;
-    }
-  }
-
-  int len = snprintf(msg, sizeof(msg),
-    "P010 raw samples pitch:%zu stride:%u size:%ux%u scan:min/avg/max:%u/%" PRIu64 "/%u nonzero:%u/%u",
-    pitch, desktop->format.stride, width, height,
-    minY == UINT16_MAX ? 0 : minY,
-    samplesY ? sumY / samplesY : 0,
-    maxY, nonzeroY, samplesY);
-
-  for(unsigned yi = 0; yi < ARRAY_LENGTH(ys) && len < (int)sizeof(msg); ++yi)
-  {
-    const unsigned y = ys[yi];
-    for(unsigned xi = 0; xi < ARRAY_LENGTH(xs) && len < (int)sizeof(msg); ++xi)
-    {
-      const unsigned x = xs[xi];
-      const size_t off = (size_t)y * pitch + (size_t)(x / 4) * 8 +
-        (size_t)(x % 4) * 2;
-      len += snprintf(msg + len, sizeof(msg) - (size_t)len,
-        " Y[%u,%u]=%u", x, y, egl_p010ReadSample(frame, off));
-    }
-  }
-
-  const unsigned uvY = height + height / 4;
-  for(unsigned xi = 0; xi < ARRAY_LENGTH(xs) && len < (int)sizeof(msg); ++xi)
-  {
-    const unsigned x = (xs[xi] / 2) * 2;
-    const size_t uOff = (size_t)uvY * pitch + (size_t)(x / 4) * 8 +
-      (size_t)(x % 4) * 2;
-    const size_t vOff = (size_t)uvY * pitch + (size_t)((x + 1) / 4) * 8 +
-      (size_t)((x + 1) % 4) * 2;
-    len += snprintf(msg + len, sizeof(msg) - (size_t)len,
-      " UV[%u,%u]=%u/%u", x, uvY,
-      egl_p010ReadSample(frame, uOff), egl_p010ReadSample(frame, vOff));
-  }
-
-  DEBUG_INFO("%s", msg);
-}
-#endif
-
-#ifdef ENABLE_HDR_DIAGNOSTICS
-static void egl_desktopWriteP010Screenshot(
-  EGL_Desktop * desktop, const FrameBuffer * frame)
-{
-  if (desktop->p010ScreenshotDone ||
-      desktop->format.type != FRAME_TYPE_P010)
-    return;
-
-  const char * path = option_get_string("egl", "p010Screenshot");
-  if (!path || !path[0])
-    return;
-
-  if (desktop->p010ScreenshotDelay > 0)
-  {
-    --desktop->p010ScreenshotDelay;
-    return;
-  }
-
-  const size_t size = (size_t)desktop->format.dataHeight * desktop->format.pitch;
-  if (!framebuffer_wait(frame, size))
-  {
-    DEBUG_ERROR("P010 screenshot framebuffer did not fill");
-    desktop->p010ScreenshotDone = true;
-    return;
-  }
-
-  FILE * f = fopen(path, "wb");
-  if (!f)
-  {
-    DEBUG_ERROR("Failed to open P010 screenshot path: %s", path);
-    desktop->p010ScreenshotDone = true;
-    return;
-  }
-
-  const uint8_t * data = framebuffer_get_buffer(frame);
-  const unsigned width = desktop->format.frameWidth;
-  const unsigned height = desktop->format.frameHeight;
-  const size_t pitch = desktop->format.pitch;
-
-  fprintf(f, "PF\n%u %u\n-1.0\n", width, height);
-  for (unsigned y = 0; y < height; ++y)
-  {
-    for (unsigned x = 0; x < width; ++x)
-    {
-      const size_t yOff = (size_t)y * pitch + (size_t)(x / 4) * 8 +
-        (size_t)(x % 4) * 2;
-      const unsigned uvX = (x / 2) * 2;
-      const unsigned uvY = height + y / 2;
-      const size_t uOff = (size_t)uvY * pitch + (size_t)(uvX / 4) * 8 +
-        (size_t)(uvX % 4) * 2;
-      const size_t vOff = (size_t)uvY * pitch + (size_t)((uvX + 1) / 4) * 8 +
-        (size_t)((uvX + 1) % 4) * 2;
-
-      uint16_t yv, uv, vv;
-      memcpy(&yv, data + yOff, sizeof(yv));
-      memcpy(&uv, data + uOff, sizeof(uv));
-      memcpy(&vv, data + vOff, sizeof(vv));
-
-      const float yf = (float)yv / 65535.0f;
-      const float uf = (float)uv / 65535.0f - 0.5f;
-      const float vf = (float)vv / 65535.0f - 0.5f;
-      float rgb[3] = {
-        yf + 1.4746f * vf,
-        yf - 0.1646f * uf - 0.5714f * vf,
-        yf + 1.8814f * uf
-      };
-
-      for (unsigned c = 0; c < 3; ++c)
-        rgb[c] = rgb[c] < 0.0f ? 0.0f : (rgb[c] > 1.0f ? 1.0f : rgb[c]);
-
-      fwrite(rgb, sizeof(float), 3, f);
-    }
-  }
-
-  if (fclose(f) != 0)
-    DEBUG_ERROR("Failed to finish P010 screenshot write: %s", path);
-  else
-    DEBUG_INFO("Wrote P010 decoded screenshot: %s (%ux%u RGB float PFM)",
-        path, width, height);
-
-  desktop->p010ScreenshotDone = true;
-}
-#endif
-
-#ifdef ENABLE_HDR_DIAGNOSTICS
-static void egl_desktopWriteRenderedScreenshot(
-  EGL_Desktop * desktop, const struct DesktopShader * shader,
-  EGL_Texture * texture, unsigned int desktopWidth, unsigned int desktopHeight,
-  unsigned int outputWidth, unsigned int outputHeight)
-{
-  if (desktop->desktopScreenshotDone)
-    return;
-
-  const char * path = option_get_string("egl", "desktopScreenshot");
-  if (!path || !path[0])
-    return;
-
-  if (desktop->desktopScreenshotDelay > 0)
-  {
-    --desktop->desktopScreenshotDelay;
-    return;
-  }
-
-  if (desktop->desktopScreenshotWidth != (int)outputWidth ||
-      desktop->desktopScreenshotHeight != (int)outputHeight)
-  {
-    if (!desktop->desktopScreenshotFBO)
-      glGenFramebuffers(1, &desktop->desktopScreenshotFBO);
-    if (!desktop->desktopScreenshotTex)
-      glGenTextures(1, &desktop->desktopScreenshotTex);
-
-    glBindTexture(GL_TEXTURE_2D, desktop->desktopScreenshotTex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F,
-        outputWidth, outputHeight, 0, GL_RGBA, GL_HALF_FLOAT, NULL);
-
-    glBindFramebuffer(GL_FRAMEBUFFER, desktop->desktopScreenshotFBO);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-        GL_TEXTURE_2D, desktop->desktopScreenshotTex, 0);
-    glDrawBuffers(1, &(GLenum){ GL_COLOR_ATTACHMENT0 });
-
-    const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if (status != GL_FRAMEBUFFER_COMPLETE)
-    {
-      DEBUG_ERROR("Desktop screenshot framebuffer incomplete: 0x%x", status);
-      glBindFramebuffer(GL_FRAMEBUFFER, 0);
-      desktop->desktopScreenshotDone = true;
-      return;
-    }
-
-    desktop->desktopScreenshotWidth  = outputWidth;
-    desktop->desktopScreenshotHeight = outputHeight;
-  }
-
-  glBindFramebuffer(GL_FRAMEBUFFER, desktop->desktopScreenshotFBO);
-  glViewport(0, 0, outputWidth, outputHeight);
-  glClear(GL_COLOR_BUFFER_BIT);
-  egl_textureBind(texture);
-  egl_shaderUse(shader->shader);
-
-  GLfloat savedMatrix[6];
-  memcpy(savedMatrix, desktop->matrix->data, sizeof(savedMatrix));
-  egl_desktopRectsMatrix((float *)desktop->matrix->data,
-      desktopWidth, desktopHeight, 0.0f, 0.0f, 1.0f, 1.0f, LG_ROTATE_0);
-  EGL_Uniform screenshotTransform =
-  {
-    .type        = EGL_UNIFORM_TYPE_M3x2FV,
-    .location    = shader->uTransform,
-    .m.transpose = GL_FALSE,
-    .m.v         = desktop->matrix
-  };
-  egl_shaderSetUniforms(shader->shader, &screenshotTransform, 1);
-
-  egl_desktopRectsUpdate(desktop->mesh, NULL, desktopWidth, desktopHeight);
-  egl_desktopRectsRender(desktop->mesh);
-
-  memcpy(desktop->matrix->data, savedMatrix, sizeof(savedMatrix));
-  EGL_Uniform restoreTransform =
-  {
-    .type        = EGL_UNIFORM_TYPE_M3x2FV,
-    .location    = shader->uTransform,
-    .m.transpose = GL_FALSE,
-    .m.v         = desktop->matrix
-  };
-  egl_shaderSetUniforms(shader->shader, &restoreTransform, 1);
-
-  const size_t pixels = (size_t)outputWidth * (size_t)outputHeight;
-  uint16_t * half = malloc(pixels * 4 * sizeof(*half));
-  if (!half)
-  {
-    DEBUG_ERROR("Failed to allocate desktop screenshot half-float buffer");
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    desktop->desktopScreenshotDone = true;
-    return;
-  }
-
-  glPixelStorei(GL_PACK_ALIGNMENT, 1);
-  glReadPixels(0, 0, outputWidth, outputHeight, GL_RGBA, GL_HALF_FLOAT, half);
-  const GLenum err = glGetError();
-  if (err != GL_NO_ERROR)
-  {
-    DEBUG_ERROR("Desktop screenshot glReadPixels failed: 0x%x", err);
-    free(half);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    desktop->desktopScreenshotDone = true;
-    return;
-  }
-
-  FILE * f = fopen(path, "wb");
-  if (!f)
-  {
-    DEBUG_ERROR("Failed to open desktop screenshot path: %s", path);
-    free(half);
-    desktop->desktopScreenshotDone = true;
-    return;
-  }
-
-  fprintf(f, "PF\n%u %u\n-1.0\n", outputWidth, outputHeight);
-  for (int y = (int)outputHeight - 1; y >= 0; --y)
-  {
-    const uint16_t * src = half + (size_t)y * (size_t)outputWidth * 4;
-    for (unsigned int x = 0; x < outputWidth; ++x)
-    {
-      const uint16_t * px = src + (size_t)x * 4;
-      const float rgb[3] =
-      {
-        egl_desktopHalfToFloat(px[0]),
-        egl_desktopHalfToFloat(px[1]),
-        egl_desktopHalfToFloat(px[2])
-      };
-      fwrite(rgb, sizeof(*rgb), 3, f);
-    }
-  }
-
-  if (fclose(f) != 0)
-    DEBUG_ERROR("Failed to finish desktop screenshot write: %s", path);
-  else
-    DEBUG_INFO("Wrote desktop shader screenshot: %s (%ux%u RGB float PFM)",
-        path, outputWidth, outputHeight);
-
-  free(half);
-  desktop->desktopScreenshotDone = true;
-}
-#endif
 
 void egl_desktopConfigUI(EGL_Desktop * desktop)
 {
@@ -868,14 +486,6 @@ bool egl_desktopSetup(EGL_Desktop * desktop, const LG_RendererFormat format)
       pixFmt = EGL_PF_P010;
       break;
 
-    case FRAME_TYPE_YUY2:
-      pixFmt = EGL_PF_YUY2;
-      break;
-
-    case FRAME_TYPE_UYVY:
-      pixFmt = EGL_PF_UYVY;
-      break;
-
     default:
       DEBUG_ERROR("Unsupported frame format");
       return false;
@@ -883,9 +493,7 @@ bool egl_desktopSetup(EGL_Desktop * desktop, const LG_RendererFormat format)
 
   const bool yuvFrame =
     format.type == FRAME_TYPE_NV12 ||
-    format.type == FRAME_TYPE_P010 ||
-    format.type == FRAME_TYPE_YUY2 ||
-    format.type == FRAME_TYPE_UYVY;
+    format.type == FRAME_TYPE_P010;
   if (desktop->useDMA && yuvFrame)
   {
     desktop->useDMA = false;
@@ -924,9 +532,7 @@ bool egl_desktopUpdate(EGL_Desktop * desktop, const FrameBuffer * frame, int dma
 {
   const bool yuvFrame =
     desktop->format.type == FRAME_TYPE_NV12 ||
-    desktop->format.type == FRAME_TYPE_P010 ||
-    desktop->format.type == FRAME_TYPE_YUY2 ||
-    desktop->format.type == FRAME_TYPE_UYVY;
+    desktop->format.type == FRAME_TYPE_P010;
 
   if (likely(desktop->useDMA && dmaFd >= 0 && !yuvFrame))
   {
@@ -970,11 +576,6 @@ bool egl_desktopUpdate(EGL_Desktop * desktop, const FrameBuffer * frame, int dma
   {
     damageRects = NULL;
     damageRectsCount = 0;
-#ifdef ENABLE_HDR_DIAGNOSTICS
-    if (desktop->debugP010 && desktop->format.type == FRAME_TYPE_P010)
-      egl_desktopLogP010Samples(desktop, frame);
-    egl_desktopWriteP010Screenshot(desktop, frame);
-#endif
   }
 
   if (likely(egl_textureUpdateFromFrame(desktop->texture, frame,
@@ -1029,9 +630,7 @@ bool egl_desktopRender(EGL_Desktop * desktop, unsigned int outputWidth,
   int scaleAlgo = EGL_SCALE_NEAREST;
   const bool yuvFrame =
     desktop->format.type == FRAME_TYPE_NV12 ||
-    desktop->format.type == FRAME_TYPE_P010 ||
-    desktop->format.type == FRAME_TYPE_YUY2 ||
-    desktop->format.type == FRAME_TYPE_UYVY;
+    desktop->format.type == FRAME_TYPE_P010;
   if (yuvFrame)
     dma = false;
 
@@ -1180,10 +779,6 @@ bool egl_desktopRender(EGL_Desktop * desktop, unsigned int outputWidth,
   };
 
   egl_shaderSetUniforms(shader->shader, uniforms, ARRAY_LENGTH(uniforms));
-#ifdef ENABLE_HDR_DIAGNOSTICS
-  egl_desktopWriteRenderedScreenshot(desktop, shader, texture, width, height,
-      width, height);
-#endif
 
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   egl_resetViewport(desktop->egl);

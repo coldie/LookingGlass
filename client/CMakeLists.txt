@@ -48,9 +48,6 @@ add_feature_info(ENABLE_PIPEWIRE ENABLE_PIPEWIRE "PipeWire audio support.")
 option(ENABLE_PULSEAUDIO "Build with PulseAudio audio output support" ON)
 add_feature_info(ENABLE_PULSEAUDIO ENABLE_PULSEAUDIO "PulseAudio audio support.")
 
-option(ENABLE_HDR_DIAGNOSTICS "Enable HDR diagnostic screenshot/logging options" OFF)
-add_feature_info(ENABLE_HDR_DIAGNOSTICS ENABLE_HDR_DIAGNOSTICS "HDR diagnostic tools.")
-
 add_compile_options(
   "-Wall"
   "-Wextra"
@@ -75,10 +72,6 @@ endif()
 
 if (ENABLE_EGL)
   add_definitions(-D ENABLE_EGL)
-endif()
-
-if (ENABLE_HDR_DIAGNOSTICS)
-  add_definitions(-D ENABLE_HDR_DIAGNOSTICS)
 endif()
 
 if(ENABLE_ASAN)

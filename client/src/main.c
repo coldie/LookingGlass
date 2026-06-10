@@ -739,11 +739,6 @@ int main_frameThread(void * unused)
           lgrFormat.bpp  = 24;
           break;
 
-        case FRAME_TYPE_YUY2:
-        case FRAME_TYPE_UYVY:
-          lgrFormat.bpp  = 16;
-          break;
-
         case FRAME_TYPE_NV12:
           lgrFormat.bpp = 12;
           break;

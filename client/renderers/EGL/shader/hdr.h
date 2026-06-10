@@ -56,18 +56,7 @@ const float c3    = 2392.0 / 128.0;
 #define HDR_VIEW_NORMAL      0
 #define HDR_VIEW_FALSE_COLOR 1
 
-float minGain(vec3 pixel) { return min(pixel.r, min(pixel.g, pixel.b)); }
 float maxGain(vec3 pixel) { return max(pixel.r, max(pixel.g, pixel.b)); }
-float midGain(vec3 pixel)
-{
-  return pixel.r < pixel.g ?
-    (pixel.r < pixel.b ?
-      min(pixel.g, pixel.b) : // min = r
-      min(pixel.r, pixel.g)) : // min = b
-    (pixel.g < pixel.b ?
-      min(pixel.r, pixel.b) : // min = g
-      min(pixel.r, pixel.g)); // min = b
-}
 
 vec3 compress(vec3 pixel)
 {
@@ -78,28 +67,9 @@ vec3 compress(vec3 pixel)
       knee + max(maxGain - knee, 0.0) * compressor) / maxGain;
 }
 
-vec3 fixClip(vec3 pixel)
-{
-  // keep the (mid - min) / (max - min) ratio
-  float preMin  = minGain(pixel);
-  float preMid  = midGain(pixel);
-  float preMax  = maxGain(pixel);
-  vec3  clip    = clamp(pixel, 0.0, 1.0);
-  if (preMax - preMin < 0.0001)
-    return clip;
-  float postMin = minGain(clip);
-  float postMid = midGain(clip);
-  float postMax = maxGain(clip);
-  float ratio   = (preMid - preMin) / (preMax - preMin);
-  float newMid  = ratio * (postMax - postMin) + postMin;
-  return vec3(clip.r != postMid ? clip.r : newMid,
-                clip.g != postMid ? clip.g : newMid,
-                clip.b != postMid ? clip.b : newMid);
-}
-
 // Decode PQ to scRGB-relative linear light. The WGC preserve-pq path encodes
 // scRGB with 1.0 == 80 nits, so this reconstructs the same scale as RGBA16F.
-vec3 pq2lin(vec3 pq, float gain)
+vec3 pq2lin(vec3 pq)
 {
   vec3 p = pow(pq, vec3(m2inv));
   vec3 d = max(p - c1, vec3(0.0)) / (c2 - c3 * p);
@@ -214,7 +184,7 @@ vec3 mapHDRLinearToTarget(vec3 linear, float targetNits, float sourceNits,
 
 vec3 mapPQToTarget(vec3 pq, float targetNits, float sourceNits, int mode)
 {
-  return lin2pq(mapHDRLinearToTarget(pq2lin(pq, targetNits),
+  return lin2pq(mapHDRLinearToTarget(pq2lin(pq),
     targetNits, sourceNits, mode));
 }
 
@@ -230,13 +200,10 @@ vec3 sdr709ToBt2020PQ(vec3 rgb)
   return lin2pq(linear709to2020(srgb2lin(clamp(rgb, 0.0, 1.0))));
 }
 
-float hdrLuminance(vec3 color, float gain, bool pq)
+float hdrLuminance(vec3 color, bool pq)
 {
   if (pq)
-  {
-    color = pq2lin(color.rgb, gain);
-    return dot(max(color, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
-  }
+    color = pq2lin(color.rgb);
 
   return dot(max(color, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
 }
@@ -273,7 +240,7 @@ vec3 mapToSDR(vec3 color, float gain, bool pq, int mode)
 {
   if (pq)
   {
-    color = bt2020to709(pq2lin(color.rgb, gain));
+    color = bt2020to709(pq2lin(color.rgb));
   }
 
   // WGC HDR is scRGB-like linear light. Treat 1.0 as SDR reference white and

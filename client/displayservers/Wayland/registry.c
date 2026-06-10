@@ -50,10 +50,6 @@ static void colorManagerSupportedFeature(void * data,
     case WP_COLOR_MANAGER_V1_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES:
       wlWm.colorFeatureSetMastering = true;
       break;
-
-    case WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_SCRGB:
-      wlWm.colorFeatureWindowsScRGB = true;
-      break;
   }
 }
 
@@ -126,9 +122,6 @@ static void registryGlobalHandler(void * data, struct wl_registry * registry,
   else if (!strcmp(interface, xdg_activation_v1_interface.name))
     wlWm.xdgActivation = wl_registry_bind(wlWm.registry, name,
         &xdg_activation_v1_interface, 1);
-  else if (!strcmp(interface, frog_color_management_factory_v1_interface.name))
-    wlWm.frogColorManagement = wl_registry_bind(wlWm.registry, name,
-        &frog_color_management_factory_v1_interface, 1);
   else if (!strcmp(interface, wp_color_manager_v1_interface.name))
   {
     wlWm.colorManager = wl_registry_bind(wlWm.registry, name,
