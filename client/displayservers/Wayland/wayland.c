@@ -202,6 +202,12 @@ static bool waylandGetProp(LG_DSProperty prop, void * ret)
     return true;
   }
 
+  if (prop == LG_DS_HDR_TARGET_MAX_LUMINANCE && wlWm.colorPreferredMaxLum > 0)
+  {
+    *(int*)ret = (int)wlWm.colorPreferredMaxLum;
+    return true;
+  }
+
   return false;
 }
 

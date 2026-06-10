@@ -682,11 +682,20 @@ bool egl_desktopRender(EGL_Desktop * desktop, unsigned int outputWidth,
 
   // in PQ output mode the tone map target is the display peak, not the SDR
   // peak luminance; it must match the max_cll advertised to the compositor
-  // (10000 nits when hdrMetadataPeak is unset) or the content will be tone
-  // mapped twice
-  const float mapHDRGain = desktop->hdrOutputPQ ?
-    (desktop->hdrMetadataPeak > 0 ? desktop->hdrMetadataPeak : 10000) :
-    desktop->peakLuminance;
+  // or the content will be tone mapped twice. clamp it to the display's
+  // reported target peak the same way the display server clamps the
+  // advertised metadata
+  float mapHDRGain = desktop->peakLuminance;
+  if (desktop->hdrOutputPQ)
+  {
+    int target = desktop->hdrMetadataPeak > 0 ?
+      desktop->hdrMetadataPeak : 10000;
+    int displayMax = 0;
+    if (app_getProp(LG_DS_HDR_TARGET_MAX_LUMINANCE, &displayMax) &&
+        displayMax > 0 && displayMax < target)
+      target = displayMax;
+    mapHDRGain = target;
+  }
   const bool mapHDRtoSDR =
     desktop->mapHDRtoSDR && desktop->hdrMappingMode != EGL_HDR_MAPPING_OFF;
 

@@ -53,6 +53,14 @@ typedef enum LG_DSProperty
    * return data type: bool
    */
   LG_DS_WARP_SUPPORT,
+
+  /**
+   * returns the display's target peak luminance in nits for HDR output
+   * if not implemented or not yet known the renderer uses its configured
+   * metadata peak unclamped
+   * return data type: int
+   */
+  LG_DS_HDR_TARGET_MAX_LUMINANCE,
 }
 LG_DSProperty;
 

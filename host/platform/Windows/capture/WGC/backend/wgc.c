@@ -524,6 +524,10 @@ struct WGCInstance
   WGCFrameInfo * current;
   WGCFrameInfo * consumerFrame;
   volatile LONG asyncNextSlot;
+  // IVSHMEM publish: the frameBuffer index the frame thread will consume
+  // next. The consumer advances it when it releases a consumed slot
+  // (mirroring the host's captureIndex); the producer publishes into it.
+  volatile LONG nextPublishSlot;
   bool asyncCapture;
   bool pollFramePool;
   bool debugStats;
@@ -606,9 +610,10 @@ static CaptureResult wgc_capture(WGCInstance * this,
   unsigned frameBufferIndex);
 static void wgc_releaseSlot(WGCInstance * this, void * token);
 static CaptureResult wgc_processFrame(WGCInstance * this,
-  IDirect3D11CaptureFrame * frame, unsigned frameBufferIndex,
-  uint64_t callbackTimeUs);
+  IDirect3D11CaptureFrame * frame, uint64_t callbackTimeUs);
 static bool wgc_selectAsyncSlot(WGCInstance * this, unsigned * frameBufferIndex);
+static CaptureResult wgc_claimIvshmemPublishSlot(WGCInstance * this,
+  WGCFrameInfo ** dstOut);
 
 static bool wgc_createCaptureItem(WGCInstance * this, HMONITOR monitor);
 static bool wgc_createFramePool(WGCInstance * this);
@@ -753,7 +758,7 @@ static HRESULT STDMETHODCALLTYPE wgc_eventInvoke(
         !wgc_isIvshmemPublishMode(owner->publishMode);
       if (callbackProcessed)
       {
-        if (wgc_processFrame(owner, next, 0, callbackTimeUs) ==
+        if (wgc_processFrame(owner, next, callbackTimeUs) ==
             CAPTURE_RESULT_OK)
         {
           InterlockedIncrement(&this->framesPulled);
@@ -765,6 +770,10 @@ static HRESULT STDMETHODCALLTYPE wgc_eventInvoke(
       {
         IDirect3D11CaptureFrame * old = InterlockedExchangePointer(
           (PVOID volatile *)&owner->pendingFrame, next);
+        // dropping a frame unprocessed loses its dirty regions (WGC reports
+        // them relative to the previous pool frame), so force full damage
+        if (old)
+          InterlockedExchange(&owner->forceNextFullCopy, 1);
         wgc_releaseFrame(&old);
         InterlockedIncrement(&this->framesPulled);
       }
@@ -1331,9 +1340,82 @@ static bool wgc_selectAsyncSlot(WGCInstance * this, unsigned * frameBufferIndex)
   return false;
 }
 
+// Claim the IVSHMEM publish slot the frame thread will consume next. The
+// capture thread runs ahead of the frame thread (Capture_WGC.asyncCapture),
+// so the index latched at iface->capture() entry can be stale by the time a
+// WGC frame actually arrives; publishing into a stale slot would overwrite a
+// framebuffer that was already posted to LGMP. nextPublishSlot only advances
+// when the consumer releases a slot it consumed, which it cannot do for this
+// slot while we hold WGC_FRAME_WRITING, so re-checking the index after the
+// claim makes the handoff race-free.
+static CaptureResult wgc_claimIvshmemPublishSlot(WGCInstance * this,
+  WGCFrameInfo ** dstOut)
+{
+  for(;;)
+  {
+    const unsigned claimIndex =
+      (unsigned)InterlockedCompareExchange(&this->nextPublishSlot, 0, 0);
+    if (claimIndex >= this->frameCount - 1)
+    {
+      DEBUG_ERROR("WGC publish slot index %u is out of range", claimIndex);
+      return CAPTURE_RESULT_ERROR;
+    }
+
+    WGCFrameInfo * dst = &this->frames[claimIndex + 1];
+    if (!dst->ivshmemSlotReady)
+      return CAPTURE_RESULT_TIMEOUT;
+
+    LONG state = InterlockedCompareExchange(&dst->state,
+      WGC_FRAME_WRITING, WGC_FRAME_FREE);
+    if (state != WGC_FRAME_FREE)
+      state = InterlockedCompareExchange(&dst->state,
+        WGC_FRAME_WRITING, WGC_FRAME_READY);
+
+    if (state != WGC_FRAME_READY && state != WGC_FRAME_FREE)
+    {
+      InterlockedIncrement(&this->asyncSlotBusy);
+      InterlockedExchange(&this->forceNextFullCopy, 1);
+      return CAPTURE_RESULT_TIMEOUT;
+    }
+
+    if ((unsigned)InterlockedCompareExchange(&this->nextPublishSlot, 0, 0) !=
+        claimIndex)
+    {
+      // the consumer consumed and released this slot between the index read
+      // and the claim; it now backs an already-posted frame, so put it back
+      // and claim the slot the consumer expects next
+      InterlockedExchange(&dst->state, WGC_FRAME_FREE);
+      continue;
+    }
+
+    if (state == WGC_FRAME_READY)
+    {
+      wgc_waitFrameD3D12Copy(this, dst);
+      // overwriting a publish the consumer never fetched; restore its damage
+      // into the accumulator so this publish still covers those changes
+      if (dst->pendingFullCopy || dst->fullCopy ||
+          dst->nbPendingDirtyRects + dst->nbDirtyRects >
+          ARRAY_LENGTH(dst->pendingDirtyRects))
+      {
+        dst->pendingFullCopy     = true;
+        dst->nbPendingDirtyRects = 0;
+      }
+      else
+      {
+        memcpy(dst->pendingDirtyRects + dst->nbPendingDirtyRects,
+          dst->dirtyRects,
+          dst->nbDirtyRects * sizeof(*dst->pendingDirtyRects));
+        dst->nbPendingDirtyRects += dst->nbDirtyRects;
+      }
+    }
+
+    *dstOut = dst;
+    return CAPTURE_RESULT_OK;
+  }
+}
+
 static CaptureResult wgc_processFrame(WGCInstance * this,
-  IDirect3D11CaptureFrame * frame, unsigned frameBufferIndex,
-  uint64_t callbackTimeUs)
+  IDirect3D11CaptureFrame * frame, uint64_t callbackTimeUs)
 {
   CaptureResult result = CAPTURE_RESULT_ERROR;
   HRESULT hr;
@@ -1443,36 +1525,12 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
 
   if (wgc_isIvshmemPublishMode(this->publishMode))
   {
-    const unsigned publishIndex = frameBufferIndex + 1;
-    if (frameBufferIndex >= this->frameCount - 1)
+    const CaptureResult claim = wgc_claimIvshmemPublishSlot(this, &dst);
+    if (claim != CAPTURE_RESULT_OK)
     {
-      DEBUG_ERROR("WGC direct frame index %u is out of range",
-        frameBufferIndex);
+      result = claim;
       goto exit;
     }
-
-    dst = &this->frames[publishIndex];
-    if (!dst->ivshmemSlotReady)
-    {
-      result = CAPTURE_RESULT_TIMEOUT;
-      goto exit;
-    }
-
-    LONG state = InterlockedCompareExchange(&dst->state,
-      WGC_FRAME_WRITING, WGC_FRAME_FREE);
-    if (state != WGC_FRAME_FREE)
-      state = InterlockedCompareExchange(&dst->state,
-        WGC_FRAME_WRITING, WGC_FRAME_READY);
-
-    if (state != WGC_FRAME_READY && state != WGC_FRAME_FREE)
-    {
-      InterlockedIncrement(&this->asyncSlotBusy);
-      InterlockedExchange(&this->forceNextFullCopy, 1);
-      result = CAPTURE_RESULT_TIMEOUT;
-      goto exit;
-    }
-    if (state == WGC_FRAME_READY)
-      wgc_waitFrameD3D12Copy(this, dst);
 
     profileStart = profile ? microtime() : 0;
     if (!wgc_ensureFrame(this, dst, *src))
@@ -1653,47 +1711,25 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
     wgcStats_recordProfileStage(&this->stats, WGC_PROFILE_POINTER,
       microtime() - profileStart);
 
-  unsigned publishIndex;
   if (wgc_isIvshmemPublishMode(this->publishMode))
   {
-    publishIndex = frameBufferIndex + 1;
-    if (frameBufferIndex >= this->frameCount - 1)
+    const CaptureResult claim = wgc_claimIvshmemPublishSlot(this, &dst);
+    if (claim != CAPTURE_RESULT_OK)
     {
-      DEBUG_ERROR("WGC direct frame index %u is out of range",
-        frameBufferIndex);
+      result = claim;
       goto exit;
     }
-
-    dst = &this->frames[publishIndex];
-    if (!dst->ivshmemSlotReady)
-    {
-      result = CAPTURE_RESULT_TIMEOUT;
-      goto exit;
-    }
-
-    LONG state = InterlockedCompareExchange(&dst->state,
-      WGC_FRAME_WRITING, WGC_FRAME_FREE);
-    if (state != WGC_FRAME_FREE)
-      state = InterlockedCompareExchange(&dst->state,
-        WGC_FRAME_WRITING, WGC_FRAME_READY);
-
-    if (state != WGC_FRAME_READY && state != WGC_FRAME_FREE)
-    {
-      InterlockedIncrement(&this->asyncSlotBusy);
-      InterlockedExchange(&this->forceNextFullCopy, 1);
-      result = CAPTURE_RESULT_TIMEOUT;
-      goto exit;
-    }
-    if (state == WGC_FRAME_READY)
-      wgc_waitFrameD3D12Copy(this, dst);
-  }
-  else if (!wgc_selectAsyncSlot(this, &publishIndex))
-  {
-    result = CAPTURE_RESULT_TIMEOUT;
-    goto exit;
   }
   else
+  {
+    unsigned publishIndex;
+    if (!wgc_selectAsyncSlot(this, &publishIndex))
+    {
+      result = CAPTURE_RESULT_TIMEOUT;
+      goto exit;
+    }
     dst = &this->frames[publishIndex];
+  }
 
   if (!wgc_ensureFrame(this, dst, *accum->texture))
     goto exit;
@@ -1886,7 +1922,7 @@ static CaptureResult wgc_capture(WGCInstance * this,
   if (this->handler && !this->asyncCapture)
     InterlockedIncrement(&this->handler->framesConsumed);
 
-  result = wgc_processFrame(this, frame, frameBufferIndex, 0);
+  result = wgc_processFrame(this, frame, 0);
   goto exit;
 
 exit:
@@ -4131,6 +4167,11 @@ bool wgc_fetchIvshmemDirect(WGCInstance * this, unsigned frameBufferIndex,
   if (frameBufferIndex >= this->frameCount - 1)
     return false;
 
+  // keep the producer's publish target in step with the consumer; after a
+  // backend reinit nextPublishSlot restarts at 0 while the host's capture
+  // index does not
+  InterlockedExchange(&this->nextPublishSlot, (LONG)frameBufferIndex);
+
   WGCFrameInfo * frame = &this->frames[frameBufferIndex + 1];
   if (!frame->ivshmemSlotReady)
     return false;
@@ -4191,5 +4232,14 @@ void wgc_releaseIvshmemDirect(WGCInstance * this, void * token)
   // No Unmap — we never mapped anything. Slot state transition only.
   if (!token)
     return;
+
+  // mirror the host's captureIndex advance so the producer publishes into
+  // the slot the frame thread will consume next; advance before the slot is
+  // freed so a concurrent claim of the old index is caught by the re-check
+  // in wgc_claimIvshmemPublishSlot
+  WGCFrameInfo * frame = token;
+  const LONG consumedIndex = (LONG)(frame - this->frames) - 1;
+  InterlockedExchange(&this->nextPublishSlot,
+    (consumedIndex + 1) % (LONG)(this->frameCount - 1));
   wgc_releaseSlot(this, token);
 }

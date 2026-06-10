@@ -1160,22 +1160,26 @@ static CaptureResult wgc_capture_waitFrame(unsigned frameBufferIndex,
   // Publish the dirty rects as client render damage. The pixel transport may
   // have used a full-frame IVSHMEM copy; damage still tells the client what
   // it needs to redraw.
+  // If the set cannot be published completely publish full damage instead
+  // (0 rects = damage-all) rather than a silently truncated set.
   FrameDamageRect merged[KVMFR_MAX_DAMAGE_RECTS];
   int mergedCount = 0;
-  for (unsigned i = 0; i < this->desc.nbDirtyRects &&
-       mergedCount < KVMFR_MAX_DAMAGE_RECTS; ++i)
+  if (this->desc.nbDirtyRects <= KVMFR_MAX_DAMAGE_RECTS)
   {
-    const RECT * r = &this->desc.dirtyRects[i];
-    merged[mergedCount].x      = r->left;
-    merged[mergedCount].y      = r->top;
-    merged[mergedCount].width  = r->right  - r->left;
-    merged[mergedCount].height = r->bottom - r->top;
-    ++mergedCount;
-  }
-  if (mergedCount > 1)
-  {
-    mergedCount = rectsMergeOverlapping(merged, mergedCount);
-    mergedCount = rectsRejectContained(merged, mergedCount);
+    for (unsigned i = 0; i < this->desc.nbDirtyRects; ++i)
+    {
+      const RECT * r = &this->desc.dirtyRects[i];
+      merged[mergedCount].x      = r->left;
+      merged[mergedCount].y      = r->top;
+      merged[mergedCount].width  = r->right  - r->left;
+      merged[mergedCount].height = r->bottom - r->top;
+      ++mergedCount;
+    }
+    if (mergedCount > 1)
+    {
+      mergedCount = rectsMergeOverlapping(merged, mergedCount);
+      mergedCount = rectsRejectContained(merged, mergedCount);
+    }
   }
   memcpy(frame->damageRects, merged,
     (size_t)mergedCount * sizeof(*frame->damageRects));

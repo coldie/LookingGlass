@@ -375,8 +375,8 @@ static struct wp_image_description_v1 * waylandCreatePQDescription(void)
       WP_COLOR_MANAGER_V1_PRIMARIES_BT2020);
 
   // hdrMetadataPeak is also the EGL renderer's PQ tone map target; the
-  // max_cll advertised here must match it or the compositor will tone map
-  // the content a second time
+  // max_cll advertised here must match what the renderer actually emits or
+  // the compositor will tone map the content a second time
   const int metadataPeak = option_get_int("egl", "hdrMetadataPeak");
   const int metadataFALL = option_get_int("egl", "hdrMetadataFALL");
   uint32_t metadataMax =
@@ -386,7 +386,19 @@ static struct wp_image_description_v1 * waylandCreatePQDescription(void)
   // reference white and the full PQ range until they are known
   const uint32_t referenceLum =
     wlWm.colorPreferredRefLum > 0 ? wlWm.colorPreferredRefLum : 203;
-  if (wlWm.colorPreferredMaxLum > 0 && metadataMax > wlWm.colorPreferredMaxLum)
+
+  // the EGL renderer tone maps PQ output to the compositor-preferred peak
+  // only when egl:hdrMapping is explicitly enabled ("auto" disables mapping
+  // for PQ output). When the renderer passes the content through untouched
+  // the metadata must not be clamped below what it emits or the compositor
+  // stops tone mapping and the display hard-clips the highlights instead
+  const char * hdrMapping = option_get_string("egl", "hdrMapping");
+  const bool rendererMapsPQ = hdrMapping &&
+    strcmp(hdrMapping, "auto") != 0 &&
+    strcmp(hdrMapping, "off" ) != 0 &&
+    strcmp(hdrMapping, "none") != 0;
+  if (rendererMapsPQ &&
+      wlWm.colorPreferredMaxLum > 0 && metadataMax > wlWm.colorPreferredMaxLum)
     metadataMax = wlWm.colorPreferredMaxLum;
 
   DEBUG_INFO("Wayland HDR metadata request: BT.2020/PQ luminance:0.0050/10000/%u nits "
