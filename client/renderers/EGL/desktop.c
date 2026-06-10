@@ -491,10 +491,9 @@ bool egl_desktopSetup(EGL_Desktop * desktop, const LG_RendererFormat format)
       return false;
   }
 
-  const bool yuvFrame =
-    format.type == FRAME_TYPE_NV12 ||
-    format.type == FRAME_TYPE_P010;
-  if (desktop->useDMA && yuvFrame)
+  /* P010 imports the packed plane as DRM_FORMAT_ABGR16161616, but there is
+   * no equivalent single-plane format for the packed NV12 transport */
+  if (desktop->useDMA && format.type == FRAME_TYPE_NV12)
   {
     desktop->useDMA = false;
     egl_textureFree(&desktop->texture);
@@ -530,11 +529,7 @@ bool egl_desktopSetup(EGL_Desktop * desktop, const LG_RendererFormat format)
 bool egl_desktopUpdate(EGL_Desktop * desktop, const FrameBuffer * frame, int dmaFd,
     const FrameDamageRect * damageRects, int damageRectsCount)
 {
-  const bool yuvFrame =
-    desktop->format.type == FRAME_TYPE_NV12 ||
-    desktop->format.type == FRAME_TYPE_P010;
-
-  if (likely(desktop->useDMA && dmaFd >= 0 && !yuvFrame))
+  if (likely(desktop->useDMA && dmaFd >= 0))
   {
     if (likely(egl_textureUpdateFromDMA(desktop->texture, frame, dmaFd)))
     {
@@ -625,8 +620,6 @@ bool egl_desktopRender(EGL_Desktop * desktop, unsigned int outputWidth,
   const bool yuvFrame =
     desktop->format.type == FRAME_TYPE_NV12 ||
     desktop->format.type == FRAME_TYPE_P010;
-  if (yuvFrame)
-    dma = false;
 
   egl_desktopRectsMatrix((float *)desktop->matrix->data,
       width, height, x, y, scaleX, scaleY, rotate);
