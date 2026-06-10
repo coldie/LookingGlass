@@ -30,11 +30,6 @@
 
 typedef enum WGCPublishMode
 {
-  // Publish slot is a SHARED + SHARED_NTHANDLE D3D11 texture opened as a
-  // D3D12 resource. Used by the D12 frontend to chain effects and write to
-  // IVSHMEM via the copy queue.
-  WGC_PUBLISH_D12_SHARE,
-
   // Publish slot is a USAGE_STAGING + CPU_ACCESS_READ D3D11 texture mapped on
   // the consumer thread. Used by the top-level Capture_WGC interface to
   // memcpy directly into IVSHMEM.

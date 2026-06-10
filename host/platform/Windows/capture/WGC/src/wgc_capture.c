@@ -1531,8 +1531,8 @@ static CaptureResult wgc_capture_waitFrame(unsigned frameBufferIndex,
   }
   if (!rgba10pq && !packedYuv && pitch < width * bpp)
   {
-    DEBUG_ERROR("WGC produced an unexpected pitch %u for width %u; "
-      "use --capture=D12WGC for HDR / format conversion", pitch, width);
+    DEBUG_ERROR("WGC produced an unexpected pitch %u for width %u",
+      pitch, width);
     wgc_releaseCpu(this->wgc, this->desc.backendToken);
     return CAPTURE_RESULT_ERROR;
   }

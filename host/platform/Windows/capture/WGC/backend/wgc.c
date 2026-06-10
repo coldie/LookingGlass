@@ -407,10 +407,6 @@ typedef struct WGCFrameInfo
   D3D11_TEXTURE2D_DESC format;
 
   ID3D11Texture2D  ** texture;
-  ID3D12Resource   ** d12Res;
-  ID3D11Fence      ** fence;
-  ID3D12Fence      ** d12Fence;
-  UINT64              fenceValue;
   bool                ready;
   bool                copiedOnce;
   volatile LONG       state;
@@ -468,7 +464,8 @@ WGCProfileStage;
 
 struct WGCInstance
 {
-  D12Backend base;
+  // enable damage tracking
+  bool trackDamage;
 
   WGCPublishMode publishMode;
   CaptureGetPointerBuffer  getPointerBufferFn;
@@ -664,18 +661,14 @@ static HRESULT STDMETHODCALLTYPE wgc_eventInvoke(
   IInspectable * args);
 static void wgc_boostCallbackThreadPriority(void);
 
-static bool wgc_create(D12Backend ** instance, unsigned frameBuffers);
-static bool wgc_init(D12Backend * instance, bool debug, ID3D12Device3 * device,
+static bool wgc_create(WGCInstance ** instance, unsigned frameBuffers);
+static bool wgc_init(WGCInstance * this, bool debug,
   IDXGIAdapter1 * adapter, IDXGIOutput * output);
-static bool wgc_deinit(D12Backend * instance);
-static void wgc_free(D12Backend ** instance);
-static CaptureResult wgc_capture(D12Backend * instance,
+static bool wgc_deinit(WGCInstance * this);
+static void wgc_free(WGCInstance ** instance);
+static CaptureResult wgc_capture(WGCInstance * this,
   unsigned frameBufferIndex);
-static CaptureResult wgc_sync(D12Backend * instance,
-  ID3D12CommandQueue * commandQueue);
-static ID3D12Resource * wgc_fetch(D12Backend * instance,
-  unsigned frameBufferIndex, D12FrameDesc * desc);
-static void wgc_releaseSlot(D12Backend * instance, void * token);
+static void wgc_releaseSlot(WGCInstance * this, void * token);
 static CaptureResult wgc_processFrame(WGCInstance * this,
   IDirect3D11CaptureFrame * frame, unsigned frameBufferIndex,
   uint64_t callbackTimeUs);
@@ -701,7 +694,6 @@ static void wgc_recordCopyStats(WGCInstance * this, const WGCFrameInfo * frame,
   bool publishCopy, uint64_t pixels);
 static bool wgc_ensureFrame(WGCInstance * this, WGCFrameInfo * frame,
   ID3D11Texture2D * src);
-static bool wgc_shareFrame(WGCInstance * this, WGCFrameInfo * frame);
 static void wgc_releaseFrameInfo(WGCFrameInfo * frame);
 static void wgc_updateDamage(WGCInstance * this, WGCFrameInfo * info,
   IDirect3D11CaptureFrame * frame);
@@ -906,7 +898,7 @@ static void wgc_waitCallbacks(WGCFrameEventHandler * handler)
     DEBUG_WARN("Timed out waiting for WGC frame callbacks to finish");
 }
 
-static bool wgc_create(D12Backend ** instance, unsigned frameBuffers)
+static bool wgc_create(WGCInstance ** instance, unsigned frameBuffers)
 {
   WGCInstance * this = calloc(1, sizeof(*this));
   if (!this)
@@ -924,19 +916,16 @@ static bool wgc_create(D12Backend ** instance, unsigned frameBuffers)
     return false;
   }
 
-  this->publishMode = WGC_PUBLISH_D12_SHARE;
   this->cursorPendingPos = wgc_packCursorPos(INT_MIN, INT_MIN);
   InitializeCriticalSection(&this->cursorLock);
   this->cursorLockCreated = true;
-  *instance = &this->base;
+  *instance = this;
   return true;
 }
 
-static bool wgc_init(D12Backend * instance, bool debug, ID3D12Device3 * device,
+static bool wgc_init(WGCInstance * this, bool debug,
   IDXGIAdapter1 * adapter, IDXGIOutput * output)
 {
-  WGCInstance * this = UPCAST(WGCInstance, instance);
-
   bool result = false;
   HRESULT hr;
   comRef_scopePush(24);
@@ -1156,9 +1145,9 @@ static bool wgc_init(D12Backend * instance, bool debug, ID3D12Device3 * device,
 
   this->colorSpace = wgc_getOutputColorSpace(this);
 
-  // Prefer the explicitly passed D12 device; else use the loaned one
-  // (typically the one bound to the D3D11On12 wrapper).
-  ID3D12Device3 * effectiveD12 = device ? device : this->loanedD12Device;
+  // Use the loaned D12 device if provided (typically the one bound to the
+  // D3D11On12 wrapper).
+  ID3D12Device3 * effectiveD12 = this->loanedD12Device;
   if (effectiveD12)
   {
     ID3D12Device3_AddRef(effectiveD12);
@@ -1371,15 +1360,13 @@ exit:
   comRef_scopePop();
 
   if (!result)
-    wgc_deinit(instance);
+    wgc_deinit(this);
 
   return result;
 }
 
-static bool wgc_deinit(D12Backend * instance)
+static bool wgc_deinit(WGCInstance * this)
 {
-  WGCInstance * this = UPCAST(WGCInstance, instance);
-
   if (this->handler)
   {
     InterlockedExchange(&this->handler->stopping, 1);
@@ -1480,9 +1467,9 @@ static bool wgc_deinit(D12Backend * instance)
   return true;
 }
 
-static void wgc_free(D12Backend ** instance)
+static void wgc_free(WGCInstance ** instance)
 {
-  WGCInstance * this = UPCAST(WGCInstance, *instance);
+  WGCInstance * this = *instance;
 
   free(this->frames);
   free(this);
@@ -1694,7 +1681,7 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
       InterlockedExchange(&this->forceNextFullCopy, 0);
     const bool hasDirtyRects = dst->nbDirtyRects > 0;
     const bool keepGapDamage =
-      forceFullCopyAfterGap && this->base.trackDamage && dst->copiedOnce &&
+      forceFullCopyAfterGap && this->trackDamage && dst->copiedOnce &&
       hasDirtyRects && !forceNextFullCopy;
     if (forceFullCopyAfterGap)
     {
@@ -1703,7 +1690,7 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
     }
     if (forceNextFullCopy)
       dst->nbDirtyRects = 0;
-    dst->fullCopy = !this->base.trackDamage || !dst->copiedOnce ||
+    dst->fullCopy = !this->trackDamage || !dst->copiedOnce ||
       dst->nbDirtyRects == 0 || forceFullCopyAfterGap;
     if (keepGapDamage)
       dst->fullCopy = false;
@@ -1802,7 +1789,7 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
     InterlockedExchange(&this->forceNextFullCopy, 0);
   const bool hasDirtyRects = accum->nbDirtyRects > 0;
   const bool keepGapDamage =
-    forceFullCopyAfterGap && this->base.trackDamage && accum->copiedOnce &&
+    forceFullCopyAfterGap && this->trackDamage && accum->copiedOnce &&
     hasDirtyRects && !forceNextFullCopy;
   if (forceFullCopyAfterGap)
   {
@@ -1811,7 +1798,7 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
   }
   if (forceNextFullCopy)
     accum->nbDirtyRects = 0;
-  accum->fullCopy = !this->base.trackDamage || !accum->copiedOnce ||
+  accum->fullCopy = !this->trackDamage || !accum->copiedOnce ||
     accum->nbDirtyRects == 0 || forceFullCopyAfterGap;
   if (profile)
     wgc_recordProfileStage(this, WGC_PROFILE_DAMAGE,
@@ -1906,12 +1893,6 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
       microtime() - profileStart);
 
   profileStart = profile ? microtime() : 0;
-  if (this->publishMode == WGC_PUBLISH_D12_SHARE)
-  {
-    // D12 consumer waits on this fence before issuing its copy queue work.
-    ++dst->fenceValue;
-    ID3D11DeviceContext4_Signal(*this->context, *dst->fence, dst->fenceValue);
-  }
   // CPU consumer relies on D3D11 Map() blocking for outstanding GPU work; we
   // still Flush to make sure the copy gets to the driver promptly.
   ID3D11DeviceContext4_Flush(*this->context);
@@ -1938,10 +1919,9 @@ exit:
   return result;
 }
 
-static CaptureResult wgc_capture(D12Backend * instance,
+static CaptureResult wgc_capture(WGCInstance * this,
   unsigned frameBufferIndex)
 {
-  WGCInstance * this = UPCAST(WGCInstance, instance);
   CaptureResult result = CAPTURE_RESULT_ERROR;
   IDirect3D11CaptureFrame * frame = NULL;
   comRef_scopePush(8);
@@ -2222,61 +2202,11 @@ static bool wgc_asyncFrameReady(WGCInstance * this)
     WGC_FRAME_READY, WGC_FRAME_READY) == WGC_FRAME_READY;
 }
 
-static CaptureResult wgc_sync(D12Backend * instance,
-  ID3D12CommandQueue * commandQueue)
-{
-  WGCInstance * this = UPCAST(WGCInstance, instance);
-
-  WGCFrameInfo * frame = InterlockedCompareExchangePointer(
-    (PVOID volatile *)&this->consumerFrame, NULL, NULL);
-
-  if (!frame)
-    return CAPTURE_RESULT_TIMEOUT;
-
-  if (ID3D11Fence_GetCompletedValue(*frame->fence) < frame->fenceValue)
-    ID3D12CommandQueue_Wait(commandQueue, *frame->d12Fence, frame->fenceValue);
-
-  return CAPTURE_RESULT_OK;
-}
-
-static ID3D12Resource * wgc_fetch(D12Backend * instance,
-  unsigned frameBufferIndex, D12FrameDesc * desc)
-{
-  WGCInstance * this = UPCAST(WGCInstance, instance);
-
-  WGCFrameInfo * frame = InterlockedCompareExchangePointer(
-    (PVOID volatile *)&this->current, NULL, NULL);
-
-  if (!frame)
-    return NULL;
-
-  const LONG state = InterlockedCompareExchange(&frame->state,
-    WGC_FRAME_CONSUMING, WGC_FRAME_READY);
-  if (state == WGC_FRAME_READY)
-    InterlockedExchangePointer((PVOID volatile *)&this->consumerFrame, frame);
-  else if (state != WGC_FRAME_CONSUMING ||
-      InterlockedCompareExchangePointer(
-        (PVOID volatile *)&this->consumerFrame, NULL, NULL) != frame)
-    return NULL;
-
-  if (state == WGC_FRAME_READY && this->asyncCapture && this->handler)
-    InterlockedIncrement(&this->handler->framesConsumed);
-
-  desc->dirtyRects   = frame->dirtyRects;
-  desc->nbDirtyRects = frame->nbDirtyRects;
-  desc->rotation     = CAPTURE_ROT_0;
-  desc->colorSpace   = this->colorSpace;
-
-  ID3D12Resource_AddRef(*frame->d12Res);
-  return *frame->d12Res;
-}
-
-static void wgc_releaseSlot(D12Backend * instance, void * token)
+static void wgc_releaseSlot(WGCInstance * this, void * token)
 {
   if (!token)
     return;
 
-  WGCInstance * this = UPCAST(WGCInstance, instance);
   WGCFrameInfo * frame = token;
   InterlockedCompareExchangePointer(
     (PVOID volatile *)&this->current, NULL, frame);
@@ -2405,7 +2335,7 @@ static bool wgc_createFramePool(WGCInstance * this)
   else
     DEBUG_WARN("WGC capture border control is not available on this OS");
 
-  if (this->base.trackDamage)
+  if (this->trackDamage)
   {
     comRef_defineLocal(IGraphicsCaptureSession4, session4);
     hr = IGraphicsCaptureSession_QueryInterface(
@@ -2463,7 +2393,7 @@ static void wgc_updateDamage(WGCInstance * this, WGCFrameInfo * info,
 {
   info->nbDirtyRects = 0;
 
-  if (!this->base.trackDamage)
+  if (!this->trackDamage)
     return;
 
   HRESULT hr;
@@ -2517,7 +2447,7 @@ exit:
 
 static void wgc_extendDamageWithPrevious(WGCInstance * this, WGCFrameInfo * info)
 {
-  if (!this->base.trackDamage)
+  if (!this->trackDamage)
     return;
 
   const unsigned currentCount = info->nbDirtyRects;
@@ -2553,7 +2483,7 @@ static void wgc_extendDamageWithPrevious(WGCInstance * this, WGCFrameInfo * info
 static bool wgc_shouldForceFullCopyAfterGap(WGCInstance * this,
   WGCFrameInfo * frame)
 {
-  if (!this->base.trackDamage || !frame->hasSystemRelativeTime)
+  if (!this->trackDamage || !frame->hasSystemRelativeTime)
     return false;
 
   bool forceFullCopy = false;
@@ -2945,24 +2875,19 @@ static void wgc_clearAccumulatedDamage(WGCFrameInfo * frame)
 
 static bool wgc_frameHasResources(const WGCFrameInfo * frame)
 {
-  return frame->texture || frame->d12Res || frame->fence ||
-    frame->d12Fence || frame->ivshmemD12Res || frame->bridgeA ||
+  return frame->texture || frame->ivshmemD12Res || frame->bridgeA ||
     frame->bridgeB || frame->bridge12 || frame->encodeUav;
 }
 
 static void wgc_releaseFrameResources(WGCFrameInfo * frame)
 {
   comRef_release(frame->texture);
-  comRef_release(frame->d12Res);
-  comRef_release(frame->fence);
-  comRef_release(frame->d12Fence);
   comRef_release(frame->ivshmemD12Res);
   comRef_release(frame->bridgeA);
   comRef_release(frame->bridgeB);
   comRef_release(frame->bridge12);
   comRef_release(frame->encodeUav);
   memset(&frame->format, 0, sizeof(frame->format));
-  frame->fenceValue = 0;
   frame->copiedOnce = false;
   frame->ready      = false;
 }
@@ -4567,8 +4492,7 @@ static bool wgc_ensureFrameIvshmemDirect(WGCInstance * this, WGCFrameInfo * fram
   }
   else if (packedRgb10)
     frame->format.Format = this->ivshmemFormat;
-  frame->fenceValue = 0;
-  frame->ready      = true;
+  frame->ready = true;
   comRef_scopePop();
   return true;
 }
@@ -4633,19 +4557,11 @@ static bool wgc_ensureFrame(WGCInstance * this, WGCFrameInfo * frame,
     dstDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     dstDesc.MiscFlags      = 0;
   }
-  else if (this->publishMode == WGC_PUBLISH_D12_SHARE)
-  {
-    // D12 share: SHARED+SHARED_NTHANDLE so the texture can be opened as a
-    // D3D12 resource via NT handle in wgc_shareFrame.
-    dstDesc.Usage          = D3D11_USAGE_DEFAULT;
-    dstDesc.BindFlags      = D3D11_BIND_SHADER_RESOURCE;
-    dstDesc.CPUAccessFlags = 0;
-    dstDesc.MiscFlags      = D3D11_RESOURCE_MISC_SHARED |
-                             D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
-  }
   else
   {
-    // CPU-staging accumulator: GPU-local copy-only texture.
+    // Accumulator: GPU-local copy-only texture. It is never mapped by the
+    // CPU; only the final publish slot is staging/readback (CPU_STAGING) or
+    // IVSHMEM-resident (IVSHMEM modes).
     dstDesc.Usage          = D3D11_USAGE_DEFAULT;
     dstDesc.BindFlags      = wgc_needsEncodeShader(this) ?
       D3D11_BIND_SHADER_RESOURCE : 0;
@@ -4668,33 +4584,8 @@ static bool wgc_ensureFrame(WGCInstance * this, WGCFrameInfo * frame,
   memcpy(&frame->format, &srcDesc, sizeof(frame->format));
   comRef_scopePop();
 
-  if (cpuPublishSlot)
-  {
-    frame->fenceValue = 0;
-    frame->ready      = true;
-    return true;
-  }
-
-  if (this->publishMode == WGC_PUBLISH_CPU_STAGING)
-  {
-    // The accumulator is never mapped by the CPU. Keep it GPU-local so the
-    // WGC source -> accumulator damage copy does not write into staging memory;
-    // only the final publish slot is staging/readback.
-    frame->fenceValue = 0;
-    frame->ready      = true;
-    return true;
-  }
-
-  if (wgc_isIvshmemPublishMode(this->publishMode))
-  {
-    // The accumulator is a normal GPU-local D3D11 texture. Only publish slots
-    // are D3D11On12-wrapped ROW_MAJOR resources placed in IVSHMEM.
-    frame->fenceValue = 0;
-    frame->ready      = true;
-    return true;
-  }
-
-  return wgc_shareFrame(this, frame);
+  frame->ready = true;
+  return true;
 }
 
 static bool wgc_ensureAllFrames(WGCInstance * this, ID3D11Texture2D * src)
@@ -4710,83 +4601,6 @@ static bool wgc_ensureAllFrames(WGCInstance * this, ID3D11Texture2D * src)
   }
 
   return true;
-}
-
-static bool wgc_shareFrame(WGCInstance * this, WGCFrameInfo * frame)
-{
-  bool result = false;
-  HRESULT hr;
-  comRef_scopePush(8);
-
-  comRef_defineLocal(IDXGIResource1, dxgiRes);
-  hr = ID3D11Texture2D_QueryInterface(
-    *frame->texture, &IID_IDXGIResource1, (void **)dxgiRes);
-  if (FAILED(hr))
-  {
-    DEBUG_WINERROR("Failed to obtain the shared ID3D11Resource1 interface", hr);
-    goto exit;
-  }
-
-  HANDLE sharedHandle;
-  hr = IDXGIResource1_CreateSharedHandle(
-    *dxgiRes, NULL, DXGI_SHARED_RESOURCE_READ, NULL, &sharedHandle);
-  if (FAILED(hr))
-  {
-    DEBUG_WINERROR("Failed to create the WGC shared handle", hr);
-    goto exit;
-  }
-
-  comRef_defineLocal(ID3D12Resource, d12Res);
-  hr = ID3D12Device3_OpenSharedHandle(
-    *this->d12device, sharedHandle, &IID_ID3D12Resource, (void **)d12Res);
-  CloseHandle(sharedHandle);
-  if (FAILED(hr))
-  {
-    DEBUG_WINERROR("Failed to open the WGC D3D12 resource", hr);
-    goto exit;
-  }
-  wgc_setD3D12ObjectName((ID3D12Object *)*d12Res,
-    "WGC shared accumulator texture");
-
-  comRef_defineLocal(ID3D11Fence, fence);
-  hr = ID3D11Device5_CreateFence(
-    *this->device, 0, D3D11_FENCE_FLAG_SHARED, &IID_ID3D11Fence, (void **)fence);
-  if (FAILED(hr))
-  {
-    DEBUG_WINERROR("Failed to create the WGC fence", hr);
-    goto exit;
-  }
-
-  hr = ID3D11Fence_CreateSharedHandle(
-    *fence, NULL, GENERIC_ALL, NULL, &sharedHandle);
-  if (FAILED(hr))
-  {
-    DEBUG_WINERROR("Failed to create the WGC fence shared handle", hr);
-    goto exit;
-  }
-
-  comRef_defineLocal(ID3D12Fence, d12Fence);
-  hr = ID3D12Device3_OpenSharedHandle(
-    *this->d12device, sharedHandle, &IID_ID3D12Fence, (void **)d12Fence);
-  CloseHandle(sharedHandle);
-  if (FAILED(hr))
-  {
-    DEBUG_WINERROR("Failed to open the WGC D3D12 fence", hr);
-    goto exit;
-  }
-  wgc_setD3D12ObjectName((ID3D12Object *)*d12Fence,
-    "WGC shared accumulator fence");
-
-  comRef_toGlobal(frame->d12Res  , d12Res  );
-  comRef_toGlobal(frame->fence   , fence   );
-  comRef_toGlobal(frame->d12Fence, d12Fence);
-  frame->fenceValue = 0;
-  frame->ready      = true;
-  result = true;
-
-exit:
-  comRef_scopePop();
-  return result;
 }
 
 static void wgc_updatePointer(WGCInstance * this, int x, int y)
@@ -5155,20 +4969,17 @@ static bool wgc_createHString(const WCHAR * str, HSTRING * result)
 bool wgc_createInstance(WGCInstance ** out, unsigned frameBuffers,
   WGCPublishMode mode)
 {
-  D12Backend * backend;
-  if (!wgc_create(&backend, frameBuffers))
+  if (!wgc_create(out, frameBuffers))
     return false;
-  WGCInstance * inst = UPCAST(WGCInstance, backend);
-  inst->publishMode = mode;
-  *out = inst;
+  (*out)->publishMode = mode;
   return true;
 }
 
 bool wgc_initInstance(WGCInstance * this, bool debug,
   IDXGIAdapter1 * adapter, IDXGIOutput * output, bool trackDamage)
 {
-  this->base.trackDamage = trackDamage;
-  return wgc_init(&this->base, debug, NULL, adapter, output);
+  this->trackDamage = trackDamage;
+  return wgc_init(this, debug, adapter, output);
 }
 
 void wgc_setPointerCallbacks(WGCInstance * this,
@@ -5283,21 +5094,19 @@ bool wgc_setIvshmemSlot(WGCInstance * this,
 
 bool wgc_deinitInstance(WGCInstance * this)
 {
-  return wgc_deinit(&this->base);
+  return wgc_deinit(this);
 }
 
 void wgc_freeInstance(WGCInstance ** this)
 {
   if (!this || !*this)
     return;
-  D12Backend * backend = &(*this)->base;
-  wgc_free(&backend);
-  *this = NULL;
+  wgc_free(this);
 }
 
 CaptureResult wgc_pollFrame(WGCInstance * this, unsigned frameBufferIndex)
 {
-  return wgc_capture(&this->base, frameBufferIndex);
+  return wgc_capture(this, frameBufferIndex);
 }
 
 bool wgc_fetchCpu(WGCInstance * this, unsigned frameBufferIndex,
@@ -5371,7 +5180,7 @@ void wgc_releaseCpu(WGCInstance * this, void * token)
   WGCFrameInfo * frame = token;
   ID3D11DeviceContext4_Unmap(*this->context,
     (ID3D11Resource *)*frame->texture, 0);
-  wgc_releaseSlot(&this->base, token);
+  wgc_releaseSlot(this, token);
 }
 
 // IVSHMEM-direct: WGC has already written pixels to IVSHMEM via the
@@ -5460,20 +5269,5 @@ void wgc_releaseIvshmemDirect(WGCInstance * this, void * token)
   // No Unmap — we never mapped anything. Slot state transition only.
   if (!token)
     return;
-  wgc_releaseSlot(&this->base, token);
+  wgc_releaseSlot(this, token);
 }
-
-const D12Backend D12Backend_WGC =
-{
-  .name        = "Windows Graphics Capture",
-  .codeName    = "WGC",
-  .trackDamage = false,
-
-  .create   = wgc_create,
-  .init     = wgc_init,
-  .deinit   = wgc_deinit,
-  .free     = wgc_free,
-  .capture  = wgc_capture,
-  .sync     = wgc_sync,
-  .fetch    = wgc_fetch
-};
