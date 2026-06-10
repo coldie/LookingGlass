@@ -153,23 +153,4 @@ install(TARGETS looking-glass-host
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   COMPONENT binary)
 
-option(BUILD_TEST_D3D11ON12_IVSHMEM
-  "Build the standalone D3D11On12 + IVSHMEM validation tool" OFF)
-option(BUILD_TEST_WGC_D3D11ON12_FRAMEPOOL
-  "Build the standalone WGC + D3D11On12 frame-pool callback repro" OFF)
-option(BUILD_TEST_HDR_PATTERN
-  "Build the standalone HDR scRGB test pattern generator" OFF)
-if((BUILD_TEST_D3D11ON12_IVSHMEM OR BUILD_TEST_WGC_D3D11ON12_FRAMEPOOL) AND WIN32)
-  add_subdirectory(test-d3d11on12-ivshmem)
-endif()
-if(BUILD_TEST_HDR_PATTERN AND WIN32)
-  add_subdirectory(test-hdr-pattern)
-endif()
-add_feature_info(BUILD_TEST_D3D11ON12_IVSHMEM BUILD_TEST_D3D11ON12_IVSHMEM
-  "Standalone D3D11On12 + IVSHMEM validation tool")
-add_feature_info(BUILD_TEST_WGC_D3D11ON12_FRAMEPOOL BUILD_TEST_WGC_D3D11ON12_FRAMEPOOL
-  "Standalone WGC + D3D11On12 frame-pool callback repro")
-add_feature_info(BUILD_TEST_HDR_PATTERN BUILD_TEST_HDR_PATTERN
-  "Standalone HDR scRGB test pattern generator")
-
 feature_summary(WHAT ENABLED_FEATURES DISABLED_FEATURES)
