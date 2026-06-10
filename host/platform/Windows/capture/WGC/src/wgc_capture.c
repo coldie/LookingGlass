@@ -29,6 +29,7 @@
 #include "common/time.h"
 
 #include "backend/wgc.h"
+#include "backend/wgc_util.h"
 #include "d12.h"  // for D12 device helpers and shared D12 frame descriptors
 
 #include <d3d11.h>
@@ -359,33 +360,9 @@ static const char * wgc_capture_hdrModeName(WGCCaptureHDRMode mode)
   return "unknown";
 }
 
-static bool wgc_capture_colorSpaceIsHDR(DXGI_COLOR_SPACE_TYPE colorSpace)
-{
-  return colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
-         colorSpace == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020 ||
-         colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
-}
-
-static DXGI_COLOR_SPACE_TYPE wgc_capture_getOutputColorSpace(IDXGIOutput * output)
-{
-  DXGI_COLOR_SPACE_TYPE colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-  IDXGIOutput6 * output6 = NULL;
-  HRESULT hr = IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput6,
-    (void **)&output6);
-  if (SUCCEEDED(hr))
-  {
-    DXGI_OUTPUT_DESC1 desc1;
-    hr = IDXGIOutput6_GetDesc1(output6, &desc1);
-    if (SUCCEEDED(hr))
-      colorSpace = desc1.ColorSpace;
-    IDXGIOutput6_Release(output6);
-  }
-  return colorSpace;
-}
-
 static void wgc_capture_resolveEncoding(DXGI_COLOR_SPACE_TYPE colorSpace)
 {
-  const bool hdrSource = wgc_capture_colorSpaceIsHDR(colorSpace);
+  const bool hdrSource = wgcUtil_colorSpaceIsHDR(colorSpace);
 
   if (this->requestedEncoding != WGC_CAPTURE_PUBLISH_FORMAT_AUTO)
   {
@@ -586,17 +563,6 @@ static wchar_t * utf8ToWide(const char * str)
   return out;
 }
 
-static bool createHString(const WCHAR * str, HSTRING * result)
-{
-  const HRESULT hr = WindowsCreateString(str, (UINT32)wcslen(str), result);
-  if (FAILED(hr))
-  {
-    DEBUG_WINERROR("WindowsCreateString failed", hr);
-    return false;
-  }
-  return true;
-}
-
 static bool wgc_canCreateCaptureItemForMonitor(HMONITOR monitor,
   const wchar_t * name)
 {
@@ -608,8 +574,8 @@ static bool wgc_canCreateCaptureItemForMonitor(HMONITOR monitor,
   }
 
   HSTRING className = NULL;
-  if (!createHString(RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureItem,
-      &className))
+  if (!wgcUtil_createHString(
+      RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureItem, &className))
     return false;
 
   IGraphicsCaptureItemInterop * interop = NULL;
@@ -940,7 +906,7 @@ static bool wgc_capture_init(void * ivshmemBase, unsigned * alignSize)
   this->output  = malloc(sizeof(*this->output )); *this->output  = output;
 
   const DXGI_COLOR_SPACE_TYPE colorSpace =
-    wgc_capture_getOutputColorSpace(output);
+    wgcUtil_getOutputColorSpace(output);
   wgc_capture_resolveEncoding(colorSpace);
   wgc_capture_forcePublishModeForEncoding();
 

@@ -4,6 +4,8 @@ project(capture_WGC LANGUAGES C)
 add_library(capture_WGC STATIC
   src/wgc_capture.c
   backend/wgc.c
+  backend/wgc_stats.c
+  backend/wgc_util.c
 )
 
 target_link_libraries(capture_WGC

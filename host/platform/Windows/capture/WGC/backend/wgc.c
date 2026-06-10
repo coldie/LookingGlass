@@ -22,6 +22,8 @@
 #include "command_group.h"
 #include "d12.h"
 #include "wgc.h"
+#include "wgc_stats.h"
+#include "wgc_util.h"
 
 #include "com_ref.h"
 #include "common/debug.h"
@@ -33,17 +35,12 @@
 #include "common/time.h"
 
 #include <stdint.h>
-#include <float.h>
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <wchar.h>
 #include <d3dcompiler.h>
 
 #define WGC_D3D12_COPY_QUEUE_MAX 8
-#define WGC_STATS_SAMPLE_MAX 512
-#define WGC_HDR_STATS_GRID 16
 
 // frame pool polling wait when wgc:pollFramePool is enabled
 #define WGC_POLL_FRAME_POOL_MS 1
@@ -444,19 +441,6 @@ typedef struct WGCFrameInfo
 }
 WGCFrameInfo;
 
-typedef enum WGCProfileStage
-{
-  WGC_PROFILE_ACQUIRE,
-  WGC_PROFILE_ENSURE,
-  WGC_PROFILE_DAMAGE,
-  WGC_PROFILE_ACCUM_COPY,
-  WGC_PROFILE_POINTER,
-  WGC_PROFILE_PUBLISH_COPY,
-  WGC_PROFILE_FLUSH,
-  WGC_PROFILE_COUNT
-}
-WGCProfileStage;
-
 struct WGCInstance
 {
   // enable damage tracking
@@ -489,7 +473,6 @@ struct WGCInstance
   bool                 nv12ShaderHdrToneMap;
   DXGI_COLOR_SPACE_TYPE nv12ShaderColorSpace;
   DXGI_FORMAT          nv12ShaderIvshmemFormat;
-  ID3D11Texture2D      ** hdrStatsTexture;
 
   // IVSHMEM publish environment — set via wgc_setIvshmemD3D12CopyEnv before
   // wgc_initInstance. Only used when publishMode is
@@ -528,38 +511,14 @@ struct WGCInstance
   bool asyncCapture;
   bool pollFramePool;
   bool debugStats;
+  WGCStats stats;
   LONG asyncTimeouts;
   LONG asyncReadyBeforeWait;
   LONG asyncReadyAfterWait;
   LONG fullCopyAfterGap;
   LONG asyncSlotBusy;
   LONG forceNextFullCopy;
-  volatile LONG64 copyAccumFull;
-  volatile LONG64 copyAccumDirty;
-  volatile LONG64 copyAccumPixels;
-  volatile LONG64 copyPublishFull;
-  volatile LONG64 copyPublishDirty;
-  volatile LONG64 copyPublishPixels;
-  volatile LONG64 profileTotalUs[WGC_PROFILE_COUNT];
-  volatile LONG64 profileMaxUs[WGC_PROFILE_COUNT];
-  volatile LONG64 profileCount[WGC_PROFILE_COUNT];
-  volatile LONG   profileSampleCount[WGC_PROFILE_COUNT];
-  volatile LONG   profileSampleOverflow[WGC_PROFILE_COUNT];
-  LONG64          profileSamples[WGC_PROFILE_COUNT][WGC_STATS_SAMPLE_MAX];
-  volatile LONG64 d3d12CopySubmitTotalUs;
-  volatile LONG64 d3d12CopySubmitMaxUs;
-  volatile LONG64 d3d12CopySubmitCount;
-  volatile LONG   d3d12CopySubmitSampleCount;
-  volatile LONG   d3d12CopySubmitSampleOverflow;
-  LONG64          d3d12CopySubmitSamples[WGC_STATS_SAMPLE_MAX];
-  volatile LONG64 d3d12FenceWaitTotalUs;
-  volatile LONG64 d3d12FenceWaitMaxUs;
-  volatile LONG64 d3d12FenceWaitCount;
-  volatile LONG   d3d12FenceWaitSampleCount;
-  volatile LONG   d3d12FenceWaitSampleOverflow;
-  LONG64          d3d12FenceWaitSamples[WGC_STATS_SAMPLE_MAX];
   uint64_t debugStatsLastLog;
-  uint64_t hdrStatsLastLog;
 
   SizeInt32 size;
   RECT outputRect;
@@ -583,9 +542,6 @@ struct WGCInstance
   uint64_t lastDwmFlushUs;
   bool hasLastSystemRelativeTime;
   int64_t lastSystemRelativeTime;
-  volatile LONG64 systemRelativeGapTotalUs;
-  volatile LONG64 systemRelativeGapMaxUs;
-  volatile LONG64 systemRelativeGapCount;
   bool mouseHookCreated;
   CRITICAL_SECTION cursorLock;
   bool cursorLockCreated;
@@ -640,7 +596,6 @@ static bool wgc_selectAsyncSlot(WGCInstance * this, unsigned * frameBufferIndex)
 
 static bool wgc_createCaptureItem(WGCInstance * this, HMONITOR monitor);
 static bool wgc_createFramePool(WGCInstance * this);
-static DXGI_COLOR_SPACE_TYPE wgc_getOutputColorSpace(WGCInstance * this);
 static DXGI_FORMAT wgc_expectedSourceFormat(WGCInstance * this);
 static bool wgc_asyncFrameReady(WGCInstance * this);
 static void wgc_accumulateDamage(WGCInstance * this, const WGCFrameInfo * src);
@@ -664,13 +619,9 @@ static void wgc_updateDamage(WGCInstance * this, WGCFrameInfo * info,
 static bool wgc_shouldForceFullCopyAfterGap(WGCInstance * this,
   WGCFrameInfo * frame);
 static void wgc_maybeLogDebugStats(WGCInstance * this);
-static void wgc_maybeLogHDRStats(WGCInstance * this, ID3D11Texture2D * src);
 static void wgc_maybeDwmFlushOnGap(WGCInstance * this);
 static bool wgc_shouldReinitAfterStarvation(WGCInstance * this, uint64_t now);
 static uint64_t wgc_dwmComposedFrames(void);
-static void wgc_recordProfileStage(WGCInstance * this, WGCProfileStage stage,
-  uint64_t elapsedUs);
-static void wgc_interlockedMax64(volatile LONG64 * target, LONG64 value);
 static void wgc_updatePointer(WGCInstance * this, int x, int y);
 static void wgc_onMouseMove(int x, int y);
 static LONG64 wgc_packCursorPos(int x, int y);
@@ -685,14 +636,12 @@ static void wgc_setMinUpdateInterval(IGraphicsCaptureSession * session,
 static WGCCursorMode wgc_parseCursorMode(void);
 static void wgc_closeInspectable(IInspectable * obj);
 static void wgc_releaseFrame(IDirect3D11CaptureFrame ** frame);
-static bool wgc_createHString(const WCHAR * str, HSTRING * result);
 static void wgc_waitCallbacks(WGCFrameEventHandler * handler);
 static bool wgc_isIvshmemPublishMode(WGCPublishMode mode);
 static bool wgc_isNV12PackedIvshmem(const WGCInstance * this);
 static bool wgc_isP010PackedIvshmem(const WGCInstance * this);
 static bool wgc_isPackedYuvIvshmem(const WGCInstance * this);
 static bool wgc_needsEncodeShader(const WGCInstance * this);
-static bool wgc_colorSpaceIsHDR(DXGI_COLOR_SPACE_TYPE colorSpace);
 
 static const ITypedEventHandler_Direct3D11CaptureFramePool_IInspectableVtbl
   wgc_eventVtbl =
@@ -766,7 +715,7 @@ static HRESULT STDMETHODCALLTYPE wgc_eventInvoke(
       const LONG64 gapUs = (LONG64)(callbackTimeUs - (uint64_t)last);
       InterlockedExchangeAdd64(&this->callbackGapTotalUs, gapUs);
       InterlockedIncrement64(&this->callbackGapCount);
-      wgc_interlockedMax64(&this->callbackGapMaxUs, gapUs);
+      wgcStats_interlockedMax64(&this->callbackGapMaxUs, gapUs);
     }
   }
 
@@ -885,6 +834,7 @@ static bool wgc_init(WGCInstance * this, bool debug,
     option_get_bool("wgc", "includeSecondaryWindows");
   this->dwmFlushOnGap = option_get_bool("wgc", "dwmFlushOnGap");
   this->lastDwmFlushUs = 0;
+  wgcStats_init(&this->stats, this->debugStats);
   DEBUG_INFO("WGC cursor:%s cursorMaxHz:%d maxFPS:%d asyncCapture:%d pollFramePool:%d includeSecondaryWindows:%d debugStats:%d dwmFlushOnGap:%d",
     this->cursorMode == WGC_CURSOR_MODE_SEPARATE ? "separate" :
     this->cursorMode == WGC_CURSOR_MODE_EMBEDDED ? "embedded" : "none",
@@ -902,7 +852,8 @@ static bool wgc_init(WGCInstance * this, bool debug,
 
   comRef_defineLocal(IGraphicsCaptureSessionStatics, sessionStatics);
   HSTRING className = NULL;
-  if (!wgc_createHString(RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureSession,
+  if (!wgcUtil_createHString(
+      RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureSession,
       &className))
     goto exit;
 
@@ -1061,7 +1012,7 @@ static bool wgc_init(WGCInstance * this, bool debug,
     goto exit;
   }
 
-  this->colorSpace = wgc_getOutputColorSpace(this);
+  this->colorSpace = wgcUtil_getOutputColorSpace(this->output);
 
   // Use the loaned D12 device if provided (the one that opened the IVSHMEM
   // heap).
@@ -1242,7 +1193,7 @@ static bool wgc_deinit(WGCInstance * this)
   comRef_release(this->graphicsDevice);
   comRef_release(this->nv12Shader);
   comRef_release(this->nv12ShaderConsts);
-  comRef_release(this->hdrStatsTexture);
+  wgcStats_free(&this->stats);
   if (this->output)
   {
     IDXGIOutput_Release(this->output);
@@ -1349,7 +1300,8 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
     goto exit;
   }
 
-  const DXGI_COLOR_SPACE_TYPE colorSpace = wgc_getOutputColorSpace(this);
+  const DXGI_COLOR_SPACE_TYPE colorSpace =
+    wgcUtil_getOutputColorSpace(this->output);
   if (colorSpace != this->colorSpace)
   {
     DEBUG_INFO("WGC color space changed 0x%x -> 0x%x, reinitializing",
@@ -1425,10 +1377,10 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
     result = CAPTURE_RESULT_REINIT;
     goto exit;
   }
-  wgc_maybeLogHDRStats(this, *src);
+  wgcStats_maybeLogHDR(&this->stats, *this->device, *this->context, *src);
 
   if (profile)
-    wgc_recordProfileStage(this, WGC_PROFILE_ACQUIRE,
+    wgcStats_recordProfileStage(&this->stats, WGC_PROFILE_ACQUIRE,
       microtime() - profileStart);
 
   if (wgc_isIvshmemPublishMode(this->publishMode))
@@ -1469,7 +1421,7 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
       goto exit;
     dst->callbackTimeUs = callbackTimeUs;
     if (profile)
-      wgc_recordProfileStage(this, WGC_PROFILE_ENSURE,
+      wgcStats_recordProfileStage(&this->stats, WGC_PROFILE_ENSURE,
         microtime() - profileStart);
 
     dst->hasSystemRelativeTime = false;
@@ -1514,7 +1466,7 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
     if (keepGapDamage)
       dst->fullCopy = false;
     if (profile)
-      wgc_recordProfileStage(this, WGC_PROFILE_DAMAGE,
+      wgcStats_recordProfileStage(&this->stats, WGC_PROFILE_DAMAGE,
         microtime() - profileStart);
 
     wgc_accumulateDamage(this, dst);
@@ -1535,7 +1487,7 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
       wgc_updatePointer(this, x, y);
     }
     if (profile)
-      wgc_recordProfileStage(this, WGC_PROFILE_POINTER,
+      wgcStats_recordProfileStage(&this->stats, WGC_PROFILE_POINTER,
         microtime() - profileStart);
 
     profileStart = profile ? microtime() : 0;
@@ -1544,13 +1496,13 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
     if (dst->copyFailed)
       goto exit;
     if (profile)
-      wgc_recordProfileStage(this, WGC_PROFILE_PUBLISH_COPY,
+      wgcStats_recordProfileStage(&this->stats, WGC_PROFILE_PUBLISH_COPY,
         microtime() - profileStart);
 
     profileStart = profile ? microtime() : 0;
     ID3D11DeviceContext4_Flush(*this->context);
     if (profile)
-      wgc_recordProfileStage(this, WGC_PROFILE_FLUSH,
+      wgcStats_recordProfileStage(&this->stats, WGC_PROFILE_FLUSH,
         microtime() - profileStart);
 
     wgc_clearAccumulatedDamage(dst);
@@ -1572,7 +1524,7 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
     goto exit;
   accum->callbackTimeUs = callbackTimeUs;
   if (profile)
-    wgc_recordProfileStage(this, WGC_PROFILE_ENSURE,
+    wgcStats_recordProfileStage(&this->stats, WGC_PROFILE_ENSURE,
       microtime() - profileStart);
 
   accum->hasSystemRelativeTime = false;
@@ -1615,13 +1567,13 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
   accum->fullCopy = !this->trackDamage || !accum->copiedOnce ||
     accum->nbDirtyRects == 0 || forceFullCopyAfterGap;
   if (profile)
-    wgc_recordProfileStage(this, WGC_PROFILE_DAMAGE,
+    wgcStats_recordProfileStage(&this->stats, WGC_PROFILE_DAMAGE,
       microtime() - profileStart);
 
   profileStart = profile ? microtime() : 0;
   wgc_copyFrameTexture(this, accum, *src, false);
   if (profile)
-    wgc_recordProfileStage(this, WGC_PROFILE_ACCUM_COPY,
+    wgcStats_recordProfileStage(&this->stats, WGC_PROFILE_ACCUM_COPY,
       microtime() - profileStart);
 
   if (keepGapDamage)
@@ -1639,7 +1591,7 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
     wgc_updatePointer(this, x, y);
   }
   if (profile)
-    wgc_recordProfileStage(this, WGC_PROFILE_POINTER,
+    wgcStats_recordProfileStage(&this->stats, WGC_PROFILE_POINTER,
       microtime() - profileStart);
 
   unsigned publishIndex;
@@ -1703,7 +1655,7 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
   if (dst->copyFailed)
     goto exit;
   if (profile)
-    wgc_recordProfileStage(this, WGC_PROFILE_PUBLISH_COPY,
+    wgcStats_recordProfileStage(&this->stats, WGC_PROFILE_PUBLISH_COPY,
       microtime() - profileStart);
 
   profileStart = profile ? microtime() : 0;
@@ -1711,7 +1663,7 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
   // still Flush to make sure the copy gets to the driver promptly.
   ID3D11DeviceContext4_Flush(*this->context);
   if (profile)
-    wgc_recordProfileStage(this, WGC_PROFILE_FLUSH,
+    wgcStats_recordProfileStage(&this->stats, WGC_PROFILE_FLUSH,
       microtime() - profileStart);
 
   wgc_clearAccumulatedDamage(dst);
@@ -1819,7 +1771,8 @@ static CaptureResult wgc_capture(WGCInstance * this,
   if (!frame)
   {
     const uint64_t now = microtime();
-    const DXGI_COLOR_SPACE_TYPE colorSpace = wgc_getOutputColorSpace(this);
+    const DXGI_COLOR_SPACE_TYPE colorSpace =
+    wgcUtil_getOutputColorSpace(this->output);
     if (colorSpace != this->colorSpace)
     {
       DEBUG_INFO("WGC color space changed while idle 0x%x -> 0x%x, reinitializing",
@@ -2037,7 +1990,8 @@ static bool wgc_createCaptureItem(WGCInstance * this, HMONITOR monitor)
   comRef_scopePush(4);
 
   HSTRING className = NULL;
-  if (!wgc_createHString(RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureItem,
+  if (!wgcUtil_createHString(
+      RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureItem,
       &className))
     goto exit;
 
@@ -2075,7 +2029,7 @@ static bool wgc_createFramePool(WGCInstance * this)
   comRef_scopePush(7);
 
   HSTRING className = NULL;
-  if (!wgc_createHString(
+  if (!wgcUtil_createHString(
       RuntimeClass_Windows_Graphics_Capture_Direct3D11CaptureFramePool,
       &className))
     goto exit;
@@ -2090,7 +2044,7 @@ static bool wgc_createFramePool(WGCInstance * this)
     goto exit;
   }
 
-  const bool hdrSource = wgc_colorSpaceIsHDR(this->colorSpace);
+  const bool hdrSource = wgcUtil_colorSpaceIsHDR(this->colorSpace);
   const bool hdrCapablePublish =
     this->ivshmemFormat == DXGI_FORMAT_R16G16B16A16_FLOAT ||
     wgc_isPackedYuvIvshmem(this);
@@ -2269,209 +2223,13 @@ static bool wgc_shouldForceFullCopyAfterGap(WGCInstance * this,
   {
     const int64_t delta =
       frame->systemRelativeTime - this->lastSystemRelativeTime;
-    if (this->debugStats)
-    {
-      const LONG64 deltaUs = (LONG64)(delta / 10);
-      InterlockedExchangeAdd64(&this->systemRelativeGapTotalUs, deltaUs);
-      InterlockedIncrement64(&this->systemRelativeGapCount);
-      wgc_interlockedMax64(&this->systemRelativeGapMaxUs, deltaUs);
-    }
+    wgcStats_recordSystemRelativeGap(&this->stats, (LONG64)(delta / 10));
     forceFullCopy = delta > WGC_FULL_COPY_GAP_100NS;
   }
 
   this->hasLastSystemRelativeTime = true;
   this->lastSystemRelativeTime = frame->systemRelativeTime;
   return forceFullCopy;
-}
-
-static void wgc_interlockedMax64(volatile LONG64 * target, LONG64 value)
-{
-  LONG64 old = InterlockedCompareExchange64(target, 0, 0);
-  while(value > old &&
-      InterlockedCompareExchange64(target, value, old) != old)
-    old = InterlockedCompareExchange64(target, 0, 0);
-}
-
-static int wgc_compareLong64(const void * a, const void * b)
-{
-  const LONG64 av = *(const LONG64 *)a;
-  const LONG64 bv = *(const LONG64 *)b;
-  return (av > bv) - (av < bv);
-}
-
-static LONG64 wgc_percentileLong64(LONG64 * values, LONG count, unsigned pct)
-{
-  if (count <= 0)
-    return 0;
-  qsort(values, count, sizeof(values[0]), wgc_compareLong64);
-  LONG idx = (LONG)(((uint64_t)pct * (uint64_t)(count - 1) + 99) / 100);
-  if (idx < 0)
-    idx = 0;
-  if (idx >= count)
-    idx = count - 1;
-  return values[idx];
-}
-
-static LONG wgc_copyAndResetSamples(volatile LONG * sampleCount,
-  LONG64 * samples, LONG64 * out)
-{
-  LONG count = InterlockedExchange(sampleCount, 0);
-  if (count < 0)
-    count = 0;
-  if (count > WGC_STATS_SAMPLE_MAX)
-    count = WGC_STATS_SAMPLE_MAX;
-  for(LONG i = 0; i < count; ++i)
-    out[i] = samples[i];
-  return count;
-}
-
-static void wgc_recordSample(volatile LONG * sampleCount,
-  volatile LONG * overflow, LONG64 * samples, LONG64 value)
-{
-  const LONG idx = InterlockedIncrement(sampleCount) - 1;
-  if (idx >= 0 && idx < WGC_STATS_SAMPLE_MAX)
-    samples[idx] = value;
-  else
-    InterlockedExchange(overflow, 1);
-}
-
-static float wgc_halfToFloat(uint16_t h)
-{
-  const uint16_t sign = h >> 15;
-  const uint16_t exp  = (h >> 10) & 0x1f;
-  const uint16_t mant = h & 0x03ff;
-  float value;
-
-  if (exp == 0)
-    value = mant ? ldexpf((float)mant / 1024.0f, -14) : 0.0f;
-  else if (exp == 31)
-    value = mant ? 0.0f : 65504.0f;
-  else
-    value = ldexpf(1.0f + (float)mant / 1024.0f, (int)exp - 15);
-
-  return sign ? -value : value;
-}
-
-static bool wgc_ensureHDRStatsTexture(WGCInstance * this)
-{
-  if (this->hdrStatsTexture && *this->hdrStatsTexture)
-    return true;
-
-  comRef_scopePush(2);
-  comRef_defineLocal(ID3D11Texture2D, texture);
-  D3D11_TEXTURE2D_DESC desc =
-  {
-    .Width          = WGC_HDR_STATS_GRID,
-    .Height         = WGC_HDR_STATS_GRID,
-    .MipLevels      = 1,
-    .ArraySize      = 1,
-    .Format         = DXGI_FORMAT_R16G16B16A16_FLOAT,
-    .SampleDesc     = { .Count = 1, .Quality = 0 },
-    .Usage          = D3D11_USAGE_STAGING,
-    .CPUAccessFlags = D3D11_CPU_ACCESS_READ,
-  };
-
-  HRESULT hr = ID3D11Device5_CreateTexture2D(*this->device, &desc, NULL,
-    texture);
-  if (FAILED(hr))
-  {
-    DEBUG_WINERROR("WGC HDR stats staging texture creation failed", hr);
-    comRef_scopePop();
-    return false;
-  }
-
-  comRef_toGlobal(this->hdrStatsTexture, texture);
-  comRef_scopePop();
-  return true;
-}
-
-static void wgc_maybeLogHDRStats(WGCInstance * this, ID3D11Texture2D * src)
-{
-  if (!this->debugStats)
-    return;
-
-  const uint64_t now = microtime();
-  if (now - this->hdrStatsLastLog < 1000000)
-    return;
-
-  D3D11_TEXTURE2D_DESC srcDesc;
-  ID3D11Texture2D_GetDesc(src, &srcDesc);
-  if (srcDesc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT)
-    return;
-
-  this->hdrStatsLastLog = now;
-  if (!wgc_ensureHDRStatsTexture(this))
-    return;
-
-  for(unsigned y = 0; y < WGC_HDR_STATS_GRID; ++y)
-  {
-    const UINT sy = WGC_HDR_STATS_GRID == 1 ? 0 :
-      (UINT)(((uint64_t)y * (srcDesc.Height - 1)) /
-        (WGC_HDR_STATS_GRID - 1));
-    for(unsigned x = 0; x < WGC_HDR_STATS_GRID; ++x)
-    {
-      const UINT sx = WGC_HDR_STATS_GRID == 1 ? 0 :
-        (UINT)(((uint64_t)x * (srcDesc.Width - 1)) /
-          (WGC_HDR_STATS_GRID - 1));
-      const D3D11_BOX box =
-      {
-        .left   = sx,
-        .top    = sy,
-        .front  = 0,
-        .right  = sx + 1,
-        .bottom = sy + 1,
-        .back   = 1
-      };
-      ID3D11DeviceContext4_CopySubresourceRegion1(*this->context,
-        (ID3D11Resource *)*this->hdrStatsTexture,
-        0, x, y, 0, (ID3D11Resource *)src, 0, &box, 0);
-    }
-  }
-
-  D3D11_MAPPED_SUBRESOURCE mapped;
-  HRESULT hr = ID3D11DeviceContext4_Map(*this->context,
-    (ID3D11Resource *)*this->hdrStatsTexture, 0, D3D11_MAP_READ, 0, &mapped);
-  if (FAILED(hr))
-  {
-    DEBUG_WINERROR("WGC HDR stats staging map failed", hr);
-    return;
-  }
-
-  LONG64 lumMilli[WGC_HDR_STATS_GRID * WGC_HDR_STATS_GRID];
-  float minLum = FLT_MAX;
-  float maxLum = 0.0f;
-  double sumLum = 0.0;
-  unsigned count = 0;
-
-  for(unsigned y = 0; y < WGC_HDR_STATS_GRID; ++y)
-  {
-    const uint8_t * row = (const uint8_t *)mapped.pData +
-      (size_t)y * mapped.RowPitch;
-    for(unsigned x = 0; x < WGC_HDR_STATS_GRID; ++x)
-    {
-      const uint16_t * px = (const uint16_t *)row + x * 4;
-      const float r = max(0.0f, wgc_halfToFloat(px[0]));
-      const float g = max(0.0f, wgc_halfToFloat(px[1]));
-      const float b = max(0.0f, wgc_halfToFloat(px[2]));
-      const float lum = r * 0.2126f + g * 0.7152f + b * 0.0722f;
-      minLum = min(minLum, lum);
-      maxLum = max(maxLum, lum);
-      sumLum += lum;
-      lumMilli[count++] = (LONG64)(lum * 1000.0f + 0.5f);
-    }
-  }
-
-  ID3D11DeviceContext4_Unmap(*this->context,
-    (ID3D11Resource *)*this->hdrStatsTexture, 0);
-
-  const LONG64 p95 = wgc_percentileLong64(lumMilli, (LONG)count, 95);
-  const LONG64 p99 = wgc_percentileLong64(lumMilli, (LONG)count, 99);
-  const double avgLum = count ? sumLum / count : 0.0;
-  DEBUG_INFO("WGC HDR RGBA16F stats scRGB-luma min/avg/p95/p99/max: "
-    "%.3f/%.3f/%.3f/%.3f/%.3f samples:%u grid:%ux%u",
-    (double)minLum, avgLum, (double)p95 / 1000.0,
-    (double)p99 / 1000.0, (double)maxLum, count,
-    WGC_HDR_STATS_GRID, WGC_HDR_STATS_GRID);
 }
 
 static void wgc_maybeLogDebugStats(WGCInstance * this)
@@ -2483,138 +2241,33 @@ static void wgc_maybeLogDebugStats(WGCInstance * this)
   if (now - this->debugStatsLastLog < 1000000)
     return;
   this->debugStatsLastLog = now;
-  const LONG64 cbGapCount = this->handler ?
-    InterlockedExchange64(&this->handler->callbackGapCount, 0) : 0;
-  const LONG64 cbGapTotal = this->handler ?
-    InterlockedExchange64(&this->handler->callbackGapTotalUs, 0) : 0;
-  const LONG64 sysRelGapCount =
-    InterlockedExchange64(&this->systemRelativeGapCount, 0);
-  const LONG64 sysRelGapTotal =
-    InterlockedExchange64(&this->systemRelativeGapTotalUs, 0);
-  LONG64 profileCount[WGC_PROFILE_COUNT];
-  LONG64 profileTotal[WGC_PROFILE_COUNT];
-  LONG64 profileMax  [WGC_PROFILE_COUNT];
-  LONG64 profileP50  [WGC_PROFILE_COUNT];
-  LONG64 profileP95  [WGC_PROFILE_COUNT];
-  LONG64 profileP99  [WGC_PROFILE_COUNT];
-  LONG64 sampleScratch[WGC_STATS_SAMPLE_MAX];
-  LONG histOverflow = 0;
-  for(unsigned i = 0; i < WGC_PROFILE_COUNT; ++i)
+
+  WGCFrameEventHandler * handler = this->handler;
+  const WGCStatsReport ext =
   {
-    profileCount[i] = InterlockedExchange64(&this->profileCount  [i], 0);
-    profileTotal[i] = InterlockedExchange64(&this->profileTotalUs[i], 0);
-    profileMax  [i] = InterlockedExchange64(&this->profileMaxUs  [i], 0);
-    const LONG n = wgc_copyAndResetSamples(&this->profileSampleCount[i],
-      this->profileSamples[i], sampleScratch);
-    profileP50[i] = wgc_percentileLong64(sampleScratch, n, 50);
-    profileP95[i] = wgc_percentileLong64(sampleScratch, n, 95);
-    profileP99[i] = wgc_percentileLong64(sampleScratch, n, 99);
-    histOverflow |= InterlockedExchange(&this->profileSampleOverflow[i], 0);
-  }
-#define WGC_PROFILE_AVG(stage) \
-  (long long)(profileCount[(stage)] ? \
-    profileTotal[(stage)] / profileCount[(stage)] : 0)
-  const LONG64 d3d12CopySubmitCount =
-    InterlockedExchange64(&this->d3d12CopySubmitCount, 0);
-  const LONG64 d3d12CopySubmitTotal =
-    InterlockedExchange64(&this->d3d12CopySubmitTotalUs, 0);
-  const LONG64 d3d12CopySubmitMax =
-    InterlockedExchange64(&this->d3d12CopySubmitMaxUs, 0);
-  LONG submitSampleCount = wgc_copyAndResetSamples(
-    &this->d3d12CopySubmitSampleCount,
-    this->d3d12CopySubmitSamples, sampleScratch);
-  const LONG64 d3d12CopySubmitP50 =
-    wgc_percentileLong64(sampleScratch, submitSampleCount, 50);
-  const LONG64 d3d12CopySubmitP95 =
-    wgc_percentileLong64(sampleScratch, submitSampleCount, 95);
-  const LONG64 d3d12CopySubmitP99 =
-    wgc_percentileLong64(sampleScratch, submitSampleCount, 99);
-  histOverflow |= InterlockedExchange(&this->d3d12CopySubmitSampleOverflow, 0);
-
-  const LONG64 d3d12FenceWaitCount =
-    InterlockedExchange64(&this->d3d12FenceWaitCount, 0);
-  const LONG64 d3d12FenceWaitTotal =
-    InterlockedExchange64(&this->d3d12FenceWaitTotalUs, 0);
-  const LONG64 d3d12FenceWaitMax =
-    InterlockedExchange64(&this->d3d12FenceWaitMaxUs, 0);
-  LONG fenceSampleCount = wgc_copyAndResetSamples(
-    &this->d3d12FenceWaitSampleCount,
-    this->d3d12FenceWaitSamples, sampleScratch);
-  const LONG64 d3d12FenceWaitP50 =
-    wgc_percentileLong64(sampleScratch, fenceSampleCount, 50);
-  const LONG64 d3d12FenceWaitP95 =
-    wgc_percentileLong64(sampleScratch, fenceSampleCount, 95);
-  const LONG64 d3d12FenceWaitP99 =
-    wgc_percentileLong64(sampleScratch, fenceSampleCount, 99);
-  histOverflow |= InterlockedExchange(&this->d3d12FenceWaitSampleOverflow, 0);
-
-  DEBUG_INFO(
-    "WGC debug stats ready-pre:%ld ready-post:%ld timeouts:%ld bursts:%ld max-batch:%ld cb-gap-avg-us:%lld cb-gap-max-us:%lld cb-gap-count:%lld sysrel-gap-avg-us:%lld sysrel-gap-max-us:%lld sysrel-gap-count:%lld gap-full:%ld slot-busy:%ld events:%ld pulled:%ld consumed:%ld copy-accum-full:%lld copy-accum-dirty:%lld copy-accum-kpix:%lld copy-publish-full:%lld copy-publish-dirty:%lld copy-publish-kpix:%lld prof-acquire-avg/max:%lld/%lld prof-ensure-avg/max:%lld/%lld prof-damage-avg/max:%lld/%lld prof-accum-copy-avg/max:%lld/%lld prof-pointer-avg/max:%lld/%lld prof-publish-copy-avg/max:%lld/%lld prof-publish-copy-p50/p95/p99:%lld/%lld/%lld prof-flush-avg/max:%lld/%lld d3d12-copy-submit-avg/max:%lld/%lld d3d12-copy-submit-p50/p95/p99:%lld/%lld/%lld d3d12-fence-wait-avg/max:%lld/%lld d3d12-fence-wait-p50/p95/p99:%lld/%lld/%lld hist-overflow:%ld",
-    InterlockedExchange(&this->asyncReadyBeforeWait, 0),
-    InterlockedExchange(&this->asyncReadyAfterWait, 0),
-    InterlockedExchange(&this->asyncTimeouts, 0),
-    this->handler ? InterlockedExchange(&this->handler->callbackBursts, 0) : 0,
-    this->handler ? InterlockedExchange(&this->handler->maxCallbackBatch, 0) : 0,
-    (long long)(cbGapCount ? cbGapTotal / cbGapCount : 0),
-    (long long)(this->handler ?
-      InterlockedExchange64(&this->handler->callbackGapMaxUs, 0) : 0),
-    (long long)cbGapCount,
-    (long long)(sysRelGapCount ? sysRelGapTotal / sysRelGapCount : 0),
-    (long long)InterlockedExchange64(&this->systemRelativeGapMaxUs, 0),
-    (long long)sysRelGapCount,
-    InterlockedExchange(&this->fullCopyAfterGap, 0),
-    InterlockedExchange(&this->asyncSlotBusy, 0),
-    this->handler ? InterlockedCompareExchange(&this->handler->events, 0, 0) : 0,
-    this->handler ? InterlockedCompareExchange(&this->handler->framesPulled, 0, 0) : 0,
-    this->handler ? InterlockedCompareExchange(&this->handler->framesConsumed, 0, 0) : 0,
-    (long long)InterlockedExchange64(&this->copyAccumFull, 0),
-    (long long)InterlockedExchange64(&this->copyAccumDirty, 0),
-    (long long)(InterlockedExchange64(&this->copyAccumPixels, 0) / 1000),
-    (long long)InterlockedExchange64(&this->copyPublishFull, 0),
-    (long long)InterlockedExchange64(&this->copyPublishDirty, 0),
-    (long long)(InterlockedExchange64(&this->copyPublishPixels, 0) / 1000),
-    WGC_PROFILE_AVG(WGC_PROFILE_ACQUIRE),
-    (long long)profileMax[WGC_PROFILE_ACQUIRE],
-    WGC_PROFILE_AVG(WGC_PROFILE_ENSURE),
-    (long long)profileMax[WGC_PROFILE_ENSURE],
-    WGC_PROFILE_AVG(WGC_PROFILE_DAMAGE),
-    (long long)profileMax[WGC_PROFILE_DAMAGE],
-    WGC_PROFILE_AVG(WGC_PROFILE_ACCUM_COPY),
-    (long long)profileMax[WGC_PROFILE_ACCUM_COPY],
-    WGC_PROFILE_AVG(WGC_PROFILE_POINTER),
-    (long long)profileMax[WGC_PROFILE_POINTER],
-    WGC_PROFILE_AVG(WGC_PROFILE_PUBLISH_COPY),
-    (long long)profileMax[WGC_PROFILE_PUBLISH_COPY],
-    (long long)profileP50[WGC_PROFILE_PUBLISH_COPY],
-    (long long)profileP95[WGC_PROFILE_PUBLISH_COPY],
-    (long long)profileP99[WGC_PROFILE_PUBLISH_COPY],
-    WGC_PROFILE_AVG(WGC_PROFILE_FLUSH),
-    (long long)profileMax[WGC_PROFILE_FLUSH],
-    (long long)(d3d12CopySubmitCount ?
-      d3d12CopySubmitTotal / d3d12CopySubmitCount : 0),
-    (long long)d3d12CopySubmitMax,
-    (long long)d3d12CopySubmitP50,
-    (long long)d3d12CopySubmitP95,
-    (long long)d3d12CopySubmitP99,
-    (long long)(d3d12FenceWaitCount ?
-      d3d12FenceWaitTotal / d3d12FenceWaitCount : 0),
-    (long long)d3d12FenceWaitMax,
-    (long long)d3d12FenceWaitP50,
-    (long long)d3d12FenceWaitP95,
-    (long long)d3d12FenceWaitP99,
-    histOverflow);
-#undef WGC_PROFILE_AVG
-}
-
-static void wgc_recordProfileStage(WGCInstance * this, WGCProfileStage stage,
-  uint64_t elapsedUs)
-{
-  InterlockedExchangeAdd64(&this->profileTotalUs[stage], (LONG64)elapsedUs);
-  InterlockedIncrement64(&this->profileCount[stage]);
-  wgc_interlockedMax64(&this->profileMaxUs[stage], (LONG64)elapsedUs);
-  wgc_recordSample(&this->profileSampleCount[stage],
-    &this->profileSampleOverflow[stage], this->profileSamples[stage],
-    (LONG64)elapsedUs);
+    .readyPre  = InterlockedExchange(&this->asyncReadyBeforeWait, 0),
+    .readyPost = InterlockedExchange(&this->asyncReadyAfterWait , 0),
+    .timeouts  = InterlockedExchange(&this->asyncTimeouts       , 0),
+    .bursts    = handler ?
+      InterlockedExchange(&handler->callbackBursts, 0) : 0,
+    .maxBatch  = handler ?
+      InterlockedExchange(&handler->maxCallbackBatch, 0) : 0,
+    .cbGapTotalUs = handler ?
+      InterlockedExchange64(&handler->callbackGapTotalUs, 0) : 0,
+    .cbGapMaxUs   = handler ?
+      InterlockedExchange64(&handler->callbackGapMaxUs, 0) : 0,
+    .cbGapCount   = handler ?
+      InterlockedExchange64(&handler->callbackGapCount, 0) : 0,
+    .gapFull   = InterlockedExchange(&this->fullCopyAfterGap, 0),
+    .slotBusy  = InterlockedExchange(&this->asyncSlotBusy, 0),
+    .events    = handler ?
+      InterlockedCompareExchange(&handler->events, 0, 0) : 0,
+    .pulled    = handler ?
+      InterlockedCompareExchange(&handler->framesPulled, 0, 0) : 0,
+    .consumed  = handler ?
+      InterlockedCompareExchange(&handler->framesConsumed, 0, 0) : 0
+  };
+  wgcStats_report(&this->stats, &ext);
 }
 
 static void wgc_accumulateDamage(WGCInstance * this, const WGCFrameInfo * src)
@@ -2739,36 +2392,9 @@ static void wgc_invalidateNV12Shader(WGCInstance * this)
   this->nv12ShaderStateValid = false;
 }
 
-static bool wgc_colorSpaceIsHDR(DXGI_COLOR_SPACE_TYPE colorSpace)
-{
-  return colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
-         colorSpace == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020 ||
-         colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
-}
-
-static DXGI_COLOR_SPACE_TYPE wgc_getOutputColorSpace(WGCInstance * this)
-{
-  if (!this->output)
-    return DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-
-  DXGI_COLOR_SPACE_TYPE colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-  IDXGIOutput6 * output6 = NULL;
-  HRESULT hr = IDXGIOutput_QueryInterface(this->output, &IID_IDXGIOutput6,
-    (void **)&output6);
-  if (SUCCEEDED(hr))
-  {
-    DXGI_OUTPUT_DESC1 desc1;
-    hr = IDXGIOutput6_GetDesc1(output6, &desc1);
-    if (SUCCEEDED(hr))
-      colorSpace = desc1.ColorSpace;
-    IDXGIOutput6_Release(output6);
-  }
-  return colorSpace;
-}
-
 static DXGI_FORMAT wgc_expectedSourceFormat(WGCInstance * this)
 {
-  const bool hdrSource = wgc_colorSpaceIsHDR(this->colorSpace);
+  const bool hdrSource = wgcUtil_colorSpaceIsHDR(this->colorSpace);
   const bool hdrCapablePublish =
     this->ivshmemFormat == DXGI_FORMAT_R16G16B16A16_FLOAT ||
     wgc_isPackedYuvIvshmem(this);
@@ -2791,7 +2417,8 @@ static unsigned wgc_nv12EncodedWidth(unsigned width)
 static bool wgc_ensureNV12Shader(WGCInstance * this)
 {
   const bool pqPreserve = wgc_isP010PackedIvshmem(this);
-  const bool hdrToneMap = !pqPreserve && wgc_colorSpaceIsHDR(this->colorSpace);
+  const bool hdrToneMap = !pqPreserve &&
+    wgcUtil_colorSpaceIsHDR(this->colorSpace);
 
   if (this->nv12Shader && this->nv12ShaderStateValid &&
       this->nv12ShaderPqPreserve     == pqPreserve &&
@@ -3123,77 +2750,12 @@ static bool wgc_encodeFrameNV12(WGCInstance * this, WGCFrameInfo * dst,
     nullUavs, NULL);
   ID3D11DeviceContext4_CSSetShader(*this->context, NULL, NULL, 0);
 
-  bool doEncodeBridgeLog = false;
-  if (this->debugStats && wgc_isP010PackedIvshmem(this))
-  {
-    static uint64_t lastEncodeBridgeLog = 0;
-    const uint64_t now = microtime();
-    if (now - lastEncodeBridgeLog >= 1000 * 1000)
-    {
-      lastEncodeBridgeLog = now;
-      doEncodeBridgeLog = true;
-    }
-  }
+  const bool doEncodeBridgeLog = wgc_isP010PackedIvshmem(this) &&
+    wgcStats_shouldDumpP010(&this->stats);
 
-  if (doEncodeBridgeLog && wgc_isP010PackedIvshmem(this) && dst->bridgeB)
-  {
-      D3D11_TEXTURE2D_DESC encodeDesc;
-      ID3D11Texture2D_GetDesc(*dst->bridgeB, &encodeDesc);
-      encodeDesc.BindFlags      = 0;
-      encodeDesc.MiscFlags      = 0;
-      encodeDesc.Usage          = D3D11_USAGE_STAGING;
-      encodeDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-
-      comRef_defineLocal(ID3D11Texture2D, encodeStaging);
-      hr = ID3D11Device5_CreateTexture2D(*this->device, &encodeDesc, NULL,
-        encodeStaging);
-      if (SUCCEEDED(hr))
-      {
-        ID3D11DeviceContext4_CopyResource(*this->context,
-          (ID3D11Resource *)*encodeStaging, (ID3D11Resource *)*dst->bridgeB);
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        hr = ID3D11DeviceContext4_Map(*this->context,
-          (ID3D11Resource *)*encodeStaging, 0, D3D11_MAP_READ, 0, &mapped);
-        if (SUCCEEDED(hr))
-        {
-          uint16_t minY = UINT16_MAX;
-          uint16_t maxY = 0;
-          uint64_t sumY = 0;
-          unsigned nonzeroY = 0;
-          unsigned samplesY = 0;
-          const unsigned srcW = this->ivshmemWidth;
-          const unsigned srcH = this->ivshmemHeight;
-          for(unsigned y = 0; y < srcH; y += max(1u, srcH / 36))
-          {
-            for(unsigned x = 0; x < srcW; x += max(1u, srcW / 64))
-            {
-              const uint8_t * row = (const uint8_t *)mapped.pData +
-                (size_t)y * mapped.RowPitch;
-              const uint16_t * px = (const uint16_t *)(row +
-                (size_t)(x / 4) * 8);
-              const uint16_t value = px[x % 4];
-              minY = min(minY, value);
-              maxY = max(maxY, value);
-              sumY += value;
-              nonzeroY += value != 0;
-              ++samplesY;
-            }
-          }
-          DEBUG_INFO("WGC P010 encode UAV samples rowPitch:%u size:%ux%u "
-            "scan:min/avg/max:%u/%" PRIu64 "/%u nonzero:%u/%u",
-            mapped.RowPitch, srcW, srcH,
-            minY == UINT16_MAX ? 0 : minY,
-            samplesY ? sumY / samplesY : 0,
-            maxY, nonzeroY, samplesY);
-          ID3D11DeviceContext4_Unmap(*this->context,
-            (ID3D11Resource *)*encodeStaging, 0);
-        }
-        else
-          DEBUG_WINERROR("Map WGC P010 encode staging failed", hr);
-      }
-      else
-        DEBUG_WINERROR("Create WGC P010 encode staging failed", hr);
-  }
+  if (doEncodeBridgeLog && dst->bridgeB)
+    wgcStats_dumpP010(*this->device, *this->context, *dst->bridgeB,
+      this->ivshmemWidth, this->ivshmemHeight, "encode UAV");
 
   // Fallback path only: the encode shader normally writes the shared bridge
   // (bridgeA) directly; bridgeB exists only if the driver refused a UAV bind
@@ -3205,65 +2767,9 @@ static bool wgc_encodeFrameNV12(WGCInstance * this, WGCFrameInfo * dst,
       (ID3D11Resource *)*dst->bridgeA, (ID3D11Resource *)*dst->bridgeB);
   }
 
-  if (doEncodeBridgeLog && wgc_isP010PackedIvshmem(this))
-  {
-      D3D11_TEXTURE2D_DESC bridgeDesc;
-      ID3D11Texture2D_GetDesc(*dst->bridgeA, &bridgeDesc);
-      bridgeDesc.BindFlags      = 0;
-      bridgeDesc.MiscFlags      = 0;
-      bridgeDesc.Usage          = D3D11_USAGE_STAGING;
-      bridgeDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-
-      comRef_defineLocal(ID3D11Texture2D, staging);
-      hr = ID3D11Device5_CreateTexture2D(*this->device, &bridgeDesc, NULL,
-        staging);
-      if (SUCCEEDED(hr))
-      {
-        ID3D11DeviceContext4_CopyResource(*this->context,
-          (ID3D11Resource *)*staging, (ID3D11Resource *)*dst->bridgeA);
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        hr = ID3D11DeviceContext4_Map(*this->context,
-          (ID3D11Resource *)*staging, 0, D3D11_MAP_READ, 0, &mapped);
-        if (SUCCEEDED(hr))
-        {
-          uint16_t minY = UINT16_MAX;
-          uint16_t maxY = 0;
-          uint64_t sumY = 0;
-          unsigned nonzeroY = 0;
-          unsigned samplesY = 0;
-          const unsigned srcW = this->ivshmemWidth;
-          const unsigned srcH = this->ivshmemHeight;
-          for(unsigned y = 0; y < srcH; y += max(1u, srcH / 36))
-          {
-            for(unsigned x = 0; x < srcW; x += max(1u, srcW / 64))
-            {
-              const uint8_t * row = (const uint8_t *)mapped.pData +
-                (size_t)y * mapped.RowPitch;
-              const uint16_t * px = (const uint16_t *)(row +
-                (size_t)(x / 4) * 8);
-              const uint16_t value = px[x % 4];
-              minY = min(minY, value);
-              maxY = max(maxY, value);
-              sumY += value;
-              nonzeroY += value != 0;
-              ++samplesY;
-            }
-          }
-          DEBUG_INFO("WGC P010 bridge samples rowPitch:%u size:%ux%u "
-            "scan:min/avg/max:%u/%" PRIu64 "/%u nonzero:%u/%u",
-            mapped.RowPitch, srcW, srcH,
-            minY == UINT16_MAX ? 0 : minY,
-            samplesY ? sumY / samplesY : 0,
-            maxY, nonzeroY, samplesY);
-          ID3D11DeviceContext4_Unmap(*this->context,
-            (ID3D11Resource *)*staging, 0);
-        }
-        else
-          DEBUG_WINERROR("Map WGC P010 bridge staging failed", hr);
-      }
-      else
-        DEBUG_WINERROR("Create WGC P010 bridge staging failed", hr);
-  }
+  if (doEncodeBridgeLog)
+    wgcStats_dumpP010(*this->device, *this->context, *dst->bridgeA,
+      this->ivshmemWidth, this->ivshmemHeight, "bridge");
 
   // Packed YUV/P010 does not share the source frame's dimensions, but the
   // D3D12 IVSHMEM copy path remaps source dirty rects into packed-buffer
@@ -3590,16 +3096,7 @@ static bool wgc_copyFrameTextureD3D12(WGCInstance * this, WGCFrameInfo * dst)
     dst->d3d12CopyFenceValue[i] = this->d3d12CopyCommands[i].fenceValue;
   }
   const uint64_t d3d12SubmitUs = microtime() - d3d12SubmitStartUs;
-  if (this->debugStats)
-  {
-    InterlockedExchangeAdd64(&this->d3d12CopySubmitTotalUs,
-      (LONG64)d3d12SubmitUs);
-    InterlockedIncrement64(&this->d3d12CopySubmitCount);
-    wgc_interlockedMax64(&this->d3d12CopySubmitMaxUs, (LONG64)d3d12SubmitUs);
-    wgc_recordSample(&this->d3d12CopySubmitSampleCount,
-      &this->d3d12CopySubmitSampleOverflow, this->d3d12CopySubmitSamples,
-      (LONG64)d3d12SubmitUs);
-  }
+  wgcStats_recordD3D12CopySubmit(&this->stats, d3d12SubmitUs);
   if (!executed)
   {
     memset(dst->d3d12CopyFenceValue, 0, sizeof(dst->d3d12CopyFenceValue));
@@ -3633,17 +3130,7 @@ static void wgc_waitFrameD3D12Copy(WGCInstance * this, WGCFrameInfo * frame)
     WaitForSingleObject(cmd->event, INFINITE);
   }
   const uint64_t fenceWaitUs = microtime() - fenceWaitStartUs;
-
-  if (this->debugStats)
-  {
-    InterlockedExchangeAdd64(&this->d3d12FenceWaitTotalUs,
-      (LONG64)fenceWaitUs);
-    InterlockedIncrement64(&this->d3d12FenceWaitCount);
-    wgc_interlockedMax64(&this->d3d12FenceWaitMaxUs, (LONG64)fenceWaitUs);
-    wgc_recordSample(&this->d3d12FenceWaitSampleCount,
-      &this->d3d12FenceWaitSampleOverflow, this->d3d12FenceWaitSamples,
-      (LONG64)fenceWaitUs);
-  }
+  wgcStats_recordD3D12FenceWait(&this->stats, fenceWaitUs);
 
   memset(frame->d3d12CopyFenceValue, 0, sizeof(frame->d3d12CopyFenceValue));
   frame->d3d12CopyQueueCount = 0;
@@ -3686,13 +3173,6 @@ static void wgc_recordCopyStats(WGCInstance * this, const WGCFrameInfo * frame,
   if (!this->debugStats)
     return;
 
-  volatile LONG64 * fullCounter  = publishCopy ?
-    &this->copyPublishFull : &this->copyAccumFull;
-  volatile LONG64 * dirtyCounter = publishCopy ?
-    &this->copyPublishDirty : &this->copyAccumDirty;
-  volatile LONG64 * pixelCounter = publishCopy ?
-    &this->copyPublishPixels : &this->copyAccumPixels;
-
   const uint64_t framePixels =
     (uint64_t)frame->format.Width * frame->format.Height;
   const bool fullCopy = frame->fullCopy ||
@@ -3701,9 +3181,8 @@ static void wgc_recordCopyStats(WGCInstance * this, const WGCFrameInfo * frame,
      frame->nbDirtyRects > 0 &&
      pixels * 100 >= framePixels * (uint64_t)this->dirtyFullCopyPercent);
 
-  InterlockedIncrement64(fullCopy ? fullCounter : dirtyCounter);
-  InterlockedExchangeAdd64(pixelCounter,
-    (LONG64)(fullCopy ? framePixels : pixels));
+  wgcStats_recordCopy(&this->stats, publishCopy, fullCopy, pixels,
+    framePixels);
 }
 
 // IVSHMEM publish: create a ROW_MAJOR TEXTURE2D placed in the IVSHMEM heap
@@ -4366,18 +3845,6 @@ static void wgc_releaseFrame(IDirect3D11CaptureFrame ** frame)
   wgc_closeInspectable((IInspectable *)*frame);
   IDirect3D11CaptureFrame_Release(*frame);
   *frame = NULL;
-}
-
-static bool wgc_createHString(const WCHAR * str, HSTRING * result)
-{
-  const HRESULT hr = WindowsCreateString(str, wcslen(str), result);
-  if (FAILED(hr))
-  {
-    DEBUG_WINERROR("WindowsCreateString failed", hr);
-    return false;
-  }
-
-  return true;
 }
 
 // Public WGC API used by the standalone Capture_WGC interface.
