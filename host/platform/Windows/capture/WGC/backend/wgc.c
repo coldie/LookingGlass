@@ -435,8 +435,9 @@ typedef struct WGCFrameInfo
   //   bridgeA — D3D11 texture on the WGC frame pool's device (SHARED +
   //             SHARED_NTHANDLE), opened as bridge12 on the D3D12 side.
   //             WGC source → bridgeA on WGC context.
-  //   bridgeB — encode-shader UAV target when packed YUV/RGB10 encoding
-  //             is active.
+  //   bridgeB — fallback encode-shader UAV target, only created if the
+  //             driver refuses a UAV bind on the shared bridgeA (the
+  //             encode shader normally writes bridgeA directly).
   ID3D11Texture2D ** bridgeA;
   ID3D11Texture2D ** bridgeB;
   ID3D12Resource  ** bridge12;
@@ -3446,6 +3447,9 @@ static bool wgc_encodeFrameNV12(WGCInstance * this, WGCFrameInfo * dst,
         DEBUG_WINERROR("Create WGC P010 encode staging failed", hr);
   }
 
+  // Fallback path only: the encode shader normally writes the shared bridge
+  // (bridgeA) directly; bridgeB exists only if the driver refused a UAV bind
+  // on the shared texture, in which case copy the encoded frame across.
   if (this->publishMode == WGC_PUBLISH_IVSHMEM_D3D12_COPY && dst->bridgeB)
   {
     ID3D11DeviceContext4_Flush(*this->context);
@@ -4155,8 +4159,25 @@ static bool wgc_ensureFrameIvshmem(WGCInstance * this, WGCFrameInfo * frame,
                       D3D11_RESOURCE_MISC_SHARED_NTHANDLE
   };
 
+  // The encode shader writes the shared bridge directly so the packed frame
+  // does not need an extra full-frame copy. Some drivers may refuse a UAV
+  // bind on a shared texture; fall back to a separate encode target that is
+  // copied into bridgeA each frame.
+  bool encodeOnBridgeA = wgc_needsEncodeShader(this);
+  if (encodeOnBridgeA)
+    bridgeDesc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+
   hr = ID3D11Device5_CreateTexture2D(*this->device, &bridgeDesc, NULL,
     bridgeA);
+  if (FAILED(hr) && encodeOnBridgeA)
+  {
+    DEBUG_WINERROR("ivshmem-d3d12-copy: shared bridge with UAV failed, "
+      "falling back to a separate encode texture", hr);
+    encodeOnBridgeA = false;
+    bridgeDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    hr = ID3D11Device5_CreateTexture2D(*this->device, &bridgeDesc, NULL,
+      bridgeA);
+  }
   if (FAILED(hr))
   {
     DEBUG_WINERROR("ivshmem-d3d12-copy: CreateTexture2D bridgeA failed", hr);
@@ -4166,17 +4187,20 @@ static bool wgc_ensureFrameIvshmem(WGCInstance * this, WGCFrameInfo * frame,
 
   if (wgc_needsEncodeShader(this))
   {
-    D3D11_TEXTURE2D_DESC encodeDesc = bridgeDesc;
-    encodeDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-    encodeDesc.MiscFlags = 0;
-    hr = ID3D11Device5_CreateTexture2D(*this->device, &encodeDesc, NULL,
-      bridgeB);
-    if (FAILED(hr))
+    if (!encodeOnBridgeA)
     {
-      DEBUG_WINERROR("ivshmem-d3d12-copy: CreateTexture2D encode "
-        "bridge failed", hr);
-      comRef_scopePop();
-      return false;
+      D3D11_TEXTURE2D_DESC encodeDesc = bridgeDesc;
+      encodeDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+      encodeDesc.MiscFlags = 0;
+      hr = ID3D11Device5_CreateTexture2D(*this->device, &encodeDesc, NULL,
+        bridgeB);
+      if (FAILED(hr))
+      {
+        DEBUG_WINERROR("ivshmem-d3d12-copy: CreateTexture2D encode "
+          "bridge failed", hr);
+        comRef_scopePop();
+        return false;
+      }
     }
 
     D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc =
@@ -4186,7 +4210,8 @@ static bool wgc_ensureFrameIvshmem(WGCInstance * this, WGCFrameInfo * frame,
       .Texture2D     = { .MipSlice = 0 }
     };
     hr = ID3D11Device5_CreateUnorderedAccessView(*this->device,
-      (ID3D11Resource *)*bridgeB, &uavDesc, encodeUav);
+      (ID3D11Resource *)(encodeOnBridgeA ? *bridgeA : *bridgeB),
+      &uavDesc, encodeUav);
     if (FAILED(hr))
     {
       DEBUG_WINERROR("ivshmem-d3d12-copy: CreateUnorderedAccessView encode "
@@ -4232,7 +4257,8 @@ static bool wgc_ensureFrameIvshmem(WGCInstance * this, WGCFrameInfo * frame,
   comRef_toGlobal(frame->bridgeA , bridgeA );
   if (wgc_needsEncodeShader(this))
   {
-    comRef_toGlobal(frame->bridgeB  , bridgeB  );
+    if (!encodeOnBridgeA)
+      comRef_toGlobal(frame->bridgeB, bridgeB);
     comRef_toGlobal(frame->encodeUav, encodeUav);
   }
   comRef_toGlobal(frame->bridge12, bridge12);
