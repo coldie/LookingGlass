@@ -31,8 +31,6 @@
 #include "common/option.h"
 #include "windows/mousehook.h"
 #include "common/time.h"
-#include "common/profile.h"
-#include "wgc_profile_d3d11.h"
 
 #include <stdint.h>
 #include <float.h>
@@ -550,10 +548,6 @@ struct WGCInstance
   // `device`/`context`.
   bool                 twoDeviceBridge;
 
-  WGCTracyD3D11Context * tracyWgcCtx;
-  WGCTracyD3D11Context * tracyOn12Ctx;
-  WGCTracyD3D12Context * tracyD3D12CopyCtx[WGC_D3D12_COPY_QUEUE_MAX];
-
   // IVSHMEM-direct environment — set via wgc_setIvshmemEnv before
   // wgc_initInstance. Only used when publishMode == WGC_PUBLISH_IVSHMEM_DIRECT.
   // The heap and D3D11On12 device are owned by the caller; we hold raw
@@ -834,8 +828,6 @@ static HRESULT STDMETHODCALLTYPE wgc_eventInvoke(
   IInspectable * args)
 {
   wgc_boostCallbackThreadPriority();
-  LG_PROFILE_THREAD("WGC FrameArrived");
-  LG_PROFILE_ZONE_BEGIN(zoneCallback, "wgc FrameArrived callback");
 
   WGCFrameEventHandler * this = UPCAST(WGCFrameEventHandler, iface);
   InterlockedIncrement(&this->activeCallbacks);
@@ -868,7 +860,6 @@ static HRESULT STDMETHODCALLTYPE wgc_eventInvoke(
       if (!next)
         break;
       ++callbackBatch;
-      LG_PROFILE_FRAME("wgc frame");
 
       const bool callbackProcessed = owner->asyncCapture &&
         !wgc_isIvshmemPublishMode(owner->publishMode);
@@ -907,7 +898,6 @@ static HRESULT STDMETHODCALLTYPE wgc_eventInvoke(
     SetEvent(this->event);
   }
   InterlockedDecrement(&this->activeCallbacks);
-  LG_PROFILE_ZONE_END(zoneCallback);
   return S_OK;
 }
 
@@ -1206,8 +1196,6 @@ static bool wgc_init(D12Backend * instance, bool debug, ID3D12Device3 * device,
   comRef_toGlobal(this->device       , d11device5    );
   comRef_toGlobal(this->context      , d11context4   );
   comRef_toGlobal(this->graphicsDevice, graphicsDevice);
-  this->tracyWgcCtx = WGC_TRACY_D3D11_CREATE(*this->device, *this->context,
-    "WGC D3D11");
 
   // Resolve on12Device / on12Context.
   //
@@ -1280,8 +1268,6 @@ static bool wgc_init(D12Backend * instance, bool debug, ID3D12Device3 * device,
     comRef_toGlobal(this->wgcFenceOn12, fenceOn12);
     this->wgcFenceValue    = 0;
     this->twoDeviceBridge  = true;
-    this->tracyOn12Ctx = WGC_TRACY_D3D11_CREATE(*this->on12Device,
-      *this->on12Context, "WGC D3D11On12");
     DEBUG_INFO("ivshmem-direct: two-device path active");
   }
 
@@ -1339,10 +1325,6 @@ static bool wgc_init(D12Backend * instance, bool debug, ID3D12Device3 * device,
         goto exit;
       }
       this->d3d12CopyCommandReady[i] = true;
-      char name[32];
-      snprintf(name, sizeof(name), "WGC D3D12 COPY q%u", i);
-      this->tracyD3D12CopyCtx[i] = WGC_TRACY_D3D12_CREATE(
-        *this->d12device, this->d3d12CopyQueues[i], name);
     }
 
     comRef_defineLocal(ID3D11Fence, fence);
@@ -1447,7 +1429,6 @@ static bool wgc_deinit(D12Backend * instance)
 
   for(unsigned i = 0; i < WGC_D3D12_COPY_QUEUE_MAX; ++i)
   {
-    WGC_TRACY_D3D12_DESTROY(this->tracyD3D12CopyCtx[i]);
     d12_commandGroupFree(&this->d3d12CopyCommands[i]);
     this->d3d12CopyCommandReady[i] = false;
     if (this->d3d12CopyQueues[i])
@@ -1457,9 +1438,6 @@ static bool wgc_deinit(D12Backend * instance)
     }
   }
   this->d3d12CopyQueueCount = 0;
-
-  WGC_TRACY_D3D11_DESTROY(this->tracyOn12Ctx);
-  WGC_TRACY_D3D11_DESTROY(this->tracyWgcCtx);
 
   if (this->mouseHookCreated)
   {
@@ -1822,15 +1800,11 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
 
     profileStart = profile ? microtime() : 0;
     timingStart = timings ? microtime() : 0;
-    LG_PROFILE_ZONE_BEGIN(zoneFlushDirect, "wgc d3d11 flush");
     // Two-device path: bridge-A copy and fence Signal are on this->context;
     // wrap copy and Release are on this->on12Context. Flush both.
     ID3D11DeviceContext4_Flush(*this->context);
     if (this->twoDeviceBridge)
       ID3D11DeviceContext4_Flush(*this->on12Context);
-    LG_PROFILE_ZONE_END(zoneFlushDirect);
-    WGC_TRACY_D3D11_COLLECT(this->tracyWgcCtx);
-    WGC_TRACY_D3D11_COLLECT(this->tracyOn12Ctx);
     if (timings)
       d12_timingRecord(D12_TIMING_WGC_SIGNAL, microtime() - timingStart);
     if (profile)
@@ -2020,9 +1994,7 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
   }
   // CPU consumer relies on D3D11 Map() blocking for outstanding GPU work; we
   // still Flush to make sure the copy gets to the driver promptly.
-  LG_PROFILE_ZONE_BEGIN(zoneFlush, "wgc d3d11 flush");
   ID3D11DeviceContext4_Flush(*this->context);
-  LG_PROFILE_ZONE_END(zoneFlush);
   if (timings)
     d12_timingRecord(D12_TIMING_WGC_SIGNAL, microtime() - timingStart);
   if (profile)
@@ -2130,7 +2102,6 @@ static CaptureResult wgc_capture(D12Backend * instance,
         DEBUG_INFO("WGC direct: pulled frame via direct TryGetNextFrame poll "
           "(FrameArrived was silent)");
       frame = polled;
-      LG_PROFILE_FRAME("wgc polled frame");
     }
     else if (!this->pollFramePool && ++this->emptyPolls % 3 == 0)
       DEBUG_INFO("WGC direct: TryGetNextFrame poll returned NULL "
@@ -3858,18 +3829,10 @@ static void wgc_copyFrameTexture(WGCInstance * this, WGCFrameInfo * dst,
       this->publishMode == WGC_PUBLISH_IVSHMEM_D3D12_COPY &&
       dst->bridgeA && dst->bridge12)
   {
-    LG_PROFILE_ZONE_BEGIN(zoneCopy1, "wgc src->bridgeA (WGC ctx)");
-    LG_PROFILE_ZONE_VALUE(zoneCopy1, pixels);
-    const char * gpuName = dst->fullCopy ?
-      "gpu wgc src->bridge" : "gpu wgc dirty src->bridge";
-    WGCTracyD3D11Zone * gpuZone = WGC_TRACY_D3D11_ZONE_BEGIN_N(
-      this->tracyWgcCtx, gpuName, strlen(gpuName));
     if (wgc_needsEncodeShader(this))
     {
       if (!wgc_encodeFrameNV12(this, dst, src))
       {
-        WGC_TRACY_D3D11_ZONE_END(gpuZone);
-        LG_PROFILE_ZONE_END(zoneCopy1);
         InterlockedExchange(&this->forceNextFullCopy, 1);
         dst->copyFailed = true;
         return;
@@ -3883,8 +3846,6 @@ static void wgc_copyFrameTexture(WGCInstance * this, WGCFrameInfo * dst,
           rect < dst->dirtyRects + dst->nbDirtyRects; ++rect)
         wgc_copyFrameTextureRectCtx(*this->context,
           (ID3D11Resource *)*dst->bridgeA, (ID3D11Resource *)src, rect);
-    WGC_TRACY_D3D11_ZONE_END(gpuZone);
-    LG_PROFILE_ZONE_END(zoneCopy1);
 
     ++this->wgcFenceValue;
     ID3D11DeviceContext4_Signal(*this->context, *this->wgcFence,
@@ -3904,34 +3865,23 @@ static void wgc_copyFrameTexture(WGCInstance * this, WGCFrameInfo * dst,
   if (twoDeviceBridge)
   {
     // Stage 1: WGC source → bridgeA on WGC context (VRAM→VRAM, same device).
+    if (wgc_needsEncodeShader(this))
     {
-      LG_PROFILE_ZONE_BEGIN(zoneCopy1, "wgc src->bridgeA (WGC ctx)");
-      LG_PROFILE_ZONE_VALUE(zoneCopy1, pixels);
-      WGCTracyD3D11Zone * gpuZone =
-        WGC_TRACY_D3D11_ZONE_BEGIN(this->tracyWgcCtx,
-          "gpu wgc src->bridgeA");
-      if (wgc_needsEncodeShader(this))
+      if (!wgc_encodeFrameNV12(this, dst, src))
       {
-        if (!wgc_encodeFrameNV12(this, dst, src))
-        {
-          WGC_TRACY_D3D11_ZONE_END(gpuZone);
-          LG_PROFILE_ZONE_END(zoneCopy1);
-          InterlockedExchange(&this->forceNextFullCopy, 1);
-          dst->copyFailed = true;
-          return;
-        }
+        InterlockedExchange(&this->forceNextFullCopy, 1);
+        dst->copyFailed = true;
+        return;
       }
-      else if (dst->fullCopy)
-        ID3D11DeviceContext4_CopyResource(*this->context,
-          (ID3D11Resource *)*dst->bridgeA, (ID3D11Resource *)src);
-      else
-        for(const RECT * rect = dst->dirtyRects;
-            rect < dst->dirtyRects + dst->nbDirtyRects; ++rect)
-          wgc_copyFrameTextureRectCtx(*this->context,
-            (ID3D11Resource *)*dst->bridgeA, (ID3D11Resource *)src, rect);
-      WGC_TRACY_D3D11_ZONE_END(gpuZone);
-      LG_PROFILE_ZONE_END(zoneCopy1);
     }
+    else if (dst->fullCopy)
+      ID3D11DeviceContext4_CopyResource(*this->context,
+        (ID3D11Resource *)*dst->bridgeA, (ID3D11Resource *)src);
+    else
+      for(const RECT * rect = dst->dirtyRects;
+          rect < dst->dirtyRects + dst->nbDirtyRects; ++rect)
+        wgc_copyFrameTextureRectCtx(*this->context,
+          (ID3D11Resource *)*dst->bridgeA, (ID3D11Resource *)src, rect);
 
     // Cross-device sync: WGC signals, D3D11On12 side waits.
     const UINT64 fenceVal = ++this->wgcFenceValue;
@@ -3944,24 +3894,15 @@ static void wgc_copyFrameTexture(WGCInstance * this, WGCFrameInfo * dst,
     // emitted once per frame.
     ID3D11Resource * acquired[1] = { (ID3D11Resource *)*dst->texture };
     ID3D11On12Device_AcquireWrappedResources(this->d11on12Device, acquired, 1);
-    {
-      LG_PROFILE_ZONE_BEGIN(zoneCopy2, "wgc bridgeB->IVSHMEM wrap (On12 ctx)");
-      LG_PROFILE_ZONE_VALUE(zoneCopy2, pixels);
-      WGCTracyD3D11Zone * gpuZone =
-        WGC_TRACY_D3D11_ZONE_BEGIN(this->tracyOn12Ctx,
-          "gpu wgc bridgeB->IVSHMEM");
-      if (dst->fullCopy)
-        ID3D11DeviceContext4_CopyResource(*this->on12Context,
-          (ID3D11Resource *)*dst->texture, (ID3D11Resource *)*dst->bridgeB);
-      else
-        for(const RECT * rect = dst->dirtyRects;
-            rect < dst->dirtyRects + dst->nbDirtyRects; ++rect)
-          wgc_copyFrameTextureRectCtx(*this->on12Context,
-            (ID3D11Resource *)*dst->texture,
-            (ID3D11Resource *)*dst->bridgeB, rect);
-      WGC_TRACY_D3D11_ZONE_END(gpuZone);
-      LG_PROFILE_ZONE_END(zoneCopy2);
-    }
+    if (dst->fullCopy)
+      ID3D11DeviceContext4_CopyResource(*this->on12Context,
+        (ID3D11Resource *)*dst->texture, (ID3D11Resource *)*dst->bridgeB);
+    else
+      for(const RECT * rect = dst->dirtyRects;
+          rect < dst->dirtyRects + dst->nbDirtyRects; ++rect)
+        wgc_copyFrameTextureRectCtx(*this->on12Context,
+          (ID3D11Resource *)*dst->texture,
+          (ID3D11Resource *)*dst->bridgeB, rect);
     ID3D11On12Device_ReleaseWrappedResources(this->d11on12Device, acquired, 1);
   }
   else
@@ -3977,10 +3918,6 @@ static void wgc_copyFrameTexture(WGCInstance * this, WGCFrameInfo * dst,
       ID3D11On12Device_AcquireWrappedResources(this->d11on12Device, acquired, 1);
     }
 
-    LG_PROFILE_ZONE_BEGIN(zoneCopy, "wgc copy (single device)");
-    LG_PROFILE_ZONE_VALUE(zoneCopy, pixels);
-    WGCTracyD3D11Zone * gpuZone =
-      WGC_TRACY_D3D11_ZONE_BEGIN(this->tracyWgcCtx, "gpu wgc copy");
     if (dst->fullCopy)
       ID3D11DeviceContext4_CopyResource(*this->context,
         (ID3D11Resource *)*dst->texture, (ID3D11Resource *)src);
@@ -3989,8 +3926,6 @@ static void wgc_copyFrameTexture(WGCInstance * this, WGCFrameInfo * dst,
           rect < dst->dirtyRects + dst->nbDirtyRects; ++rect)
         wgc_copyFrameTextureRectCtx(*this->context,
           (ID3D11Resource *)*dst->texture, (ID3D11Resource *)src, rect);
-    WGC_TRACY_D3D11_ZONE_END(gpuZone);
-    LG_PROFILE_ZONE_END(zoneCopy);
 
     if (needsAcquire)
       ID3D11On12Device_ReleaseWrappedResources(this->d11on12Device, acquired, 1);
@@ -4233,13 +4168,6 @@ static bool wgc_copyFrameTextureD3D12(WGCInstance * this, WGCFrameInfo * dst)
   for(unsigned i = 0; i < activeQueues; ++i)
   {
     D12CommandGroup * cmd = &this->d3d12CopyCommands[i];
-    char gpuName[64];
-    snprintf(gpuName, sizeof(gpuName),
-      copyFull ? "gpu wgc full bridge->ivshmem q%u" :
-                 "gpu wgc dirty bridge->ivshmem q%u",
-      i);
-    WGCTracyD3D12Zone * gpuZone = WGC_TRACY_D3D12_ZONE_BEGIN_N(
-      this->tracyD3D12CopyCtx[i], *cmd->gfxList, gpuName, strlen(gpuName));
 
     if (needsEncode)
     {
@@ -4347,12 +4275,9 @@ static bool wgc_copyFrameTextureD3D12(WGCInstance * this, WGCFrameInfo * dst)
       ID3D12GraphicsCommandList_ResourceBarrier(*cmd->gfxList,
         ARRAY_LENGTH(barriers), barriers);
     }
-
-    WGC_TRACY_D3D12_ZONE_END(gpuZone);
   }
 
   bool executed = true;
-  LG_PROFILE_ZONE_BEGIN(zoneD3D12Submit, "wgc d3d12 copy submit");
   const uint64_t d3d12SubmitStartUs = microtime();
   for(unsigned i = 0; i < activeQueues; ++i)
   {
@@ -4361,7 +4286,6 @@ static bool wgc_copyFrameTextureD3D12(WGCInstance * this, WGCFrameInfo * dst)
     dst->d3d12CopyFenceValue[i] = this->d3d12CopyCommands[i].fenceValue;
   }
   const uint64_t d3d12SubmitUs = microtime() - d3d12SubmitStartUs;
-  LG_PROFILE_ZONE_END(zoneD3D12Submit);
   if (this->debugStats)
   {
     InterlockedExchangeAdd64(&this->d3d12CopySubmitTotalUs,
@@ -4380,11 +4304,6 @@ static bool wgc_copyFrameTextureD3D12(WGCInstance * this, WGCFrameInfo * dst)
   }
 
   dst->d3d12CopyQueueCount = activeQueues;
-  for(unsigned i = 0; i < activeQueues; ++i)
-  {
-    WGC_TRACY_D3D12_NEW_FRAME(this->tracyD3D12CopyCtx[i]);
-    WGC_TRACY_D3D12_COLLECT(this->tracyD3D12CopyCtx[i]);
-  }
   return true;
 }
 
@@ -4395,7 +4314,6 @@ static void wgc_waitFrameD3D12Copy(WGCInstance * this, WGCFrameInfo * frame)
   if (!count)
     return;
 
-  LG_PROFILE_ZONE_BEGIN(zoneD3D12Wait, "wgc d3d12 fence wait");
   const uint64_t fenceWaitStartUs = microtime();
   for(unsigned i = 0; i < count; ++i)
   {
@@ -4411,7 +4329,6 @@ static void wgc_waitFrameD3D12Copy(WGCInstance * this, WGCFrameInfo * frame)
     WaitForSingleObject(cmd->event, INFINITE);
   }
   const uint64_t fenceWaitUs = microtime() - fenceWaitStartUs;
-  LG_PROFILE_ZONE_END(zoneD3D12Wait);
 
   if (this->debugStats)
   {
@@ -4989,7 +4906,6 @@ static void wgc_updatePointer(WGCInstance * this, int x, int y)
     y = info.ptScreenPos.y;
   }
 
-  LG_PROFILE_ZONE_BEGIN(zonePointer, "wgc update pointer");
   CapturePointer pointer = {0};
   bool changed = false;
 
@@ -5026,7 +4942,6 @@ static void wgc_updatePointer(WGCInstance * this, int x, int y)
       const uint64_t intervalUs = 1000000ULL / this->cursorMaxHz;
       if (now - this->cursorLastPostUs < intervalUs)
       {
-        LG_PROFILE_ZONE_END(zonePointer);
         if (this->cursorLockCreated)
           LeaveCriticalSection(&this->cursorLock);
         return;
@@ -5065,7 +4980,6 @@ static void wgc_updatePointer(WGCInstance * this, int x, int y)
   this->lastCursorX       = x;
   this->lastCursorY       = y;
   this->lastCursor        = info.hCursor;
-  LG_PROFILE_ZONE_END(zonePointer);
   if (this->cursorLockCreated)
     LeaveCriticalSection(&this->cursorLock);
 }
@@ -5507,10 +5421,8 @@ bool wgc_fetchCpu(WGCInstance * this, unsigned frameBufferIndex,
   // needed. This also handles the GPU/CPU sync for the prior CopyResource
   // issued in wgc_processFrame.
   D3D11_MAPPED_SUBRESOURCE mapped;
-  LG_PROFILE_ZONE_BEGIN(zoneMap, "wgc map staging texture");
   HRESULT hr = ID3D11DeviceContext4_Map(*this->context,
     (ID3D11Resource *)*frame->texture, 0, D3D11_MAP_READ, 0, &mapped);
-  LG_PROFILE_ZONE_END(zoneMap);
   if (FAILED(hr))
   {
     DEBUG_WINERROR("Failed to map WGC staging texture", hr);

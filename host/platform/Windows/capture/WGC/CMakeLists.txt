@@ -6,13 +6,6 @@ add_library(capture_WGC STATIC
   backend/wgc.c
 )
 
-if(ENABLE_TRACY)
-  enable_language(CXX)
-  target_sources(capture_WGC PRIVATE
-    backend/wgc_profile_d3d11.cpp
-  )
-endif()
-
 target_link_libraries(capture_WGC
   lg_common
   capture_D12

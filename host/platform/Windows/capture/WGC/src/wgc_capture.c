@@ -27,7 +27,6 @@
 #include "common/rects.h"
 #include "common/KVMFR.h"
 #include "common/time.h"
-#include "common/profile.h"
 
 #include "backend/wgc.h"
 #include "d12.h"  // for D12 device helpers and shared D12 frame descriptors
@@ -1475,7 +1474,6 @@ static CaptureResult wgc_capture_waitFrame(unsigned frameBufferIndex,
 
   memset(&this->desc, 0, sizeof(this->desc));
   const uint64_t readbackStart = microtime();
-  LG_PROFILE_ZONE_BEGIN(zoneFetchCpu, "wgc cpu fetch/map");
 
   const bool gpuPublish =
     this->publishMode == WGC_CAPTURE_PUBLISH_IVSHMEM_DIRECT ||
@@ -1497,11 +1495,8 @@ static CaptureResult wgc_capture_waitFrame(unsigned frameBufferIndex,
   }
 
   if (!fetched)
-  {
-    LG_PROFILE_ZONE_END(zoneFetchCpu);
     return CAPTURE_RESULT_TIMEOUT;
-  }
-  LG_PROFILE_ZONE_END(zoneFetchCpu);
+
   const uint64_t readbackUs = microtime() - readbackStart;
   if (this->timings || this->debugStats)
   {
@@ -1712,7 +1707,6 @@ static CaptureResult wgc_capture_getFrame(unsigned frameBufferIndex,
 
   uint64_t copyPixels = 0;
   const uint64_t memcpyStart = microtime();
-  LG_PROFILE_ZONE_BEGIN(zoneMemcpy, "wgc ivshmem copy");
   if (fullCopy)
   {
     const void * src = this->mapped;
@@ -1720,7 +1714,6 @@ static CaptureResult wgc_capture_getFrame(unsigned frameBufferIndex,
     {
       if (!wgc_capture_encodeRGBA10PQ())
       {
-        LG_PROFILE_ZONE_END(zoneMemcpy);
         wgc_releaseCpu(this->wgc, this->desc.backendToken);
         this->frameMapped = false;
         this->mapped      = NULL;
@@ -1742,10 +1735,6 @@ static CaptureResult wgc_capture_getFrame(unsigned frameBufferIndex,
     if (this->timings || this->debugStats)
       this->copyRects += local.count;
   }
-  LG_PROFILE_ZONE_VALUE(zoneMemcpy, copyPixels);
-  LG_PROFILE_ZONE_END(zoneMemcpy);
-  LG_PROFILE_PLOT_I("WGC dirty rects", fullCopy ? 0 : local.count);
-  LG_PROFILE_PLOT_I("WGC copied kpix", copyPixels / 1000);
   const uint64_t memcpyUs = microtime() - memcpyStart;
   if (this->timings || this->debugStats)
   {

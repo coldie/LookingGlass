@@ -38,7 +38,6 @@
 #include "common/cpuinfo.h"
 #include "common/util.h"
 #include "common/array.h"
-#include "common/profile.h"
 
 #include <lgmp/host.h>
 
@@ -262,11 +261,7 @@ static bool sendFrame(CaptureResult result, bool * restart)
 
   // only wait if the result from the capture was OK
   if (result == CAPTURE_RESULT_OK)
-  {
-    LG_PROFILE_ZONE_BEGIN(zoneWaitFrame, "host waitFrame");
     result = app.iface->waitFrame(app.captureIndex, &frame, app.maxFrameSize);
-    LG_PROFILE_ZONE_END(zoneWaitFrame);
-  }
 
   switch(result)
   {
@@ -408,27 +403,20 @@ static bool sendFrame(CaptureResult result, bool * restart)
       microtime() - frame.backendFrameTimeUs);
 
   const uint64_t postStart = timing ? microtime() : 0;
-  LG_PROFILE_ZONE_BEGIN(zonePostFrame, "host lgmp post frame");
   if ((status = lgmpHostQueuePost(app.frameQueue, 0,
     app.frameMemory[app.captureIndex])) != LGMP_OK)
   {
-    LG_PROFILE_ZONE_END(zonePostFrame);
     DEBUG_ERROR("%s", lgmpStatusString(status));
     return true;
   }
-  LG_PROFILE_ZONE_END(zonePostFrame);
   if (timing)
     app.iface->recordTiming(CAPTURE_TIMING_LGMP_POST,
       microtime() - postStart);
 
-  LG_PROFILE_ZONE_BEGIN(zoneGetFrame, "host getFrame");
   app.iface->getFrame(
     app.captureIndex,
     app.frameBuffer[app.captureIndex],
     app.maxFrameSize);
-  LG_PROFILE_ZONE_END(zoneGetFrame);
-  LG_PROFILE_FRAME_DEFAULT();
-  LG_PROFILE_FRAME("consumer ready frame");
 
   app.readIndex = app.captureIndex;
   if (++app.captureIndex == LGMP_Q_FRAME_LEN)
@@ -439,7 +427,6 @@ static bool sendFrame(CaptureResult result, bool * restart)
 static int frameThread(void * opaque)
 {
   DEBUG_INFO("Frame thread started");
-  LG_PROFILE_THREAD("LG frame thread");
 #ifdef _WIN32
   boostFrameThreadPriority();
 #endif
@@ -879,8 +866,6 @@ fail_init:
 // this is called from the platform specific startup routine
 int app_main(int argc, char * argv[])
 {
-  LG_PROFILE_THREAD("LG host main");
-
   if (!installCrashHandler(os_getExecutable()))
     DEBUG_WARN("Failed to install the crash handler");
 

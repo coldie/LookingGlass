@@ -35,9 +35,6 @@ add_feature_info(ENABLE_ASAN ENABLE_ASAN "AddressSanitizer support.")
 option(ENABLE_UBSAN "Build with UndefinedBehaviorSanitizer" OFF)
 add_feature_info(ENABLE_UBSAN ENABLE_UBSAN "UndefinedBehaviorSanitizer support.")
 
-option(ENABLE_TRACY "Build with Tracy profiler instrumentation" OFF)
-add_feature_info(ENABLE_TRACY ENABLE_TRACY "Tracy profiler instrumentation.")
-
 add_compile_options(
   "-Wall"
   "-Werror"
@@ -63,21 +60,6 @@ endif()
 if(ENABLE_UBSAN)
   add_compile_options("-fsanitize=undefined")
   set(EXE_FLAGS "${EXE_FLAGS} -fsanitize=undefined")
-endif()
-
-if(ENABLE_TRACY)
-  enable_language(CXX)
-  set(TRACY_STATIC ON CACHE BOOL "" FORCE)
-  set(TRACY_ON_DEMAND ON CACHE BOOL "" FORCE)
-  add_subdirectory("${PROJECT_TOP}/repos/tracy" "${CMAKE_BINARY_DIR}/tracy")
-  target_compile_definitions(TracyClient PUBLIC TRACY_ENABLE TRACY_ON_DEMAND)
-  target_compile_options(TracyClient PRIVATE
-    -Wno-error
-    -Wno-unknown-pragmas
-    -Wno-sign-compare
-  )
-  add_definitions(-DENABLE_TRACY -DTRACY_ENABLE -DTRACY_ON_DEMAND)
-  include_directories(SYSTEM "${PROJECT_TOP}/repos/tracy/public")
 endif()
 
 add_custom_command(
@@ -129,19 +111,6 @@ target_link_libraries(looking-glass-host
   platform
   lgmp
 )
-
-if(ENABLE_TRACY)
-  target_link_libraries(looking-glass-host TracyClient)
-  if(WIN32)
-    target_link_libraries(looking-glass-host
-      -static
-      -static-libstdc++
-      -static-libgcc
-    )
-  endif()
-  target_compile_definitions(looking-glass-host PRIVATE ENABLE_TRACY)
-  set_target_properties(looking-glass-host PROPERTIES LINKER_LANGUAGE CXX)
-endif()
 
 if(WIN32)
   set_target_properties(looking-glass-host PROPERTIES LINK_FLAGS "-Wl,--gc-sections -Wl,--nxcompat")
