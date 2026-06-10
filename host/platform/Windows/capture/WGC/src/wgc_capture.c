@@ -1577,8 +1577,6 @@ static CaptureResult wgc_capture_waitFrame(unsigned frameBufferIndex,
   frame->hdr              = rgba16f || p010 || rgba10pq;
   frame->hdrPQ            = p010 || rgba10pq;
   frame->rotation         = CAPTURE_ROT_0;
-  frame->hasBackendFrameTime = this->desc.hasBackendFrameTime;
-  frame->backendFrameTimeUs  = this->desc.backendFrameTimeUs;
 
   // Publish the dirty rects as client render damage. The pixel transport may
   // have used a full-frame IVSHMEM copy; damage still tells the client what

@@ -396,22 +396,12 @@ static bool sendFrame(CaptureResult result, bool * restart)
   framebuffer_prepare(app.frameBuffer[app.captureIndex]);
 
   /* we post and then get the frame, this is intentional! */
-  const bool timing = app.iface->recordTiming && app.iface->isTimingEnabled &&
-    app.iface->isTimingEnabled();
-  if (frame.hasBackendFrameTime && app.iface->recordTiming)
-    app.iface->recordTiming(CAPTURE_TIMING_FRAME_TO_LGMP_POST,
-      microtime() - frame.backendFrameTimeUs);
-
-  const uint64_t postStart = timing ? microtime() : 0;
   if ((status = lgmpHostQueuePost(app.frameQueue, 0,
     app.frameMemory[app.captureIndex])) != LGMP_OK)
   {
     DEBUG_ERROR("%s", lgmpStatusString(status));
     return true;
   }
-  if (timing)
-    app.iface->recordTiming(CAPTURE_TIMING_LGMP_POST,
-      microtime() - postStart);
 
   app.iface->getFrame(
     app.captureIndex,
@@ -1134,12 +1124,6 @@ int app_main(int argc, char * argv[])
           bool restart = false;
           if (!sendFrame(result, &restart) && restart)
             setAppState(APP_STATE_TRANSITION_TO_IDLE);
-          if (result == CAPTURE_RESULT_OK &&
-              app.iface->recordTiming &&
-              app.iface->isTimingEnabled &&
-              app.iface->isTimingEnabled())
-            app.iface->recordTiming(CAPTURE_TIMING_LOOP_TOTAL,
-              microtime() - captureStartTime);
         }
         break;
       }

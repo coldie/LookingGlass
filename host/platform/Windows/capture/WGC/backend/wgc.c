@@ -53,35 +53,6 @@ typedef enum WGCTiledCopyMode
 }
 WGCTiledCopyMode;
 
-typedef enum WGCTimingStage
-{
-  D12_TIMING_WGC_CONTENT_SIZE,
-  D12_TIMING_WGC_SURFACE,
-  D12_TIMING_WGC_ACCESS,
-  D12_TIMING_WGC_TEXTURE,
-  D12_TIMING_WGC_ENSURE,
-  D12_TIMING_WGC_METADATA,
-  D12_TIMING_WGC_DAMAGE,
-  D12_TIMING_WGC_POINTER,
-  D12_TIMING_WGC_COPY,
-  D12_TIMING_WGC_SIGNAL,
-  D12_TIMING_WGC_WAIT,
-  D12_TIMING_WGC_TAKE_FRAME,
-  D12_TIMING_D12_SYNC
-}
-WGCTimingStage;
-
-static inline bool d12_timingEnabled(void)
-{
-  return false;
-}
-
-static inline void d12_timingRecord(WGCTimingStage stage, uint64_t value)
-{
-  (void)stage;
-  (void)value;
-}
-
 #define WIDL_using_Windows_Foundation
 #define WIDL_using_Windows_Foundation_Collections
 #define WIDL_using_Windows_Graphics
@@ -1554,13 +1525,9 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
   WGCFrameInfo * dst = NULL;
   comRef_scopePush(11);
 
-  const bool timings = d12_timingEnabled();
   const bool profile = this->debugStats;
-  uint64_t timingStart = timings ? microtime() : 0;
   SizeInt32 size;
   hr = IDirect3D11CaptureFrame_get_ContentSize(frame, &size);
-  if (timings)
-    d12_timingRecord(D12_TIMING_WGC_CONTENT_SIZE, microtime() - timingStart);
   if (FAILED(hr))
   {
     DEBUG_WINERROR("Failed to get WGC frame size", hr);
@@ -1615,35 +1582,26 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
 
   uint64_t profileStart = profile ? microtime() : 0;
 
-  timingStart = timings ? microtime() : 0;
   comRef_defineLocal(IDirect3DSurface, surface);
   hr = IDirect3D11CaptureFrame_get_Surface(frame, surface);
-  if (timings)
-    d12_timingRecord(D12_TIMING_WGC_SURFACE, microtime() - timingStart);
   if (FAILED(hr))
   {
     DEBUG_WINERROR("Failed to get WGC frame surface", hr);
     goto exit;
   }
 
-  timingStart = timings ? microtime() : 0;
   comRef_defineLocal(IDirect3DDxgiInterfaceAccess, access);
   hr = IDirect3DSurface_QueryInterface(
     *surface, &IID_IDirect3DDxgiInterfaceAccess, (void **)access);
-  if (timings)
-    d12_timingRecord(D12_TIMING_WGC_ACCESS, microtime() - timingStart);
   if (FAILED(hr))
   {
     DEBUG_WINERROR("Failed to query IDirect3DDxgiInterfaceAccess", hr);
     goto exit;
   }
 
-  timingStart = timings ? microtime() : 0;
   comRef_defineLocal(ID3D11Texture2D, src);
   hr = IDirect3DDxgiInterfaceAccess_GetInterface(
     *access, &IID_ID3D11Texture2D, (void **)src);
-  if (timings)
-    d12_timingRecord(D12_TIMING_WGC_TEXTURE, microtime() - timingStart);
   if (FAILED(hr))
   {
     DEBUG_WINERROR("Failed to get WGC D3D11 texture", hr);
@@ -1700,17 +1658,13 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
       wgc_waitFrameD3D12Copy(this, dst);
 
     profileStart = profile ? microtime() : 0;
-    timingStart = timings ? microtime() : 0;
     if (!wgc_ensureFrame(this, dst, *src))
       goto exit;
     dst->callbackTimeUs = callbackTimeUs;
-    if (timings)
-      d12_timingRecord(D12_TIMING_WGC_ENSURE, microtime() - timingStart);
     if (profile)
       wgc_recordProfileStage(this, WGC_PROFILE_ENSURE,
         microtime() - profileStart);
 
-    timingStart = timings ? microtime() : 0;
     dst->hasSystemRelativeTime = false;
     dst->systemRelativeTime    = 0;
     TimeSpan systemRelativeTime;
@@ -1721,8 +1675,6 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
       dst->hasSystemRelativeTime = true;
       dst->systemRelativeTime    = systemRelativeTime.Duration;
     }
-    if (timings)
-      d12_timingRecord(D12_TIMING_WGC_METADATA, microtime() - timingStart);
 
     if (this->cursorMode == WGC_CURSOR_MODE_SEPARATE &&
         !this->mouseHookCreated)
@@ -1734,7 +1686,6 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
     }
 
     profileStart = profile ? microtime() : 0;
-    timingStart = timings ? microtime() : 0;
     wgc_updateDamage(this, dst, frame);
     wgc_extendDamageWithPrevious(this, dst);
     const bool forceFullCopyAfterGap =
@@ -1756,8 +1707,6 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
       dst->nbDirtyRects == 0 || forceFullCopyAfterGap;
     if (keepGapDamage)
       dst->fullCopy = false;
-    if (timings)
-      d12_timingRecord(D12_TIMING_WGC_DAMAGE, microtime() - timingStart);
     if (profile)
       wgc_recordProfileStage(this, WGC_PROFILE_DAMAGE,
         microtime() - profileStart);
@@ -1771,7 +1720,6 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
         dst->nbDirtyRects * sizeof(*dst->dirtyRects));
 
     profileStart = profile ? microtime() : 0;
-    timingStart = timings ? microtime() : 0;
     if (this->cursorMode == WGC_CURSOR_MODE_SEPARATE)
     {
       const LONG64 pending = InterlockedExchange64(
@@ -1780,33 +1728,25 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
       wgc_unpackCursorPos(pending, &x, &y);
       wgc_updatePointer(this, x, y);
     }
-    if (timings)
-      d12_timingRecord(D12_TIMING_WGC_POINTER, microtime() - timingStart);
     if (profile)
       wgc_recordProfileStage(this, WGC_PROFILE_POINTER,
         microtime() - profileStart);
 
     profileStart = profile ? microtime() : 0;
-    timingStart = timings ? microtime() : 0;
     dst->copyFailed = false;
     wgc_copyFrameTexture(this, dst, *src, true);
     if (dst->copyFailed)
       goto exit;
-    if (timings)
-      d12_timingRecord(D12_TIMING_WGC_COPY, microtime() - timingStart);
     if (profile)
       wgc_recordProfileStage(this, WGC_PROFILE_PUBLISH_COPY,
         microtime() - profileStart);
 
     profileStart = profile ? microtime() : 0;
-    timingStart = timings ? microtime() : 0;
     // Two-device path: bridge-A copy and fence Signal are on this->context;
     // wrap copy and Release are on this->on12Context. Flush both.
     ID3D11DeviceContext4_Flush(*this->context);
     if (this->twoDeviceBridge)
       ID3D11DeviceContext4_Flush(*this->on12Context);
-    if (timings)
-      d12_timingRecord(D12_TIMING_WGC_SIGNAL, microtime() - timingStart);
     if (profile)
       wgc_recordProfileStage(this, WGC_PROFILE_FLUSH,
         microtime() - profileStart);
@@ -1823,20 +1763,16 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
   }
 
   profileStart = profile ? microtime() : 0;
-  timingStart = timings ? microtime() : 0;
   accum = &this->frames[0];
   if (!wgc_ensureFrame(this, accum, *src))
     goto exit;
   if (!wgc_ensureAllFrames(this, *src))
     goto exit;
   accum->callbackTimeUs = callbackTimeUs;
-  if (timings)
-    d12_timingRecord(D12_TIMING_WGC_ENSURE, microtime() - timingStart);
   if (profile)
     wgc_recordProfileStage(this, WGC_PROFILE_ENSURE,
       microtime() - profileStart);
 
-  timingStart = timings ? microtime() : 0;
   accum->hasSystemRelativeTime = false;
   accum->systemRelativeTime    = 0;
   TimeSpan systemRelativeTime;
@@ -1848,9 +1784,6 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
     accum->systemRelativeTime    = systemRelativeTime.Duration;
   }
 
-  if (timings)
-    d12_timingRecord(D12_TIMING_WGC_METADATA, microtime() - timingStart);
-
   if (this->cursorMode == WGC_CURSOR_MODE_SEPARATE &&
       !this->mouseHookCreated)
   {
@@ -1861,7 +1794,6 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
   }
 
   profileStart = profile ? microtime() : 0;
-  timingStart = timings ? microtime() : 0;
   wgc_updateDamage(this, accum, frame);
   wgc_extendDamageWithPrevious(this, accum);
   const bool forceFullCopyAfterGap =
@@ -1881,17 +1813,12 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
     accum->nbDirtyRects = 0;
   accum->fullCopy = !this->base.trackDamage || !accum->copiedOnce ||
     accum->nbDirtyRects == 0 || forceFullCopyAfterGap;
-  if (timings)
-    d12_timingRecord(D12_TIMING_WGC_DAMAGE, microtime() - timingStart);
   if (profile)
     wgc_recordProfileStage(this, WGC_PROFILE_DAMAGE,
       microtime() - profileStart);
 
   profileStart = profile ? microtime() : 0;
-  timingStart = timings ? microtime() : 0;
   wgc_copyFrameTexture(this, accum, *src, false);
-  if (timings)
-    d12_timingRecord(D12_TIMING_WGC_COPY, microtime() - timingStart);
   if (profile)
     wgc_recordProfileStage(this, WGC_PROFILE_ACCUM_COPY,
       microtime() - profileStart);
@@ -1902,7 +1829,6 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
   wgc_accumulateDamage(this, accum);
 
   profileStart = profile ? microtime() : 0;
-  timingStart = timings ? microtime() : 0;
   if (this->cursorMode == WGC_CURSOR_MODE_SEPARATE)
   {
     const LONG64 pending = InterlockedExchange64(
@@ -1911,8 +1837,6 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
     wgc_unpackCursorPos(pending, &x, &y);
     wgc_updatePointer(this, x, y);
   }
-  if (timings)
-    d12_timingRecord(D12_TIMING_WGC_POINTER, microtime() - timingStart);
   if (profile)
     wgc_recordProfileStage(this, WGC_PROFILE_POINTER,
       microtime() - profileStart);
@@ -1973,19 +1897,15 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
       dst->nbDirtyRects * sizeof(*dst->dirtyRects));
 
   profileStart = profile ? microtime() : 0;
-  timingStart = timings ? microtime() : 0;
   dst->copyFailed = false;
   wgc_copyFrameTexture(this, dst, *accum->texture, true);
   if (dst->copyFailed)
     goto exit;
-  if (timings)
-    d12_timingRecord(D12_TIMING_WGC_COPY, microtime() - timingStart);
   if (profile)
     wgc_recordProfileStage(this, WGC_PROFILE_PUBLISH_COPY,
       microtime() - profileStart);
 
   profileStart = profile ? microtime() : 0;
-  timingStart = timings ? microtime() : 0;
   if (this->publishMode == WGC_PUBLISH_D12_SHARE)
   {
     // D12 consumer waits on this fence before issuing its copy queue work.
@@ -1995,8 +1915,6 @@ static CaptureResult wgc_processFrame(WGCInstance * this,
   // CPU consumer relies on D3D11 Map() blocking for outstanding GPU work; we
   // still Flush to make sure the copy gets to the driver promptly.
   ID3D11DeviceContext4_Flush(*this->context);
-  if (timings)
-    d12_timingRecord(D12_TIMING_WGC_SIGNAL, microtime() - timingStart);
   if (profile)
     wgc_recordProfileStage(this, WGC_PROFILE_FLUSH,
       microtime() - profileStart);
@@ -2028,7 +1946,6 @@ static CaptureResult wgc_capture(D12Backend * instance,
   IDirect3D11CaptureFrame * frame = NULL;
   comRef_scopePush(8);
 
-  const bool timings = d12_timingEnabled();
   const bool callbackProcessed = this->asyncCapture &&
     !wgc_isIvshmemPublishMode(this->publishMode);
 
@@ -2040,11 +1957,8 @@ static CaptureResult wgc_capture(D12Backend * instance,
     goto exit;
   }
 
-  uint64_t timingStart = timings ? microtime() : 0;
   const DWORD wait = WaitForSingleObject(this->frameEvent,
     this->pollFramePool ? (DWORD)this->pollFramePoolMs : 1000);
-  if (timings)
-    d12_timingRecord(D12_TIMING_WGC_WAIT, microtime() - timingStart);
   if (wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT)
   {
     DEBUG_WINERROR("Waiting for a WGC frame failed, reinitializing",
@@ -2072,11 +1986,8 @@ static CaptureResult wgc_capture(D12Backend * instance,
     goto exit;
   }
 
-  timingStart = timings ? microtime() : 0;
   frame = InterlockedExchangePointer(
     (PVOID volatile *)&this->pendingFrame, NULL);
-  if (timings)
-    d12_timingRecord(D12_TIMING_WGC_TAKE_FRAME, microtime() - timingStart);
 
   // IVSHMEM diagnostic: if the callback hasn't given us a pending frame,
   // optionally poll the frame pool directly. This tells us whether
@@ -2322,12 +2233,8 @@ static CaptureResult wgc_sync(D12Backend * instance,
   if (!frame)
     return CAPTURE_RESULT_TIMEOUT;
 
-  const bool timings = d12_timingEnabled();
-  const uint64_t timingStart = timings ? microtime() : 0;
   if (ID3D11Fence_GetCompletedValue(*frame->fence) < frame->fenceValue)
     ID3D12CommandQueue_Wait(commandQueue, *frame->d12Fence, frame->fenceValue);
-  if (timings)
-    d12_timingRecord(D12_TIMING_D12_SYNC, microtime() - timingStart);
 
   return CAPTURE_RESULT_OK;
 }
