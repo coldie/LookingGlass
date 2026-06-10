@@ -394,6 +394,7 @@ interface IGraphicsCaptureSession6
 #define WGC_STALL_REINIT_US (3ULL * 1000ULL * 1000ULL)
 #define WGC_STALL_BACKOFF_INITIAL_US (2ULL * 1000ULL * 1000ULL)
 #define WGC_STALL_BACKOFF_MAX_US (30ULL * 1000ULL * 1000ULL)
+#define WGC_STALL_DWM_IDLE_US (1ULL * 1000ULL * 1000ULL)
 
 #define WGC_FRAME_FREE      0
 #define WGC_FRAME_WRITING   1
@@ -636,6 +637,10 @@ struct WGCInstance
   LONG emptyPollStartEvents;
   LONG emptyPollStartPulled;
   LONG emptyPollStartConsumed;
+  uint64_t emptyPollStartDwmFrames;
+  uint64_t emptyPollLastDwmFrames;
+  uint64_t emptyPollLastDwmChangeUs;
+  uint64_t emptyPollDwmAdvanceUs;
   bool loggedFirstFrame;
   WGCCursorMode cursorMode;
   int maxFPS;
@@ -678,6 +683,7 @@ struct WGCInstance
 static WGCInstance * volatile wgcCursorInstance;
 static volatile uint64_t wgcNextStarvationReinitUs = 0;
 static volatile uint64_t wgcStarvationBackoffUs = 0;
+static volatile uint64_t wgcLastStarvationReinitUs = 0;
 
 static HRESULT STDMETHODCALLTYPE wgc_eventQueryInterface(
   ITypedEventHandler_Direct3D11CaptureFramePool_IInspectable * iface,
@@ -742,6 +748,7 @@ static void wgc_maybeLogDebugStats(WGCInstance * this);
 static void wgc_maybeLogHDRStats(WGCInstance * this, ID3D11Texture2D * src);
 static void wgc_maybeDwmFlushOnGap(WGCInstance * this);
 static bool wgc_shouldReinitAfterStarvation(WGCInstance * this, uint64_t now);
+static uint64_t wgc_dwmComposedFrames(void);
 static void wgc_recordProfileStage(WGCInstance * this, WGCProfileStage stage,
   uint64_t elapsedUs);
 static void wgc_interlockedMax64(volatile LONG64 * target, LONG64 value);
@@ -2174,6 +2181,19 @@ static CaptureResult wgc_capture(D12Backend * instance,
   this->emptyPollStartEvents = 0;
   this->emptyPollStartPulled = 0;
   this->emptyPollStartConsumed = 0;
+  this->emptyPollStartDwmFrames = 0;
+  this->emptyPollLastDwmFrames = 0;
+  this->emptyPollLastDwmChangeUs = 0;
+  this->emptyPollDwmAdvanceUs = 0;
+  // a fresh session usually delivers an initial frame before starving again,
+  // so only forgive the backoff after sustained delivery since the last
+  // starvation reinit
+  if (wgcStarvationBackoffUs &&
+      microtime() - wgcLastStarvationReinitUs > 2 * WGC_STALL_BACKOFF_MAX_US)
+  {
+    wgcNextStarvationReinitUs = 0;
+    wgcStarvationBackoffUs = 0;
+  }
   if (this->handler && !this->asyncCapture)
     InterlockedIncrement(&this->handler->framesConsumed);
 
@@ -2205,12 +2225,51 @@ static bool wgc_shouldReinitAfterStarvation(WGCInstance * this, uint64_t now)
     this->emptyPollStartEvents = events;
     this->emptyPollStartPulled = pulled;
     this->emptyPollStartConsumed = consumed;
+    this->emptyPollStartDwmFrames = wgc_dwmComposedFrames();
+    this->emptyPollLastDwmFrames = this->emptyPollStartDwmFrames;
+    this->emptyPollLastDwmChangeUs = now;
+    this->emptyPollDwmAdvanceUs = 0;
     return false;
   }
 
   const uint64_t stalledUs = now - this->emptyPollStartUs;
   if (stalledUs < WGC_STALL_REINIT_US)
     return false;
+
+  // WGC legitimately delivers nothing while the desktop is static; only
+  // treat the silence as starvation if DWM composed new frames that WGC
+  // failed to deliver. A failed DWM query (sample of 0) means progress is
+  // unknown, so fall back to time-only detection instead of disabling the
+  // watchdog
+  const uint64_t dwmFrames = wgc_dwmComposedFrames();
+  if (dwmFrames && !this->emptyPollStartDwmFrames)
+    this->emptyPollStartDwmFrames = dwmFrames;
+  if (dwmFrames && this->emptyPollStartDwmFrames)
+  {
+    if (dwmFrames == this->emptyPollStartDwmFrames)
+      return false;
+
+    if (dwmFrames != this->emptyPollLastDwmFrames)
+    {
+      this->emptyPollLastDwmFrames = dwmFrames;
+      this->emptyPollLastDwmChangeUs = now;
+    }
+    else if (now - this->emptyPollLastDwmChangeUs >= WGC_STALL_DWM_IDLE_US)
+    {
+      // an isolated composition (cursor, another monitor) followed by idle
+      // is not starvation; re-arm the gate against the current count
+      this->emptyPollStartDwmFrames = dwmFrames;
+      this->emptyPollDwmAdvanceUs = 0;
+      return false;
+    }
+
+    // content can resume after a long idle gap; require a full stall window
+    // of sustained DWM composition before declaring the session dead
+    if (!this->emptyPollDwmAdvanceUs)
+      this->emptyPollDwmAdvanceUs = now;
+    if (now - this->emptyPollDwmAdvanceUs < WGC_STALL_REINIT_US)
+      return false;
+  }
 
   if (now < wgcNextStarvationReinitUs)
   {
@@ -2229,14 +2288,26 @@ static bool wgc_shouldReinitAfterStarvation(WGCInstance * this, uint64_t now)
     wgcStarvationBackoffUs = min(
       wgcStarvationBackoffUs * 2, WGC_STALL_BACKOFF_MAX_US);
   wgcNextStarvationReinitUs = now + wgcStarvationBackoffUs;
+  wgcLastStarvationReinitUs = now;
 
+  const uint64_t dwmAdvanced = dwmFrames && this->emptyPollStartDwmFrames ?
+    dwmFrames - this->emptyPollStartDwmFrames : 0;
   DEBUG_WARN("WGC capture starved for %.2fs with no callback/queue progress "
-    "(events:%ld pulled:%ld consumed:%ld), reinitializing; next starvation "
-    "reinit backoff %.2fs",
+    "while DWM composed %llu frames (events:%ld pulled:%ld consumed:%ld), "
+    "reinitializing; next starvation reinit backoff %.2fs",
     (double)stalledUs / 1000000.0,
+    (unsigned long long)dwmAdvanced,
     events, pulled, consumed,
     (double)wgcStarvationBackoffUs / 1000000.0);
   return true;
+}
+
+static uint64_t wgc_dwmComposedFrames(void)
+{
+  DWM_TIMING_INFO timing = { .cbSize = sizeof(timing) };
+  if (FAILED(DwmGetCompositionTimingInfo(NULL, &timing)))
+    return 0;
+  return timing.cFrame;
 }
 
 static void wgc_maybeDwmFlushOnGap(WGCInstance * this)
@@ -3222,11 +3293,11 @@ static bool wgc_ensureNV12Shader(WGCInstance * this)
     "float3 prepareRgb(float3 rgb)\n"
     "{\n"
     "#if WGC_HDR_PQ_PRESERVE || WGC_HDR_RGB10PQ\n"
-    "  float3 linear709 = max(rgb, float3(0.0, 0.0, 0.0));\n"
     "  float3 linear2020;\n"
-    "  linear2020.r = dot(linear709, float3(0.6274039, 0.3292829, 0.0433131));\n"
-    "  linear2020.g = dot(linear709, float3(0.0690973, 0.9195404, 0.0113622));\n"
-    "  linear2020.b = dot(linear709, float3(0.0163914, 0.0880133, 0.8955953));\n"
+    "  linear2020.r = dot(rgb, float3(0.6274039, 0.3292829, 0.0433131));\n"
+    "  linear2020.g = dot(rgb, float3(0.0690973, 0.9195404, 0.0113622));\n"
+    "  linear2020.b = dot(rgb, float3(0.0163914, 0.0880133, 0.8955953));\n"
+    "  linear2020 = max(linear2020, float3(0.0, 0.0, 0.0));\n"
     "  float sdrWhiteNits = 80.0;\n"
     "  float m1 = 2610.0 / 16384.0;\n"
     "  float m2 = 2523.0 / 32.0;\n"

@@ -130,6 +130,8 @@ struct WGCCapture
   unsigned                 stride;    // pixels per row
   unsigned                 dataHeight;
   unsigned                 formatVer;
+  WGCCapturePublishMode    publishedMode;   // mode/format as last published
+  WGCCapturePublishFormat  publishedFormat;
   uint8_t                * encodeBuffer;
   size_t                   encodeBufferSize;
 
@@ -478,18 +480,18 @@ static float wgc_capture_pqOETF(float nits)
 
 static uint32_t wgc_capture_packRGBA10PQ(float r709, float g709, float b709)
 {
-  const float r2020 =
-    max(0.0f, r709) * 0.6274039f +
-    max(0.0f, g709) * 0.3292829f +
-    max(0.0f, b709) * 0.0433131f;
-  const float g2020 =
-    max(0.0f, r709) * 0.0690973f +
-    max(0.0f, g709) * 0.9195404f +
-    max(0.0f, b709) * 0.0113622f;
-  const float b2020 =
-    max(0.0f, r709) * 0.0163914f +
-    max(0.0f, g709) * 0.0880133f +
-    max(0.0f, b709) * 0.8955953f;
+  const float r2020 = max(0.0f,
+    r709 * 0.6274039f +
+    g709 * 0.3292829f +
+    b709 * 0.0433131f);
+  const float g2020 = max(0.0f,
+    r709 * 0.0690973f +
+    g709 * 0.9195404f +
+    b709 * 0.0113622f);
+  const float b2020 = max(0.0f,
+    r709 * 0.0163914f +
+    g709 * 0.0880133f +
+    b709 * 0.8955953f);
 
   const uint32_t r = (uint32_t)(wgc_capture_pqOETF(r2020 * 80.0f) * 1023.0f + 0.5f);
   const uint32_t g = (uint32_t)(wgc_capture_pqOETF(g2020 * 80.0f) * 1023.0f + 0.5f);
@@ -1362,12 +1364,6 @@ static bool wgc_capture_init(void * ivshmemBase, unsigned * alignSize)
     return false;
   }
 
-  // A Windows display topology change can tear down and rebuild the capture
-  // transport while returning to the same dimensions and pitch. Force the
-  // client to rebuild its texture/import state after every successful WGC
-  // init instead of relying only on width/height/pitch deltas.
-  ++this->formatVer;
-
   return true;
 }
 
@@ -1385,12 +1381,9 @@ static bool wgc_capture_deinit(void)
   }
   memset(this->ivshmemSlotRegistered, 0,
     sizeof(this->ivshmemSlotRegistered));
-  this->width       = 0;
-  this->height      = 0;
-  this->pitch       = 0;
-  this->mappedPitch = 0;
-  this->stride      = 0;
-  this->dataHeight  = 0;
+  // width/height/pitch and the published mode/format survive deinit so the
+  // formatVer delta check in waitFrame only fires on a real format change
+  // across a reinit, keeping reinits invisible to the client
   this->mapped      = NULL;
   this->frameMapped = false;
 
@@ -1551,19 +1544,23 @@ static CaptureResult wgc_capture_waitFrame(unsigned frameBufferIndex,
 
   const unsigned dataHeight = packedYuv ? height + (height + 1) / 2 : height;
 
-  // bump formatVer if dimensions changed
+  // bump formatVer if the published format changed
   if (this->width != width || this->height != height ||
-      this->pitch != outputPitch || this->mappedPitch != pitch)
+      this->pitch != outputPitch || this->mappedPitch != pitch ||
+      this->publishedMode   != this->publishMode ||
+      this->publishedFormat != this->publishFormat)
     ++this->formatVer;
 
-  this->width       = width;
-  this->height      = height;
-  this->mappedPitch = pitch;
-  this->pitch       = outputPitch;
-  this->stride      = outputPitch / bpp;
-  this->dataHeight  = dataHeight;
-  this->mapped      = map;
-  this->frameMapped = true;
+  this->width           = width;
+  this->height          = height;
+  this->mappedPitch     = pitch;
+  this->pitch           = outputPitch;
+  this->stride          = outputPitch / bpp;
+  this->dataHeight      = dataHeight;
+  this->mapped          = map;
+  this->frameMapped     = true;
+  this->publishedMode   = this->publishMode;
+  this->publishedFormat = this->publishFormat;
 
   const unsigned maxRows = (unsigned)(maxFrameSize / outputPitch);
   const unsigned outRows = (maxRows < dataHeight) ? maxRows : dataHeight;
@@ -1826,6 +1823,8 @@ struct CaptureInterface Capture_WGC =
 {
   .shortName       = "WGC",
   .asyncCapture    = false,
+  // GPU publish modes write directly into the IVSHMEM frame slot in capture()
+  .writesFrameOnCapture = true,
   .getName         = wgc_capture_getName,
   .initOptions     = wgc_capture_initOptions,
   .create          = wgc_capture_create,

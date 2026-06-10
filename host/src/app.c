@@ -239,11 +239,8 @@ static bool lgmpTimer(void * opaque)
   return true;
 }
 
-static bool sendFrame(CaptureResult result, bool * restart)
+static bool waitForFrameQueueRoom(void)
 {
-  CaptureFrame frame = { 0 };
-  bool repeatFrame = false;
-
   //wait until there is room in the queue
   while(app.state == APP_STATE_RUNNING &&
       lgmpHostQueuePending(app.frameQueue) == LGMP_Q_FRAME_LEN)
@@ -252,7 +249,15 @@ static bool sendFrame(CaptureResult result, bool * restart)
     continue;
   }
 
-  if (app.state != APP_STATE_RUNNING)
+  return app.state == APP_STATE_RUNNING;
+}
+
+static bool sendFrame(CaptureResult result, bool * restart)
+{
+  CaptureFrame frame = { 0 };
+  bool repeatFrame = false;
+
+  if (!waitForFrameQueueRoom())
     return false;
 
   // only wait if the result from the capture was OK
@@ -1096,6 +1101,11 @@ int app_main(int argc, char * argv[])
           if (us > 1000)
             nsleep(us * 1000);
         }
+
+        // if the interface writes frame data during capture we must ensure
+        // the client is no longer reading the buffer before we start
+        if (app.iface->writesFrameOnCapture && !waitForFrameQueueRoom())
+          break;
 
         const uint64_t captureStartTime = microtime();
 

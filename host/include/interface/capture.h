@@ -126,6 +126,10 @@ typedef struct CaptureInterface
   const bool   asyncCapture;
   const bool   deprecated;
 
+  /* true if capture() writes pixel data into the FrameBuffer, requiring the
+   * frame queue to have room before capture() is called */
+  const bool   writesFrameOnCapture;
+
   const char * (*getName        )(void);
   void         (*initOptions    )(void);
 
