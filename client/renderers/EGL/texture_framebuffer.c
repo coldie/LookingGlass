@@ -217,13 +217,16 @@ static bool egl_texFBUpdate(EGL_Texture * texture, const EGL_TexUpdate * update)
         texture->format.pitch
       );
 
-      if (damage->count > KVMFR_MAX_DAMAGE_RECTS)
+      /* append to any damage still pending upload (the process call may
+       * have deferred the upload while a prior sync was in flight) */
+      if (upload->count < 0 ||
+          upload->count + damage->count > KVMFR_MAX_DAMAGE_RECTS)
         upload->count = -1;
       else
       {
-        memcpy(upload->rects, scaledDamageRects,
+        memcpy(upload->rects + upload->count, scaledDamageRects,
           damage->count * sizeof(FrameDamageRect));
-        upload->count = damage->count;
+        upload->count += damage->count;
       }
     }
     else
@@ -239,13 +242,16 @@ static bool egl_texFBUpdate(EGL_Texture * texture, const EGL_TexUpdate * update)
         texture->format.pitch
       );
 
-      if (damage->count > KVMFR_MAX_DAMAGE_RECTS)
+      /* append to any damage still pending upload (the process call may
+       * have deferred the upload while a prior sync was in flight) */
+      if (upload->count < 0 ||
+          upload->count + damage->count > KVMFR_MAX_DAMAGE_RECTS)
         upload->count = -1;
       else
       {
-        memcpy(upload->rects, damage->rects,
+        memcpy(upload->rects + upload->count, damage->rects,
           damage->count * sizeof(FrameDamageRect));
-        upload->count = damage->count;
+        upload->count += damage->count;
       }
     }
   }

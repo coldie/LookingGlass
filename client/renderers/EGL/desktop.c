@@ -572,12 +572,6 @@ bool egl_desktopUpdate(EGL_Desktop * desktop, const FrameBuffer * frame, int dma
       return false;
   }
 
-  if (yuvFrame)
-  {
-    damageRects = NULL;
-    damageRectsCount = 0;
-  }
-
   if (likely(egl_textureUpdateFromFrame(desktop->texture, frame,
         damageRects, damageRectsCount)))
   {

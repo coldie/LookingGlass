@@ -1151,19 +1151,8 @@ static CaptureResult wgc_capture_waitFrame(unsigned frameBufferIndex,
   // it needs to redraw.
   FrameDamageRect merged[KVMFR_MAX_DAMAGE_RECTS];
   int mergedCount = 0;
-  if (packedYuv)
-  {
-    // Packed YUV is encoded from BGRA/RGBA16F into a subsampled transport. Until damage is
-    // expanded for chroma blocks and overlay edge cases, present the whole
-    // frame to avoid stale output artifacts on alt-tab/compositor changes.
-    merged[0].x      = 0;
-    merged[0].y      = 0;
-    merged[0].width  = width;
-    merged[0].height = height;
-    mergedCount = 1;
-  }
-  else for (unsigned i = 0; i < this->desc.nbDirtyRects &&
-            mergedCount < KVMFR_MAX_DAMAGE_RECTS; ++i)
+  for (unsigned i = 0; i < this->desc.nbDirtyRects &&
+       mergedCount < KVMFR_MAX_DAMAGE_RECTS; ++i)
   {
     const RECT * r = &this->desc.dirtyRects[i];
     merged[mergedCount].x      = r->left;
@@ -1211,7 +1200,8 @@ static CaptureResult wgc_capture_getFrame(unsigned frameBufferIndex,
       FrameDamage * d = &this->frameDamage[i];
       if (i == frameBufferIndex)
         d->count = 0;
-      else if (this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_NV12)
+      else if (this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_NV12 ||
+               this->publishFormat == WGC_CAPTURE_PUBLISH_FORMAT_P010)
         d->count = -1;
       else if (this->desc.nbDirtyRects == 0 ||
         (d->count >= 0 &&
