@@ -27,7 +27,6 @@
 #include "common/windebug.h"
 #include "common/option.h"
 #include "common/rects.h"
-#include "common/time.h"
 #include "common/vector.h"
 #include "common/display.h"
 #include "com_ref.h"
@@ -40,10 +39,6 @@
 #include <dxgi1_3.h>
 #include <dxgi1_6.h>
 #include <d3dcommon.h>
-#include <stdlib.h>
-#include <string.h>
-
-#define D12_STATS_SAMPLE_MAX 512
 
 // definitions
 struct D12Interface
@@ -87,39 +82,6 @@ struct D12Interface
   // options
   bool debug;
   bool trackDamage;
-  bool debugStats;
-
-  // debug stats state
-  uint64_t debugStatsLastLog;
-  uint64_t debugStatsLastFrameUs;
-  uint64_t dsFrames;
-  uint64_t dsAcquired;
-  uint64_t dsTimeouts;
-  uint64_t dsErrors;
-  uint64_t dsPublishes;
-  uint64_t dsPublishDirty;
-  uint64_t dsPublishKpix;
-  uint64_t dsFrameGapCount;
-  uint64_t dsFrameGapTotalUs;
-  uint64_t dsFrameGapMaxUs;
-  uint64_t dsAcquireCount;
-  uint64_t dsAcquireTotalUs;
-  uint64_t dsAcquireMaxUs;
-  uint64_t dsAcquireSamples[D12_STATS_SAMPLE_MAX];
-  unsigned dsAcquireSampleCount;
-  bool     dsAcquireSampleOverflow;
-  uint64_t dsCopyCount;
-  uint64_t dsCopyTotalUs;
-  uint64_t dsCopyMaxUs;
-  uint64_t dsCopySamples[D12_STATS_SAMPLE_MAX];
-  unsigned dsCopySampleCount;
-  bool     dsCopySampleOverflow;
-  uint64_t dsPublishCount;
-  uint64_t dsPublishTotalUs;
-  uint64_t dsPublishMaxUs;
-  uint64_t dsPublishSamples[D12_STATS_SAMPLE_MAX];
-  unsigned dsPublishSampleCount;
-  bool     dsPublishSampleOverflow;
 
   unsigned frameBufferCount;
   // must be last
@@ -209,13 +171,6 @@ static void d12_initOptions(void)
       .type           = OPTION_TYPE_BOOL,
       .value.x_bool   = false
     },
-    {
-      .module         = "d12",
-      .name           = "debugStats",
-      .description    = "Log D12 capture stats once per second",
-      .type           = OPTION_TYPE_BOOL,
-      .value.x_bool   = false
-    },
     {0}
   };
 
@@ -241,11 +196,10 @@ static bool d12_create(
   this->debug        = option_get_bool("d12", "debug"       );
   this->trackDamage  = option_get_bool("d12", "trackDamage" );
   this->indirectCopy = option_get_bool("d12", "indirectCopy");
-  this->debugStats   = option_get_bool("d12", "debugStats"  );
 
   DEBUG_INFO(
-    "debug:%d trackDamage:%d indirectCopy:%d debugStats:%d",
-    this->debug, this->trackDamage, this->indirectCopy, this->debugStats);
+    "debug:%d trackDamage:%d indirectCopy:%d",
+    this->debug, this->trackDamage, this->indirectCopy);
 
   this->d3d12 = LoadLibrary("d3d12.dll");
   if (!this->d3d12)
@@ -567,175 +521,11 @@ static void d12_free(void)
   this = NULL;
 }
 
-static int d12_compareUint64(const void * a, const void * b)
-{
-  const uint64_t av = *(const uint64_t *)a;
-  const uint64_t bv = *(const uint64_t *)b;
-  return (av > bv) - (av < bv);
-}
-
-static uint64_t d12_percentile(uint64_t * values, unsigned count,
-  unsigned pct)
-{
-  if (!count)
-    return 0;
-  qsort(values, count, sizeof(values[0]), d12_compareUint64);
-  unsigned idx = (unsigned)(((uint64_t)pct * (uint64_t)(count - 1) + 99) / 100);
-  if (idx >= count)
-    idx = count - 1;
-  return values[idx];
-}
-
-static void d12_recordStat(uint64_t * count, uint64_t * total, uint64_t * maxv,
-  uint64_t * samples, unsigned * sampleCount, bool * sampleOverflow,
-  uint64_t elapsedUs)
-{
-  ++*count;
-  *total += elapsedUs;
-  if (elapsedUs > *maxv)
-    *maxv = elapsedUs;
-  if (*sampleCount < D12_STATS_SAMPLE_MAX)
-    samples[(*sampleCount)++] = elapsedUs;
-  else
-    *sampleOverflow = true;
-}
-
-static void d12_maybeLogDebugStats(void)
-{
-  if (!this || !this->debugStats)
-    return;
-
-  const uint64_t now = microtime();
-  if (this->debugStatsLastLog == 0)
-  {
-    this->debugStatsLastLog = now;
-    return;
-  }
-  if (now - this->debugStatsLastLog < 1000000)
-    return;
-  this->debugStatsLastLog = now;
-
-#define D12_AVG(t, c) ((long long)((c) ? (t) / (c) : 0))
-  uint64_t acquireSamples[D12_STATS_SAMPLE_MAX];
-  uint64_t copySamples   [D12_STATS_SAMPLE_MAX];
-  uint64_t publishSamples[D12_STATS_SAMPLE_MAX];
-  memcpy(acquireSamples, this->dsAcquireSamples,
-    this->dsAcquireSampleCount * sizeof(acquireSamples[0]));
-  memcpy(copySamples, this->dsCopySamples,
-    this->dsCopySampleCount * sizeof(copySamples[0]));
-  memcpy(publishSamples, this->dsPublishSamples,
-    this->dsPublishSampleCount * sizeof(publishSamples[0]));
-  const bool histOverflow = this->dsAcquireSampleOverflow ||
-    this->dsCopySampleOverflow || this->dsPublishSampleOverflow;
-  DEBUG_INFO(
-    "D12 debug stats frames:%llu acquired:%llu timeouts:%llu errors:%llu "
-    "publishes:%llu publish-dirty:%llu publish-kpix:%llu "
-    "frame-gap-avg-us:%lld frame-gap-max-us:%llu frame-gap-count:%llu "
-    "acquire-avg/max:%lld/%llu copy-avg/max:%lld/%llu "
-    "publish-avg/max:%lld/%llu acquire-p50/p95/p99:%llu/%llu/%llu "
-    "copy-p50/p95/p99:%llu/%llu/%llu publish-p50/p95/p99:%llu/%llu/%llu "
-    "hist-overflow:%d",
-    (unsigned long long)this->dsFrames,
-    (unsigned long long)this->dsAcquired,
-    (unsigned long long)this->dsTimeouts,
-    (unsigned long long)this->dsErrors,
-    (unsigned long long)this->dsPublishes,
-    (unsigned long long)this->dsPublishDirty,
-    (unsigned long long)this->dsPublishKpix,
-    D12_AVG(this->dsFrameGapTotalUs, this->dsFrameGapCount),
-    (unsigned long long)this->dsFrameGapMaxUs,
-    (unsigned long long)this->dsFrameGapCount,
-    D12_AVG(this->dsAcquireTotalUs, this->dsAcquireCount),
-    (unsigned long long)this->dsAcquireMaxUs,
-    D12_AVG(this->dsCopyTotalUs, this->dsCopyCount),
-    (unsigned long long)this->dsCopyMaxUs,
-    D12_AVG(this->dsPublishTotalUs, this->dsPublishCount),
-    (unsigned long long)this->dsPublishMaxUs,
-    (unsigned long long)d12_percentile(acquireSamples,
-      this->dsAcquireSampleCount, 50),
-    (unsigned long long)d12_percentile(acquireSamples,
-      this->dsAcquireSampleCount, 95),
-    (unsigned long long)d12_percentile(acquireSamples,
-      this->dsAcquireSampleCount, 99),
-    (unsigned long long)d12_percentile(copySamples,
-      this->dsCopySampleCount, 50),
-    (unsigned long long)d12_percentile(copySamples,
-      this->dsCopySampleCount, 95),
-    (unsigned long long)d12_percentile(copySamples,
-      this->dsCopySampleCount, 99),
-    (unsigned long long)d12_percentile(publishSamples,
-      this->dsPublishSampleCount, 50),
-    (unsigned long long)d12_percentile(publishSamples,
-      this->dsPublishSampleCount, 95),
-    (unsigned long long)d12_percentile(publishSamples,
-      this->dsPublishSampleCount, 99),
-    histOverflow ? 1 : 0);
-#undef D12_AVG
-
-  this->dsFrames           = 0;
-  this->dsAcquired         = 0;
-  this->dsTimeouts         = 0;
-  this->dsErrors           = 0;
-  this->dsPublishes        = 0;
-  this->dsPublishDirty     = 0;
-  this->dsPublishKpix      = 0;
-  this->dsFrameGapCount    = 0;
-  this->dsFrameGapTotalUs  = 0;
-  this->dsFrameGapMaxUs    = 0;
-  this->dsAcquireCount     = 0;
-  this->dsAcquireTotalUs   = 0;
-  this->dsAcquireMaxUs     = 0;
-  this->dsAcquireSampleCount = 0;
-  this->dsAcquireSampleOverflow = false;
-  this->dsCopyCount        = 0;
-  this->dsCopyTotalUs      = 0;
-  this->dsCopyMaxUs        = 0;
-  this->dsCopySampleCount  = 0;
-  this->dsCopySampleOverflow = false;
-  this->dsPublishCount     = 0;
-  this->dsPublishTotalUs   = 0;
-  this->dsPublishMaxUs     = 0;
-  this->dsPublishSampleCount = 0;
-  this->dsPublishSampleOverflow = false;
-}
-
 static CaptureResult d12_capture(
   unsigned frameBufferIndex, FrameBuffer * frameBuffer)
 {
   DEBUG_TRACE("d12_backendCapture");
-  const bool stats = this->debugStats;
-  const uint64_t t0 = stats ? microtime() : 0;
-  CaptureResult result = d12_backendCapture(this->backend, frameBufferIndex);
-  if (stats)
-  {
-    const uint64_t elapsed = microtime() - t0;
-    d12_recordStat(&this->dsAcquireCount, &this->dsAcquireTotalUs,
-      &this->dsAcquireMaxUs, this->dsAcquireSamples,
-      &this->dsAcquireSampleCount, &this->dsAcquireSampleOverflow, elapsed);
-    ++this->dsFrames;
-    if (result == CAPTURE_RESULT_OK)
-      ++this->dsAcquired;
-    else if (result == CAPTURE_RESULT_TIMEOUT)
-      ++this->dsTimeouts;
-    else if (result == CAPTURE_RESULT_ERROR)
-      ++this->dsErrors;
-
-    if (result == CAPTURE_RESULT_OK)
-    {
-      const uint64_t now = microtime();
-      if (this->debugStatsLastFrameUs != 0)
-      {
-        const uint64_t gap = now - this->debugStatsLastFrameUs;
-        ++this->dsFrameGapCount;
-        this->dsFrameGapTotalUs += gap;
-        if (gap > this->dsFrameGapMaxUs)
-          this->dsFrameGapMaxUs = gap;
-      }
-      this->debugStatsLastFrameUs = now;
-    }
-  }
-  d12_maybeLogDebugStats();
-  return result;
+  return d12_backendCapture(this->backend, frameBufferIndex);
 }
 
 static CaptureResult d12_waitFrame(unsigned frameBufferIndex,
@@ -914,11 +704,6 @@ static CaptureResult d12_getFrame(unsigned frameBufferIndex,
   CaptureResult result = CAPTURE_RESULT_ERROR;
   comRef_scopePush(3);
 
-  const bool stats = this->debugStats;
-  const uint64_t copyStartUs = stats ? microtime() : 0;
-  unsigned dsDirtyRects = 0;
-  uint64_t dsPixelsCopied = 0;
-
   D12FrameDesc desc;
 
   comRef_defineLocal(ID3D12Resource, src);
@@ -999,12 +784,6 @@ static CaptureResult d12_getFrame(unsigned frameBufferIndex,
     this->nbDirtyRects = 0;
     ID3D12GraphicsCommandList_CopyTextureRegion(
       *this->copyCommand.gfxList, &dstLoc, 0, 0, 0, &srcLoc, NULL);
-    if (stats)
-    {
-      dsDirtyRects = 0;
-      dsPixelsCopied = (uint64_t)this->dstFormat.desc.Width *
-        (uint64_t)this->dstFormat.desc.Height;
-    }
   }
   else
   {
@@ -1016,12 +795,6 @@ static CaptureResult d12_getFrame(unsigned frameBufferIndex,
       /* the prior frame was fully damaged, we must update everything */
       ID3D12GraphicsCommandList_CopyTextureRegion(
         *this->copyCommand.gfxList, &dstLoc, 0, 0, 0, &srcLoc, NULL);
-      if (stats)
-      {
-        dsDirtyRects = desc.nbDirtyRects;
-        dsPixelsCopied = (uint64_t)this->dstFormat.desc.Width *
-          (uint64_t)this->dstFormat.desc.Height;
-      }
     }
     else
     {
@@ -1068,11 +841,7 @@ static CaptureResult d12_getFrame(unsigned frameBufferIndex,
         ID3D12GraphicsCommandList_CopyTextureRegion(
           *this->copyCommand.gfxList, &dstLoc,
           box.left, box.top, 0, &srcLoc, &box);
-        if (stats)
-          dsPixelsCopied += (uint64_t)rect->width * (uint64_t)rect->height;
       }
-      if (stats)
-        dsDirtyRects = rectCount;
     }
 
     /* store the dirty rects for the next frame */
@@ -1101,7 +870,6 @@ static CaptureResult d12_getFrame(unsigned frameBufferIndex,
   DEBUG_TRACE("Fence wait");
   d12_commandGroupWait(&this->copyCommand);
 
-  const uint64_t publishStartUs = stats ? microtime() : 0;
   if (this->indirectCopy)
   {
     if (rectCount == 0)
@@ -1126,21 +894,6 @@ static CaptureResult d12_getFrame(unsigned frameBufferIndex,
     framebuffer_set_write_ptr(frameBuffer,
       this->dstFormat.desc.Height * this->pitch);
   }
-  if (stats)
-  {
-    const uint64_t now = microtime();
-    d12_recordStat(&this->dsPublishCount, &this->dsPublishTotalUs,
-      &this->dsPublishMaxUs, this->dsPublishSamples,
-      &this->dsPublishSampleCount, &this->dsPublishSampleOverflow,
-      now - publishStartUs);
-    d12_recordStat(&this->dsCopyCount, &this->dsCopyTotalUs,
-      &this->dsCopyMaxUs, this->dsCopySamples, &this->dsCopySampleCount,
-      &this->dsCopySampleOverflow, publishStartUs - copyStartUs);
-    ++this->dsPublishes;
-    if (dsDirtyRects > 0)
-      ++this->dsPublishDirty;
-    this->dsPublishKpix += dsPixelsCopied / 1000;
-  }
 
   // reset the command queues
   if (this->effectsActive)
@@ -1158,7 +911,6 @@ static CaptureResult d12_getFrame(unsigned frameBufferIndex,
 
 exit:
   comRef_scopePop();
-  d12_maybeLogDebugStats();
   return result;
 }
 

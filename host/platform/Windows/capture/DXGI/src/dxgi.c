@@ -29,13 +29,10 @@
 #include "common/rects.h"
 #include "common/runningavg.h"
 #include "common/KVMFR.h"
-#include "common/time.h"
 #include "common/vector.h"
 
 #include <math.h>
 #include <stdatomic.h>
-#include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
@@ -53,7 +50,6 @@
 #include "pp.h"
 
 #define LOCKED(...) INTERLOCKED_SECTION(this->deviceContextLock, __VA_ARGS__)
-#define DXGI_STATS_SAMPLE_MAX 512
 
 //post processers
 extern const DXGIPostProcess DXGIPP_Downsample;
@@ -163,38 +159,6 @@ struct DXGIInterface
   bool lastPointerVisible;
 
   FrameDamage frameDamage[LGMP_Q_FRAME_LEN];
-
-  // debug stats
-  bool     debugStats;
-  uint64_t debugStatsLastLog;
-  uint64_t debugStatsLastFrameUs;
-  uint64_t dsFrames;
-  uint64_t dsAcquired;
-  uint64_t dsTimeouts;
-  uint64_t dsErrors;
-  uint64_t dsSkipped;
-  uint64_t dsPublishes;
-  uint64_t dsFrameGapCount;
-  uint64_t dsFrameGapTotalUs;
-  uint64_t dsFrameGapMaxUs;
-  uint64_t dsAcquireCount;
-  uint64_t dsAcquireTotalUs;
-  uint64_t dsAcquireMaxUs;
-  uint64_t dsAcquireSamples[DXGI_STATS_SAMPLE_MAX];
-  unsigned dsAcquireSampleCount;
-  bool     dsAcquireSampleOverflow;
-  uint64_t dsCopyCount;
-  uint64_t dsCopyTotalUs;
-  uint64_t dsCopyMaxUs;
-  uint64_t dsCopySamples[DXGI_STATS_SAMPLE_MAX];
-  unsigned dsCopySampleCount;
-  bool     dsCopySampleOverflow;
-  uint64_t dsPublishCount;
-  uint64_t dsPublishTotalUs;
-  uint64_t dsPublishMaxUs;
-  uint64_t dsPublishSamples[DXGI_STATS_SAMPLE_MAX];
-  unsigned dsPublishSampleCount;
-  bool     dsPublishSampleOverflow;
 };
 
 // locals
@@ -297,13 +261,6 @@ static void dxgi_initOptions(void)
       .type           = OPTION_TYPE_BOOL,
       .value.x_bool   = true
     },
-    {
-      .module         = "dxgi",
-      .name           = "debugStats",
-      .description    = "Log DXGI capture stats once per second",
-      .type           = OPTION_TYPE_BOOL,
-      .value.x_bool   = false
-    },
     {0}
   };
 
@@ -340,7 +297,6 @@ static bool dxgi_create(
   this->useAcquireLock      = option_get_bool("dxgi", "useAcquireLock");
   this->allowRGB24          = option_get_bool("dxgi", "allowRGB24");
   this->dwmFlush            = option_get_bool("dxgi", "dwmFlush");
-  this->debugStats          = option_get_bool("dxgi", "debugStats");
   this->disableDamage       = option_get_bool("dxgi", "disableDamage");
   this->texture             = calloc(this->maxTextures, sizeof(*this->texture));
   this->getPointerBufferFn  = getPointerBufferFn;
@@ -1087,135 +1043,6 @@ static void computeTexDamage(Texture * tex)
   }
 }
 
-static int dxgi_compareUint64(const void * a, const void * b)
-{
-  const uint64_t av = *(const uint64_t *)a;
-  const uint64_t bv = *(const uint64_t *)b;
-  return (av > bv) - (av < bv);
-}
-
-static uint64_t dxgi_percentile(uint64_t * values, unsigned count,
-  unsigned pct)
-{
-  if (!count)
-    return 0;
-  qsort(values, count, sizeof(values[0]), dxgi_compareUint64);
-  unsigned idx = (unsigned)(((uint64_t)pct * (uint64_t)(count - 1) + 99) / 100);
-  if (idx >= count)
-    idx = count - 1;
-  return values[idx];
-}
-
-static void dxgi_recordStat(uint64_t * count, uint64_t * total, uint64_t * maxv,
-  uint64_t * samples, unsigned * sampleCount, bool * sampleOverflow,
-  uint64_t elapsedUs)
-{
-  ++*count;
-  *total += elapsedUs;
-  if (elapsedUs > *maxv)
-    *maxv = elapsedUs;
-  if (*sampleCount < DXGI_STATS_SAMPLE_MAX)
-    samples[(*sampleCount)++] = elapsedUs;
-  else
-    *sampleOverflow = true;
-}
-
-static void dxgi_maybeLogDebugStats(void)
-{
-  if (!this || !this->debugStats)
-    return;
-
-  const uint64_t now = microtime();
-  if (this->debugStatsLastLog == 0)
-  {
-    this->debugStatsLastLog = now;
-    return;
-  }
-  if (now - this->debugStatsLastLog < 1000000)
-    return;
-  this->debugStatsLastLog = now;
-
-#define DXGI_AVG(t, c) ((long long)((c) ? (t) / (c) : 0))
-  uint64_t acquireSamples[DXGI_STATS_SAMPLE_MAX];
-  uint64_t copySamples   [DXGI_STATS_SAMPLE_MAX];
-  uint64_t publishSamples[DXGI_STATS_SAMPLE_MAX];
-  memcpy(acquireSamples, this->dsAcquireSamples,
-    this->dsAcquireSampleCount * sizeof(acquireSamples[0]));
-  memcpy(copySamples, this->dsCopySamples,
-    this->dsCopySampleCount * sizeof(copySamples[0]));
-  memcpy(publishSamples, this->dsPublishSamples,
-    this->dsPublishSampleCount * sizeof(publishSamples[0]));
-  const bool histOverflow = this->dsAcquireSampleOverflow ||
-    this->dsCopySampleOverflow || this->dsPublishSampleOverflow;
-  DEBUG_INFO(
-    "DXGI debug stats frames:%llu acquired:%llu skipped:%llu timeouts:%llu errors:%llu "
-    "publishes:%llu frame-gap-avg-us:%lld frame-gap-max-us:%llu "
-    "frame-gap-count:%llu acquire-avg/max:%lld/%llu "
-    "copy-avg/max:%lld/%llu publish-avg/max:%lld/%llu "
-    "acquire-p50/p95/p99:%llu/%llu/%llu copy-p50/p95/p99:%llu/%llu/%llu "
-    "publish-p50/p95/p99:%llu/%llu/%llu hist-overflow:%d",
-    (unsigned long long)this->dsFrames,
-    (unsigned long long)this->dsAcquired,
-    (unsigned long long)this->dsSkipped,
-    (unsigned long long)this->dsTimeouts,
-    (unsigned long long)this->dsErrors,
-    (unsigned long long)this->dsPublishes,
-    DXGI_AVG(this->dsFrameGapTotalUs, this->dsFrameGapCount),
-    (unsigned long long)this->dsFrameGapMaxUs,
-    (unsigned long long)this->dsFrameGapCount,
-    DXGI_AVG(this->dsAcquireTotalUs, this->dsAcquireCount),
-    (unsigned long long)this->dsAcquireMaxUs,
-    DXGI_AVG(this->dsCopyTotalUs, this->dsCopyCount),
-    (unsigned long long)this->dsCopyMaxUs,
-    DXGI_AVG(this->dsPublishTotalUs, this->dsPublishCount),
-    (unsigned long long)this->dsPublishMaxUs,
-    (unsigned long long)dxgi_percentile(acquireSamples,
-      this->dsAcquireSampleCount, 50),
-    (unsigned long long)dxgi_percentile(acquireSamples,
-      this->dsAcquireSampleCount, 95),
-    (unsigned long long)dxgi_percentile(acquireSamples,
-      this->dsAcquireSampleCount, 99),
-    (unsigned long long)dxgi_percentile(copySamples,
-      this->dsCopySampleCount, 50),
-    (unsigned long long)dxgi_percentile(copySamples,
-      this->dsCopySampleCount, 95),
-    (unsigned long long)dxgi_percentile(copySamples,
-      this->dsCopySampleCount, 99),
-    (unsigned long long)dxgi_percentile(publishSamples,
-      this->dsPublishSampleCount, 50),
-    (unsigned long long)dxgi_percentile(publishSamples,
-      this->dsPublishSampleCount, 95),
-    (unsigned long long)dxgi_percentile(publishSamples,
-      this->dsPublishSampleCount, 99),
-    histOverflow ? 1 : 0);
-#undef DXGI_AVG
-
-  this->dsFrames           = 0;
-  this->dsAcquired         = 0;
-  this->dsSkipped          = 0;
-  this->dsTimeouts         = 0;
-  this->dsErrors           = 0;
-  this->dsPublishes        = 0;
-  this->dsFrameGapCount    = 0;
-  this->dsFrameGapTotalUs  = 0;
-  this->dsFrameGapMaxUs    = 0;
-  this->dsAcquireCount     = 0;
-  this->dsAcquireTotalUs   = 0;
-  this->dsAcquireMaxUs     = 0;
-  this->dsAcquireSampleCount = 0;
-  this->dsAcquireSampleOverflow = false;
-  this->dsCopyCount        = 0;
-  this->dsCopyTotalUs      = 0;
-  this->dsCopyMaxUs        = 0;
-  this->dsCopySampleCount  = 0;
-  this->dsCopySampleOverflow = false;
-  this->dsPublishCount     = 0;
-  this->dsPublishTotalUs   = 0;
-  this->dsPublishMaxUs     = 0;
-  this->dsPublishSampleCount = 0;
-  this->dsPublishSampleOverflow = false;
-}
-
 static CaptureResult dxgi_capture(unsigned frameBufferIndex,
   FrameBuffer * frameBuffer)
 {
@@ -1238,8 +1065,6 @@ static CaptureResult dxgi_capture(unsigned frameBufferIndex,
   void *         pointerShape     = NULL;
   UINT           pointerShapeSize = 0;
 
-  const bool stats = this->debugStats;
-
   // release the prior frame
   result = dxgi_releaseFrame();
   if (result != CAPTURE_RESULT_OK)
@@ -1252,7 +1077,6 @@ static CaptureResult dxgi_capture(unsigned frameBufferIndex,
   if (this->dwmFlush)
     DwmFlush();
 
-  const uint64_t acquireStartUs = stats ? microtime() : 0;
   if (this->useAcquireLock)
   {
     LOCKED({
@@ -1265,32 +1089,6 @@ static CaptureResult dxgi_capture(unsigned frameBufferIndex,
       *this->dup, 1000, &frameInfo, res);
 
   result = dxgi_hResultToCaptureResult(status);
-  if (stats)
-  {
-    const uint64_t now = microtime();
-    dxgi_recordStat(&this->dsAcquireCount, &this->dsAcquireTotalUs,
-      &this->dsAcquireMaxUs, this->dsAcquireSamples,
-      &this->dsAcquireSampleCount, &this->dsAcquireSampleOverflow,
-      now - acquireStartUs);
-    ++this->dsFrames;
-    if (result == CAPTURE_RESULT_OK)
-    {
-      ++this->dsAcquired;
-      if (this->debugStatsLastFrameUs != 0)
-      {
-        const uint64_t gap = now - this->debugStatsLastFrameUs;
-        ++this->dsFrameGapCount;
-        this->dsFrameGapTotalUs += gap;
-        if (gap > this->dsFrameGapMaxUs)
-          this->dsFrameGapMaxUs = gap;
-      }
-      this->debugStatsLastFrameUs = now;
-    }
-    else if (result == CAPTURE_RESULT_TIMEOUT)
-      ++this->dsTimeouts;
-    else if (result == CAPTURE_RESULT_ERROR)
-      ++this->dsErrors;
-  }
   if (result != CAPTURE_RESULT_OK)
   {
     if (result == CAPTURE_RESULT_ERROR)
@@ -1324,8 +1122,6 @@ static CaptureResult dxgi_capture(unsigned frameBufferIndex,
       // and must invalidate all the textures.
       for (int i = 0; i < this->maxTextures; ++i)
         this->texture[i].texDamageCount = -1;
-      if (stats)
-        ++this->dsSkipped;
     }
   }
 
@@ -1339,7 +1135,6 @@ static CaptureResult dxgi_capture(unsigned frameBufferIndex,
       copyPointer = true;
   }
 
-  const uint64_t copyStartUs = (stats && copyFrame) ? microtime() : 0;
   if (copyFrame || copyPointer)
   {
     if (copyFrame)
@@ -1500,15 +1295,6 @@ static CaptureResult dxgi_capture(unsigned frameBufferIndex,
 
       // update the last frame time
       this->frameTime.QuadPart = frameInfo.LastPresentTime.QuadPart;
-
-      if (stats)
-      {
-        dxgi_recordStat(&this->dsCopyCount, &this->dsCopyTotalUs,
-          &this->dsCopyMaxUs, this->dsCopySamples,
-          &this->dsCopySampleCount, &this->dsCopySampleOverflow,
-          microtime() - copyStartUs);
-        ++this->dsPublishes;
-      }
     }
 
     if (copyPointer)
@@ -1588,7 +1374,6 @@ static CaptureResult dxgi_capture(unsigned frameBufferIndex,
   result = CAPTURE_RESULT_OK;
 exit:
   comRef_scopePop();
-  dxgi_maybeLogDebugStats();
   return result;
 }
 
@@ -1647,9 +1432,6 @@ static CaptureResult dxgi_getFrame(unsigned frameBufferIndex,
 {
   DEBUG_ASSERT(this);
   DEBUG_ASSERT(this->initialized);
-
-  const bool stats = this->debugStats;
-  const uint64_t publishStartUs = stats ? microtime() : 0;
 
   Texture     * tex    = &this->texture[this->texRIndex];
   FrameDamage * damage = &this->frameDamage[frameBufferIndex];
@@ -1722,13 +1504,6 @@ static CaptureResult dxgi_getFrame(unsigned frameBufferIndex,
   if (++this->texRIndex == this->maxTextures)
     this->texRIndex = 0;
 
-  if (stats)
-    dxgi_recordStat(&this->dsPublishCount, &this->dsPublishTotalUs,
-      &this->dsPublishMaxUs, this->dsPublishSamples,
-      &this->dsPublishSampleCount, &this->dsPublishSampleOverflow,
-      microtime() - publishStartUs);
-
-  dxgi_maybeLogDebugStats();
   return CAPTURE_RESULT_OK;
 }
 
